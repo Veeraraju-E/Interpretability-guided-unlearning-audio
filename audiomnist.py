@@ -1,13 +1,8 @@
-"""
-AudioMNIST Digit Unlearning Pipeline — "forget digit x"
-"""
-
 from __future__ import annotations
 import os, time, random, glob
 from pathlib import Path
 from typing import List, Dict
 import numpy as np
-import torch
 from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score
 from sklearn.linear_model import LogisticRegression
 
@@ -227,26 +222,24 @@ def linear_probe_U(Z_all, labels, U, split_mask, forget_digits=["0"]):
     """Train/test a linear probe in reduced coordinates ZU for forget vs not-forget classification."""
     if U.shape[1] == 0:
         return float('nan'), float('nan')
-    ZU = Z_all @ U  # reduced representation
+    # ZU = Z_all @ U  # reduced representation
     
     # Binarize labels: 1 = forget_digits, 0 = others
     y = np.array([1 if l in forget_digits else 0 for l in labels])
     
-    ZU_train = ZU[split_mask['dev']]
+    ZU_train = Z_all[split_mask['dev']]
     y_train = y[split_mask['dev']]
-    ZU_test = ZU[split_mask['test']]
+    ZU_test = Z_all[split_mask['test']]
     y_test = y[split_mask['test']]
     
     clf = LogisticRegression(max_iter=500)
-    clf.fit(ZU_train, y_train)
-    
+    clf.fit(ZU_train, y_train)    
     y_pred = clf.predict(ZU_test)
     acc = accuracy_score(y_test, y_pred)
     auc = roc_auc_score(y_test, clf.decision_function(ZU_test))
     return acc, auc
 
-
-# -------------------- Digit classifier (ResNet-like) --------------------
+# -------------------- Run full pipeline --------------------
 def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
                  dev_frac: float = 0.75,
                  sae_hidden_mult: float = 4.0, sae_k: int = 128, sae_epochs: int = 30,
@@ -267,7 +260,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"Forgetting digits: {forget_digits}")
 
     # 1) manifest + splits
-    print("[1/11] Building manifest and splits (AudioMNIST; digit-unlearning)...")
+    print("[1/13] Building manifest and splits (AudioMNIST; digit-unlearning)...")
     entries = build_manifest_from_audiomnist(data_root)
     # group by digit
     by_digit = {}
@@ -323,7 +316,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"  forget-dev: {M_forget_dev.sum()}, forget-test: {M_forget_test.sum()}, retain-dev: {M_retain_dev.sum()}, retain-test: {M_retain_test.sum()}")
 
     # 3) Whitener on retain-dev (we whiten on non-forget dev samples)
-    print("[3/11] Fitting whitener on retain-dev (non-forget dev)...")
+    print("[3/13] Fitting whitener on retain-dev (non-forget dev)...")
     E_ret_train = E_all[M_retain_dev]
     if E_ret_train.shape[0] < 2:
         raise RuntimeError("Not enough retain-dev (non-forget) samples to fit whitener")
@@ -331,7 +324,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     Z_all = apply_whitener(E_all, mu, W)
 
     # 4) SAE training on Z_dev (retain + forget union, unsupervised)
-    print("[4/11] Training SAE on Z_dev (all digits: retain+forget union)...")
+    print("[4/13] Training SAE on Z_dev (all digits: retain+forget union)...")
     Z_dev = Z_all[is_dev]   # retain + forget
     if Z_dev.shape[0] < 2:
         raise RuntimeError("Not enough dev samples to train SAE")
@@ -344,20 +337,20 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=min(4096, max(8, Z_sae_train.shape[0])), lr=1e-3, device=device)
 
     # 5) SAE activations for forget-dev vs retain-dev
-    print("[5/11] Encoding SAE activations...")
+    print("[5/13] Encoding SAE activations...")
     Z_ret_dev = Z_all[M_retain_dev]
     Z_fgt_dev = Z_all[M_forget_dev]
     A_ret = sae_encode_batch(sae, Z_ret_dev, device=device, batch=8192)
     A_fgt = sae_encode_batch(sae, Z_fgt_dev, device=device, batch=8192) if Z_fgt_dev.shape[0] > 0 else np.zeros((0, sae.m))
 
     # 6) feature stats & selection: features that predict forget-digits (A_fgt positive, A_ret negative)
-    print("[6/11] Computing feature statistics and selecting discriminative features (forget digits vs rest)...")
+    print("[6/13] Computing feature statistics and selecting discriminative features (forget digits vs rest)...")
     stats = feature_stats(A_fgt, A_ret)
     feat_idx_global = select_features_from_stats(stats, top_k=build_U_top, fdr=0.05)
     feat_idx = feat_idx_global
 
     # 7) build U from decoder atoms corresponding to selected features
-    print("[7/11] Building subspace U from decoder atoms...")
+    print("[7/13] Building subspace U from decoder atoms...")
     dec_w = sae.dec.weight.detach().cpu().numpy()  # [d, m]
     U = build_U_from_decoder(dec_w, feat_idx)
     print(f"  U shape: {U.shape}")
@@ -365,7 +358,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     # 8) compute LEACE projector in U to remove predictivity of forget-digits (Y=1 for forget digits)
     P_r = np.eye(U.shape[1])
     if leace and U.shape[1] > 0:
-        print("[8/11] Computing LEACE projector in U (removing component predictive of forget-digits)...")
+        print("[8/13] Computing LEACE projector in U (removing component predictive of forget-digits)...")
         mask_dev = is_dev
         Y_dev = y_binary[mask_dev].reshape(-1, 1)
         if mask_dev.sum() == 0:
@@ -377,11 +370,11 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
             print("  LEACE computation failed, falling back to identity. Error:", e)
             P_r = np.eye(U.shape[1])
     else:
-        print("[8/11] Skipping LEACE (identity)")
+        print("[8/13] Skipping LEACE (identity)")
         mu_r = np.zeros((1, U.shape[1])) if U.shape[1] > 0 else None
 
     # 9) Apply SAUCE gating (optional) then LEACE, optionally add noise
-    print("[9/11] Applying SAUCE gating and LEACE edit...")
+    print("[9/13] Applying SAUCE gating and LEACE edit...")
     Z_edit = Z_all.copy()
     if beta and beta > 0.0 and len(feat_idx) > 0:
         Z_edit = apply_sauce_gating(sae, Z_all, feat_idx, beta=beta, device=device, batch=8192)
@@ -394,7 +387,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     E_all_norm, E_edit_norm = E_all / (np.linalg.norm(E_all, axis=1, keepdims=True) + 1e-12), E_edit / (np.linalg.norm(E_edit, axis=1, keepdims=True) + 1e-12)
 
     # 10) Evaluations
-    print("[10/11] Digit classification accuracy (ResNet) before/after edits...")
+    print("[10/13] Digit classification accuracy (ResNet) before/after edits...")
     all_digits = sorted(set(labels_digits))
     digit2id = {d:i for i,d in enumerate(all_digits)}
 
@@ -424,58 +417,44 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"  Classifier Retain: before {acc_ret_before*100:.2f}% after {acc_ret_after*100:.2f}%")
     print(f"  Classifier Forget: before {acc_fgt_before*100:.2f}% after {acc_fgt_after*100:.2f}%")
 
-    print("[11/11] Verification evaluation (EER, minDCF, Linear Probe).")
+    print("[11/13] Verification evaluation (EER, minDCF, Linear Probe).")
     print(f"  Verification trials: positive pairs within forget digits {forget_digits}, negative pairs across forget/retain")
     results = {}
+
     # --- Build dev/test trials
-    dev_trials, dev_labels = build_verification_trials(labels_digits, forget_digits, is_dev)
+    # dev_trials, dev_labels = build_verification_trials(labels_digits, forget_digits, is_dev)
     test_trials, test_labels = build_verification_trials(labels_digits, forget_digits, is_test)
 
     # --- Compute scores BEFORE edit ---
-    scores_dev_before = compute_scores(E_all_norm, dev_trials)
+    # scores_dev_before = compute_scores(E_all_norm, dev_trials)
     scores_test_before = compute_scores(E_all_norm, test_trials)
 
     # --- Compute scores AFTER edit ---
-    scores_dev_after = compute_scores(E_edit_norm, dev_trials)
+    # scores_dev_after = compute_scores(E_edit_norm, dev_trials)
     scores_test_after = compute_scores(E_edit_norm, test_trials)
-
-    # --- Calibration (single calibrator from dev_before, applied to both) ---
-    scores_test_before_cal = calibrate_scores(scores_dev_before, dev_labels, scores_test_before)
-    scores_test_after_cal = calibrate_scores(scores_dev_after, dev_labels, scores_test_after)
 
     # --- Compute EER (global forget-vs-rest) ---
     eer_before = compute_eer(scores_test_before, test_labels)
     eer_after = compute_eer(scores_test_after, test_labels)
-    eer_before_cal = compute_eer(scores_test_before_cal, test_labels)
-    eer_after_cal = compute_eer(scores_test_after_cal, test_labels)
 
     results["EER_before_raw"] = eer_before
     results["EER_after_raw"] = eer_after
-    results["EER_before_cal"] = eer_before_cal
-    results["EER_after_cal"] = eer_after_cal
-
-    # --- Compute minDCF (p_tar=0.01 and 0.001) ---
-    for p_tar in [0.01, 0.001]:
-        dcf_before = actual_dcf(scores_test_before, test_labels, p_tar=p_tar)
-        dcf_after = actual_dcf(scores_test_after, test_labels, p_tar=p_tar)
-        results[f"actualDCF_before_{p_tar}"] = dcf_before
-        results[f"actualDCF_after_{p_tar}"] = dcf_after
 
     # --- Linear probe in reduced coordinates U (existing) ---
     split_mask = {"dev": is_dev, "test": is_test}
     acc_before, auc_before = linear_probe_U(Z_all, labels_digits, U, split_mask, forget_digits=forget_digits)
     acc_after, auc_after = linear_probe_U(Z_edit, labels_digits, U, split_mask, forget_digits=forget_digits)
+    print(f'Linear Probing accuracies and auc, before : {acc_before, auc_before}, after: {acc_after, auc_after}')
 
     # --- Per-class EERs on TEST partition ---
     per_class_test = per_class_eers(E_all_norm, E_edit_norm, labels_digits, mask=(M_retain_test | M_forget_test), rng_seed=seed)
     
     # --- Intra-class cosine similarities on TEST partition ---
-    print("[12/12] Computing intra-class cosine similarities...")
+    print("[12/13] Computing intra-class cosine similarities...")
     intra_sim_before = compute_intra_class_cosine_similarities(E_all_norm, labels_digits, mask=(M_retain_test | M_forget_test), rng_seed=seed)
     intra_sim_after = compute_intra_class_cosine_similarities(E_edit_norm, labels_digits, mask=(M_retain_test | M_forget_test), rng_seed=seed)
 
     # --- Inter-class cosine similarities on TEST partition ---
-    print("[13/13] Computing inter-class cosine similarities...")
     inter_sim_before = compute_forget_inter_class_similarities(E_all_norm, labels_digits, mask=(M_retain_test | M_forget_test), forget_digits=forget_digits, rng_seed=seed)
     inter_sim_after = compute_forget_inter_class_similarities(E_edit_norm, labels_digits, mask=(M_retain_test | M_forget_test), forget_digits=forget_digits, rng_seed=seed)
 
@@ -492,8 +471,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
             return (float('nan'), float('nan'))
         be = [v[0] for v in per_class_dict.values() if not np.isnan(v[0])]
         ae = [v[1] for v in per_class_dict.values() if not np.isnan(v[1])]
-        return (float(np.mean(be)) if len(be) > 0 else float('nan'),
-                float(np.mean(ae)) if len(ae) > 0 else float('nan'))
+        return float(np.mean(be)) if len(be) > 0 else float('nan'), float(np.mean(ae)) if len(ae) > 0 else float('nan')
 
     retain_avg_before, retain_avg_after = avg_eers(per_class_ret)
     forget_avg_before, forget_avg_after = avg_eers(per_class_fgt)
@@ -503,6 +481,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     results["forget_EER_before_avg"] = forget_avg_before
     results["forget_EER_after_avg"] = forget_avg_after
 
+    print("\n[13/13] Final Results")
     # --- Print summary ---
     print("\n--- Verification Results ---")
     for k, v in results.items():
@@ -532,45 +511,6 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"  Forget avg EER: before {forget_avg_before:.4f}, after {forget_avg_after:.4f}")
     print(f"  Forgot digits: {forget_digits}")
     print(f"  Retained digits: {[d for d in digits if d not in forget_digits]}")
-
-
-    # --- Store per-class & summary in final results to be saved ---
-    results_bundle = {
-        "classification": {
-            "acc_ret_before": acc_ret_before,
-            "acc_fgt_before": acc_fgt_before,
-            "acc_ret_after": acc_ret_after,
-            "acc_fgt_after": acc_fgt_after
-        },
-        "verification": {
-            "linear_probe_acc_before": acc_before,
-            "linear_probe_acc_after": acc_after,
-            "linear_probe_auc_before": auc_before,
-            "linear_probe_auc_after": auc_after,
-            "per_class_test": per_class_test,
-            "retain_avg_eer_before": retain_avg_before,
-            "retain_avg_eer_after": retain_avg_after,
-            "forget_avg_eer_before": forget_avg_before,
-            "forget_avg_eer_after": forget_avg_after
-        },
-        "intra_class_similarities": {
-            "before": intra_sim_before,
-            "after": intra_sim_after
-        },
-        "inter_class_similarities": {
-            "before": inter_sim_before,
-            "after": inter_sim_after
-        }
-    }
-
-    np.savez(os.path.join(save_dir, "artifacts_digit_unlearn.npz"),
-            mu=mu, W=W, U=U, P_r=P_r, feat_idx=np.array(feat_idx),
-            E_before=E_all_norm, E_after=E_edit_norm,
-            labels=np.array(labels_digits, dtype=object),
-            y_binary=y_binary, sets=np.array(sets, dtype=object),
-            results=results_bundle)
-    torch.save(sae.state_dict(), os.path.join(save_dir, "sae_state.pt"))
-
     print("Done. Total time:", time.strftime('%H:%M:%S', time.gmtime(time.time() - t0_all)))
 
 
@@ -578,7 +518,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", default="./audiomnist_data", help="AudioMNIST root containing recordings/")
+    p.add_argument("--data_root", default="./datasets/audiomnist_data", help="AudioMNIST root containing recordings/")
     p.add_argument("--save_dir", default="./outputs_audiomnist", help="where to store artifacts")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=1337)

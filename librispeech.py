@@ -5,6 +5,8 @@ from typing import List, Dict
 import argparse
 import numpy as np
 import torch
+from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score
+from sklearn.linear_model import LogisticRegression
 
 from common import (
     seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener, 
@@ -25,6 +27,27 @@ def build_manifest(data_root: str) -> List[Dict]:
             entries.append({"path": p, "speaker": spk, "subset": sub})
     if len(entries) == 0: raise RuntimeError(f"No entries under {data_root}/dev-clean or dev-other")
     return entries
+
+# -------------------- Linear Probing --------------------
+def linear_probe_U(Z_all, labels, U, split_mask, forget_speakers):
+    """Train/test a linear probe in reduced coordinates ZU for forget vs not-forget speaker classification."""
+    if U.shape[1] == 0:
+        return float('nan'), float('nan')
+    
+    # Binarize labels: 1 = forget_speakers, 0 = others
+    y = np.array([1 if l in forget_speakers else 0 for l in labels])
+    
+    ZU_train = Z_all[split_mask['dev']]
+    y_train = y[split_mask['dev']]
+    ZU_test = Z_all[split_mask['test']]
+    y_test = y[split_mask['test']]
+    
+    clf = LogisticRegression(max_iter=500)
+    clf.fit(ZU_train, y_train)    
+    y_pred = clf.predict(ZU_test)
+    acc = accuracy_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, clf.decision_function(ZU_test))
+    return acc, auc
 
 # -------------------- Orchestration: full run --------------------
 def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
@@ -260,6 +283,24 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     results["forget_EER_before_avg"] = forget_avg_before
     results["forget_EER_after_avg"] = forget_avg_after
 
+    # -------------------- Linear Probing Evaluation --------------------
+    print("[11/11] Linear probing evaluation in U subspace (forget vs retain speakers)...")
+    
+    # Create split masks for linear probing
+    split_mask = {"dev": M_ret_dev | M_fgt_dev, "test": M_ret_test | M_fgt_test}
+    
+    # Linear probe in reduced coordinates U (before edits)
+    acc_before, auc_before = linear_probe_U(Z_all, labels, U, split_mask, forget_spks)
+    acc_after, auc_after = linear_probe_U(Z_edit, labels, U, split_mask, forget_spks)
+    
+    print(f'  Linear Probing accuracies and AUC, before: ({acc_before:.4f}, {auc_before:.4f}), after: ({acc_after:.4f}, {auc_after:.4f})')
+    
+    # Store results
+    results["linear_probe_acc_before"] = acc_before
+    results["linear_probe_acc_after"] = acc_after
+    results["linear_probe_auc_before"] = auc_before
+    results["linear_probe_auc_after"] = auc_after
+
     # Print detailed and summary outputs
     print("\nPer-class EERs (sample):")
     for i, (c, (eb, ea)) in enumerate(sorted(per_class_test.items())): 
@@ -277,11 +318,15 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
         json.dump({
             "per_class_count_test": len(per_class_test),
             "retain_avg": {"before": retain_avg_before, "after": retain_avg_after},
-            "forget_avg": {"before": forget_avg_before, "after": forget_avg_after}
+            "forget_avg": {"before": forget_avg_before, "after": forget_avg_after},
+            "linear_probe": {
+                "acc_before": acc_before, "acc_after": acc_after,
+                "auc_before": auc_before, "auc_after": auc_after
+            }
         }, fh, indent=2)
 
     # -------------------- 12) Speaker classifier (ResNet) training (unchanged) --------------------
-    print("[11/11] Speaker classification accuracy (ResNet) before/after edits...")
+    print("[12/12] Speaker classification accuracy (ResNet) before/after edits...")
     all_spks = sorted(list(set(labels)))
     spk2id = {s:i for i,s in enumerate(all_spks)}
     
@@ -316,7 +361,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
 # -------------------- CLI --------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", default="./librispeech_data_dev/LibriSpeech", help="LibriSpeech root containing dev-clean/dev-other")
+    p.add_argument("--data_root", default="./datasets/librispeech_data_dev/LibriSpeech", help="LibriSpeech root containing dev-clean/dev-other")
     p.add_argument("--save_dir", default="./outputs", help="where to store artifacts")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=1337)
