@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import List, Dict
 import argparse
 import numpy as np
+import torch
 
-# Import shared functionality from common module
 from common import (
     seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener, 
     invert_whitener, l2_normalize, TopKSAE, train_sae, sae_encode_batch,
@@ -31,8 +31,9 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
                  retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75,
                  sae_hidden_mult: float = 4.0, sae_topk: int = 128, sae_epochs: int = 30,
                  build_U_top: int = 200, beta: float = 0.0, leace: bool = True,
-                 leace_ridge: float = 1e-6, noise_sigma: float = 0.02, per_speaker_union: bool = False, forget_spk: int = None,
-                 encoder: str = "ecapa", wav2vec2_model: str = "facebook/wav2vec2-base", hubert_model: str = "facebook/hubert-base-ls960"):
+                 leace_ridge: float = 1e-6, noise_sigma: float = 0.02, per_speaker_union: bool = False, 
+                 forget_spks: List[str] = None, encoder: str = "ecapa", 
+                 wav2vec2_model: str = "facebook/wav2vec2-base", hubert_model: str = "facebook/hubert-base-ls960"):
     seed_all(seed)
     os.makedirs(save_dir, exist_ok=True)
     t0_all = time.time()
@@ -47,14 +48,19 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
         by.setdefault(e["speaker"], []).append(e["path"])
 
     spks = sorted(by.keys())
-    if forget_spk is None:
-        forget_spk = random.choice(spks)
-    if forget_spk not in spks:
-        raise ValueError(f"Requested forget_spk {forget_spk} not found in dataset")
-    print(f"  FORGETTING SPEAKER: {forget_spk}")
+    if forget_spks is None:
+        forget_spks = [random.choice(spks)]
+    elif isinstance(forget_spks, str):
+        forget_spks = [forget_spks]
+    
+    # Validate that all requested forget speakers exist
+    for spk in forget_spks:
+        if spk not in spks:
+            raise ValueError(f"Requested forget speaker {spk} not found in dataset")
+    
+    print(f"  FORGETTING SPEAKERS: {forget_spks}")
 
-    retain_spks = [s for s in spks if s != forget_spk]
-    forget_spks = [forget_spk]
+    retain_spks = [s for s in spks if s not in forget_spks]
 
     manifest = []
     rng = random.Random(seed)
@@ -63,7 +69,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
         n_dev = max(1, int(len(paths) * dev_frac_per_spk))
         dev_paths = paths[:n_dev]
         test_paths = paths[n_dev:]
-        setlbl = 'forget' if s == forget_spk else 'retain'
+        setlbl = 'forget' if s in forget_spks else 'retain'
         for p in dev_paths:
             manifest.append({"path": p, "speaker": s, "set": setlbl, "split": "dev"})
         for p in test_paths:
@@ -140,9 +146,11 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     P_r = np.eye(U.shape[1])
     if leace:
         print("[8/11] Computing LEACE projector in U...")
-        # build Y labels: forget vs rest for all Z_all rows (same as )
+        # build Y labels: forget vs rest for all Z_all rows
         mask_dev = np.array([s.endswith(':dev') for s in sets])
-        Y_dev = (np.array([1 if s.startswith('forget') else 0 for s in sets])[mask_dev]).reshape(-1,1)
+        # Create binary labels: 1 for forget speakers, 0 for retain speakers
+        Y_dev = np.array([1 if any(spk == m['speaker'] for spk in forget_spks) else 0 
+                         for m in all_manifest if mask_dev[all_manifest.index(m)]], dtype=int).reshape(-1,1)
         P_r, mu_r = leace_projector_in_U(Z_all[mask_dev], U, Y_dev, ridge=leace_ridge)
         np.savez(os.path.join(save_dir, "leace_Pr.npz"), U=U, P_r=P_r)
     else:
@@ -255,7 +263,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     # Print detailed and summary outputs
     print("\nPer-class EERs (sample):")
     for i, (c, (eb, ea)) in enumerate(sorted(per_class_test.items())): 
-        if c == forget_spk:
+        if c in forget_spks:
             print("  [FORGET SPEAKER]")
         print(f"  class {c}: EER_before={eb:.4f}, EER_after={ea:.4f}")
 
@@ -322,7 +330,7 @@ if __name__ == "__main__":
     p.add_argument("--leace", action="store_true")
     p.add_argument("--leace_ridge", type=float, default=1e-6)
     p.add_argument("--noise_sigma", type=float, default=0.02)
-    p.add_argument("--forget_spk", type=str, default='174', help="Speaker ID to forget (if not given, random)")
+    p.add_argument("--forget_spks", nargs='+', default=['174'], help="Speaker IDs to forget (e.g., '174' '175' '176')")
     p.add_argument("--encoder", type=str, default="ecapa", help="Encoder to use - 'ecapa', 'wav2vec2', 'hubert'")
     args = p.parse_args()
     run_pipeline(
@@ -333,5 +341,5 @@ if __name__ == "__main__":
         build_U_top=args.build_U_top, 
         beta=args.beta, 
         leace=args.leace, leace_ridge=args.leace_ridge, noise_sigma=args.noise_sigma, 
-        encoder=args.encoder, forget_spk=args.forget_spk
+        encoder=args.encoder, forget_spks=args.forget_spks
     )
