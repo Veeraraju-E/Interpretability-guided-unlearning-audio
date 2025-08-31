@@ -460,6 +460,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     else:
         acc_before, auc_before = linear_probe_U(Z_all, labels_commands, U, split_mask, forget_commands=forget_commands)
         acc_after, auc_after = linear_probe_U(Z_edit, labels_commands, U, split_mask, forget_commands=forget_commands)
+        print(f'Linear probe accuracy before: {acc_before, auc_before}, after : {acc_after, auc_after}')
 
     # Per-class EERs on TEST partition
     print("[12/12] Computing per-class EERs and cosine similarities...")
