@@ -362,7 +362,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--data_root", default="./datasets/librispeech_data_dev/LibriSpeech", help="LibriSpeech root containing dev-clean/dev-other")
-    p.add_argument("--save_dir", default="./outputs", help="where to store artifacts")
+    p.add_argument("--save_dir", default="./outputs", help="store artifacts")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--retain_frac", type=float, default=0.7)

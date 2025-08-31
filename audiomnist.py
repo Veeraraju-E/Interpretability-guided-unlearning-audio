@@ -5,14 +5,16 @@ from typing import List, Dict
 import numpy as np
 from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score
 from sklearn.linear_model import LogisticRegression
+from itertools import combinations
 
 from common import (
     seed_all, extract_embeddings, fit_whitener, apply_whitener, 
     invert_whitener, TopKSAE, train_sae, sae_encode_batch,
     feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating,
-    inject_noise_in_subspace, compute_eer, compute_scores,
-    train_classifier, evaluate_classifier
+    inject_noise_in_subspace, eer_from_scores, compute_scores,
+    train_classifier, evaluate_classifier,
+    compute_numerical_diagnostics
 )
 
 # -------------------- Manifest builder for AudioMNIST --------------------
@@ -166,8 +168,6 @@ def build_verification_trials(labels, forget_digits, split_mask, seed=42):
     
     return trials, np.array(trial_labels)
 
-from itertools import combinations
-
 def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[str], mask: np.ndarray, rng_seed: int = 1337):
     """
     For each class present in `mask`, compute EER using:
@@ -205,18 +205,19 @@ def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[s
         scores_before = compute_scores(emb_before, trials)
         scores_after = compute_scores(emb_after, trials)
 
-        # compute EER (compute_eer returns (eer, threshold))
+        # compute EER (eer_from_scores returns (eer, threshold))
         try:
-            eer_b, _ = compute_eer(scores_before, trial_labels)
+            eer_b, _ = eer_from_scores(scores_before, trial_labels)
         except Exception:
             eer_b, _ = (float('nan'), float('nan'))
         try:
-            eer_a, _ = compute_eer(scores_after, trial_labels)
+            eer_a, _ = eer_from_scores(scores_after, trial_labels)
         except Exception:
             eer_a, _ = (float('nan'), float('nan'))
         per_class[c] = (float(eer_b), float(eer_a))
 
     return per_class
+
 
 def linear_probe_U(Z_all, labels, U, split_mask, forget_digits=["0"]):
     """Train/test a linear probe in reduced coordinates ZU for forget vs not-forget classification."""
@@ -434,8 +435,8 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     scores_test_after = compute_scores(E_edit_norm, test_trials)
 
     # --- Compute EER (global forget-vs-rest) ---
-    eer_before = compute_eer(scores_test_before, test_labels)
-    eer_after = compute_eer(scores_test_after, test_labels)
+    eer_before = eer_from_scores(scores_test_before, test_labels)
+    eer_after = eer_from_scores(scores_test_after, test_labels)
 
     results["EER_before_raw"] = eer_before
     results["EER_after_raw"] = eer_after
@@ -511,6 +512,16 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"  Forget avg EER: before {forget_avg_before:.4f}, after {forget_avg_after:.4f}")
     print(f"  Forgot digits: {forget_digits}")
     print(f"  Retained digits: {[d for d in digits if d not in forget_digits]}")
+    
+    # 14) Numerical diagnostics and visualizations
+    print("[14/14] Computing numerical diagnostics and creating visualizations...")
+    
+    # Compute numerical diagnostics
+    compute_numerical_diagnostics(
+        Z_all, Z_edit, U, sae, feat_idx, y_binary, is_dev, is_test,
+        labels_digits, forget_digits, mu, W, P_r, mu_r, E_all, E_edit
+    )
+        
     print("Done. Total time:", time.strftime('%H:%M:%S', time.gmtime(time.time() - t0_all)))
 
 
@@ -526,7 +537,7 @@ if __name__ == "__main__":
     p.add_argument("--sae_hidden_mult", type=float, default=4.0)
     p.add_argument("--sae_k", type=int, default=128)
     p.add_argument("--sae_epochs", type=int, default=50)
-    p.add_argument("--build_U_top", type=int, default=200)
+    p.add_argument("--build_U_top", type=int, default=100)
     p.add_argument("--beta", type=float, default=0.0)
     p.add_argument("--leace", action="store_true", help="Compute LEACE projector in U (default: False if not provided)")
     p.add_argument("--leace_ridge", type=float, default=1e-6)
