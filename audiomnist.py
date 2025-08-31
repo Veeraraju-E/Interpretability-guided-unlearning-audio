@@ -512,16 +512,6 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"  Forget avg EER: before {forget_avg_before:.4f}, after {forget_avg_after:.4f}")
     print(f"  Forgot digits: {forget_digits}")
     print(f"  Retained digits: {[d for d in digits if d not in forget_digits]}")
-    
-    # 14) Numerical diagnostics and visualizations
-    print("[14/14] Computing numerical diagnostics and creating visualizations...")
-    
-    # Compute numerical diagnostics
-    compute_numerical_diagnostics(
-        Z_all, Z_edit, U, sae, feat_idx, y_binary, is_dev, is_test,
-        labels_digits, forget_digits, mu, W, P_r, mu_r, E_all, E_edit
-    )
-        
     print("Done. Total time:", time.strftime('%H:%M:%S', time.gmtime(time.time() - t0_all)))
 
 
