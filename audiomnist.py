@@ -13,8 +13,7 @@ from common import (
     feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating,
     inject_noise_in_subspace, eer_from_scores, compute_scores,
-    train_classifier, evaluate_classifier,
-    compute_numerical_diagnostics
+    train_classifier, evaluate_classifier
 )
 
 # -------------------- Manifest builder for AudioMNIST --------------------
@@ -519,7 +518,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", default="./datasets/audiomnist_data", help="AudioMNIST root containing recordings/")
+    p.add_argument("--data_root", default="../datasets/audiomnist_data", help="AudioMNIST root containing recordings/")
     p.add_argument("--save_dir", default="./outputs_audiomnist", help="where to store artifacts")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=1337)
