@@ -1,33 +1,35 @@
 from __future__ import annotations
-import os, time, random
+import os, time, json, random
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
+import argparse
 import numpy as np
+import torch
 
 from common import (
-    seed_all, extract_embeddings, fit_whitener, apply_whitener,
-    invert_whitener, TopKSAE, train_sae, sae_encode_batch,
-    feature_stats, select_features_from_stats, build_U_from_decoder,
-    leace_projector_in_U, apply_subspace_leace, apply_sauce_gating,
-    inject_noise_in_subspace, eer_from_scores, compute_scores,
-    train_classifier, evaluate_classifier, linear_probe_U, 
-    build_verification_trials, per_class_eers, compute_intra_class_cosine_similarities, avg_eers
+    seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener,
+    invert_whitener, l2_normalize, TopKSAE, train_sae, sae_encode_batch,
+    prune_and_normalize_decoder, feature_stats, select_features_from_stats, build_U_from_decoder,
+    leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace,
+    compute_scores, eer_from_scores, build_verification_trials,
+    train_classifier, evaluate_classifier, linear_probe_U, per_class_eers, avg_eers
 )
 
-from itertools import combinations
 
-# -------------------- Manifest builder for Speech Commands --------------------
-def build_manifest_from_speechcommands(data_root: str, allowed_exts: List[str]=[".wav"]) -> List[Dict]:
+# -------------------- Manifest --------------------
+def build_manifest(data_root: str, dev_frac_per_cmd: float = 0.75, seed: int = 1337, 
+                  allowed_exts: List[str] = [".wav"]) -> List[Dict]:
     """
     Build manifest entries for Speech Commands dataset folder.
-    Expects a flat directory structure
-    Returns list of dicts: {"path": p, "speaker": spk, "command": command_label}
+    Expects a flat directory structure with command directories.
+    Returns list of dicts: {"path": p, "speaker": spk, "command": command_label, "split": "dev"/"test"}
     """
     data_root = os.path.expanduser(data_root)
     if not os.path.isdir(data_root):
         raise RuntimeError(f"Speech Commands root not found or not a directory: {data_root}")
 
-    entries = []
+    # First collect all raw entries
+    raw_entries = []
     data_root_path = Path(data_root)
     
     # Get command labels
@@ -47,327 +49,317 @@ def build_manifest_from_speechcommands(data_root: str, allowed_exts: List[str]=[
                 fname = audio_file.stem  # filename without extension
                 # Extract speaker id if possible. Typical pattern: <speakerid>_nohash_<utterance>
                 parts = fname.split("_")
-                if len(parts) >= 1 and len(parts[0]) > 0: spk = parts[0]
-                else: spk = "unknown"                
-                entries.append({
+                if len(parts) >= 1 and len(parts[0]) > 0: 
+                    spk = parts[0]
+                else: 
+                    spk = "unknown"                
+                raw_entries.append({
                     "path": str(audio_file), 
                     "speaker": spk, 
                     "command": command_label
                 })
     
-    if len(entries) == 0:
-        print(f"Warning: No Speech Commands audio files found under {data_root} with extensions {allowed_exts}.")
-        raise RuntimeError(f"No Speech Commands audio files found under {data_root}")
+    if len(raw_entries) == 0:
+        raise RuntimeError(f"No Speech Commands audio files found under {data_root} with extensions {allowed_exts}")
 
-    print(f"Found {len(entries)} audio files across {len(command_dirs)} command categories.")
-    return entries
+    print(f"Found {len(raw_entries)} audio files across {len(command_dirs)} command categories.")
 
-# -------------------- Command classifier (ResNet-like) --------------------
-def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
-                 dev_frac: float = 0.75,
-                 sae_hidden_mult: float = 4.0, sae_k: int = 128, sae_epochs: int = 30,
-                 build_U_top: int = 200, beta: float = 0.0, leace: bool = True,
-                 leace_ridge: float = 1e-6, noise_sigma: float = 0.02,
-                 forget_commands: List[str] = ["yes"], encoder: str = "ecapa",
-                 wav2vec2_model: str = "facebook/wav2vec2-base",
-                 hubert_model: str = "facebook/hubert-base-ls960"):
+    # Group by command and create splits
+    by_command = {}
+    for entry in raw_entries:
+        command = entry['command']
+        by_command.setdefault(command, []).append(entry)
+
+    rng = random.Random(seed)
+    manifest = []
+    for command, entries in by_command.items():
+        rng.shuffle(entries)
+        n_dev = max(1, int(len(entries) * dev_frac_per_cmd))
+        # ensure that if command has >1 utts, we leave at least 1 for test
+        if len(entries) > 1 and n_dev >= len(entries): 
+            n_dev = len(entries) - 1
+        
+        dev_entries = entries[:n_dev]
+        test_entries = entries[n_dev:]
+        
+        for entry in dev_entries:
+            entry_copy = entry.copy()
+            entry_copy['split'] = 'dev'
+            manifest.append(entry_copy)
+        for entry in test_entries:
+            entry_copy = entry.copy()
+            entry_copy['split'] = 'test'
+            manifest.append(entry_copy)
+    
+    return manifest
+
+
+# -------------------- Orchestration --------------------
+def run_pipeline(
+    data_root: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
+    retain_frac: float = 0.975, dev_frac_per_cmd: float = 0.75, sae_hidden_mult: float = 4.0,
+    sae_topk: int = 128, sae_epochs: int = 30,
+    build_U_top: int = 200, beta: float = 0.0, leace: bool = True, leace_ridge: float = 1e-6, 
+    noise_sigma: float = 0.02, per_speaker_union: bool = False, forget_commands: Optional[List[str]] = None,
+    encoder: str = "ecapa", wav2vec2_model: str = "facebook/wav2vec2-base", 
+    hubert_model: str = "facebook/hubert-base-ls960"
+):
     """
-    Full pipeline that unlearns the specified forget_commands (list of strings, e.g., ["yes", "no"]).
-    Returns a dict of summary metrics and saves artifacts to save_dir.
+    Main pipeline orchestration - aligned with voxceleb.py framework.
     """
     seed_all(seed)
     os.makedirs(save_dir, exist_ok=True)
     t0_all = time.time()
 
-    print(f"\n===== Running pipeline (encoder={encoder}) =====")
-    print(f"Forgetting commands: {forget_commands}")
+    # Default forget commands if none specified
+    if forget_commands is None:
+        forget_commands = ["yes"]
+    elif isinstance(forget_commands, str):
+        forget_commands = [forget_commands]
+    else:
+        forget_commands = list(forget_commands)
 
     # 1) manifest + splits
     print("[1/12] Building manifest and splits...")
-    entries = build_manifest_from_speechcommands(data_root)
+    entries = build_manifest(data_root, dev_frac_per_cmd, seed)
 
-    # group by command label
-    by_cmd = {}
+    # group utterances by command (use full entries ordering)
+    by = {}
     for e in entries:
-        by_cmd.setdefault(e["command"], []).append(e)
+        by.setdefault(e["command"], []).append(e)
+    commands = sorted(by.keys())
+    # test_counts = {c: sum(1 for x in by[c] if x.get('split') == 'test') for c in commands}
 
-    commands = sorted(by_cmd.keys())
     for cmd in forget_commands:
         if cmd not in commands:
-            raise ValueError(f"Requested forget command '{cmd}' not found in dataset commands: {commands}. Please check the downloaded data structure or the forget_commands list.")
+            raise ValueError(f"Requested forget command '{cmd}' not found in dataset commands: {commands}")
 
+    print(f"  FORGETTING COMMANDS ({len(forget_commands)}): {forget_commands}")
+
+    retain_commands = [c for c in commands if c not in forget_commands]
+
+    # add 'set' labels to manifest
     manifest = []
-    rng = random.Random(seed)
-    for c, utts in by_cmd.items():
-        rng.shuffle(utts)
-        n_dev = max(1, int(len(utts) * dev_frac))
-        dev_utts = utts[:n_dev]
-        test_utts = utts[n_dev:]
-        setlbl = "forget" if c in forget_commands else "retain"
-        for u in dev_utts: manifest.append({**u, "set": setlbl, "split": "dev"})
-        for u in test_utts: manifest.append({**u, "set": setlbl, "split": "test"})
+    for entry in entries:
+        entry_copy = entry.copy()
+        entry_copy['set'] = 'forget' if entry['command'] in forget_commands else 'retain'
+        manifest.append(entry_copy)
 
-    dev_manifest = [m for m in manifest if m["split"]=="dev"]
-    test_manifest = [m for m in manifest if m["split"]=="test"]
-    dev_retain = [m for m in dev_manifest if m["set"]=="retain"]
-    dev_forget = [m for m in dev_manifest if m["set"]=="forget"]
-    test_retain = [m for m in test_manifest if m["set"]=="retain"]
-    test_forget = [m for m in test_manifest if m["set"]=="forget"]
-
+    dev_manifest = [m for m in manifest if m['split'] == 'dev']
+    test_manifest = [m for m in manifest if m['split'] == 'test']
+    dev_retain = [m for m in dev_manifest if m['set'] == 'retain']
+    dev_forget = [m for m in dev_manifest if m['set'] == 'forget']
+    test_retain = [m for m in test_manifest if m['set'] == 'retain']
+    test_forget = [m for m in test_manifest if m['set'] == 'forget']
+    print(f"  retain_commands {len(retain_commands)} forget_commands {len(forget_commands)}")
     print(f"  dev_retain {len(dev_retain)} dev_forget {len(dev_forget)} | test_retain {len(test_retain)} test_forget {len(test_forget)}")
-    print(f"  Forgetting commands: {forget_commands}")
-    print(f"  Retaining commands: {[c for c in commands if c not in forget_commands]}")
 
-    # 2) extract embeddings based on encoder
-    E_all, L_all, _ = extract_embeddings(manifest, encoder=encoder, device=device, wav2vec2_model=wav2vec2_model, hubert_model=hubert_model, label_key='command')
-    E_all = np.asarray(E_all)
-    labels_commands = list(L_all)  # list of command strings per utterance
-    sets = [m["split"] for m in manifest]  # 'dev' or 'test'
-    is_dev = np.array([s == 'dev' for s in sets], dtype=bool)
-    is_test = np.array([s == 'test' for s in sets], dtype=bool)
+    # 2) Embedding extraction
+    print("[2/12] Extracting embeddings...")
+    all_manifest = dev_manifest + test_manifest
+    E_all, L_all, P_all = extract_embeddings(all_manifest, encoder=encoder, device=device, wav2vec2_model=wav2vec2_model, hubert_model=hubert_model, label_key='command')
+    manifest = list(dev_manifest) + list(test_manifest)
+    labels = L_all
 
-    # create binary target: 1 if command in forget_commands else 0
-    y_binary = np.array([1 if c in forget_commands else 0 for c in labels_commands], dtype=int)
+    # Create set labels
+    sets = [f"{m['set']}:{m['split']}" for m in manifest]
+    
+    # all masks
+    M_ret_dev = np.array([s == 'retain:dev' for s in sets], dtype=bool)
+    M_fgt_dev = np.array([s == 'forget:dev' for s in sets], dtype=bool)
+    M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
+    M_fgt_test = np.array([s == 'forget:test' for s in sets], dtype=bool)
 
-    # masks
-    M_forget_dev = is_dev & (y_binary == 1)
-    M_forget_test = is_test & (y_binary == 1)
-    M_retain_dev = is_dev & (y_binary == 0)
-    M_retain_test = is_test & (y_binary == 0)
-
-    print(f"  forget-dev: {M_forget_dev.sum()}, forget-test: {M_forget_test.sum()}, retain-dev: {M_retain_dev.sum()}, retain-test: {M_retain_test.sum()}")
-
-    # 3) Whitener on retain-dev
-    print("[3/12] Fitting whitener on retain-dev...")
-    E_ret_train = E_all[M_retain_dev]
-    if E_ret_train.shape[0] < 2:
+    # 3) Whitening on retain-dev
+    print("[3/12] Fitting whitener on Train-retain (retain-dev)...")
+    E_ret_train = E_all[M_ret_dev]
+    if E_ret_train.shape[0] < 2: 
         raise RuntimeError("Not enough retain-dev samples to fit whitener")
     mu, W = fit_whitener(E_ret_train)
     Z_all = apply_whitener(E_all, mu, W)
 
-    # 4) SAE training on Z_dev
-    print("[4/12] Training SAE on Z_dev...")
-    Z_dev = Z_all[is_dev]
-    if Z_dev.shape[0] < 2:
-        raise RuntimeError("Not enough dev samples to train SAE")
+    # 4) SAE training on dev (retain + forget)
+    print("[4/12] Training SAE on Z_train (dev union: retain+forget)...")
+    Z_train = Z_all[M_ret_dev | M_fgt_dev]
+    perm = np.random.permutation(Z_train.shape[0])
+    cut = int(0.8 * len(perm))
+    Z_sae_train, Z_sae_val = Z_train[perm[:cut]], Z_train[perm[cut:]]
+    sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=sae_hidden_mult, k=sae_topk)
+    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=4096, lr=1e-3, device=device)
 
-    perm = np.random.permutation(Z_dev.shape[0])
-    cut = max(1, int(0.8 * len(perm)))
-    Z_sae_train = Z_dev[perm[:cut]]
-    Z_sae_val = Z_dev[perm[cut:]] if cut < len(perm) else Z_dev[perm[:1]]
-    sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=sae_hidden_mult, k=sae_k)
-    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=min(4096, max(8, Z_sae_train.shape[0])), lr=1e-3, device=device)
-
-    # 5) SAE activations
-    print("[5/12] Encoding SAE activations...")
-    Z_ret_dev = Z_all[M_retain_dev]
-    Z_fgt_dev = Z_all[M_forget_dev]
+    # 5) SAE encodes for feature mining
+    print("[5/12] Encoding SAE activations for train-retain and train-forget...")
+    Z_ret_dev = Z_all[M_ret_dev]
+    Z_fgt_dev = Z_all[M_fgt_dev]
     A_ret = sae_encode_batch(sae, Z_ret_dev, device=device, batch=8192)
-    A_fgt = sae_encode_batch(sae, Z_fgt_dev, device=device, batch=8192) if Z_fgt_dev.shape[0] > 0 else np.zeros((0, sae.m))
+    A_fgt = sae_encode_batch(sae, Z_fgt_dev, device=device, batch=8192)
 
     # 6) feature stats & selection
-    print("[6/12] Computing feature statistics and selecting discriminative features...")
+    print("[6/12] Computing feature statistics and selecting features...")
     stats = feature_stats(A_fgt, A_ret)
     feat_idx_global = select_features_from_stats(stats, top_k=build_U_top, fdr=0.05)
     feat_idx = feat_idx_global
+    if per_speaker_union:
+        print("  computing per-forget-speaker feature unions... (not implemented, using global)")
+        feat_idx = feat_idx_global
 
-    # 7) build U from decoder atoms
-    print("[7/12] Building subspace U from decoder atoms...")
-    dec_w = sae.dec.weight.detach().cpu().numpy()
+    # 7) prune & normalize decoder & build U
+    print("[7/12] Building U subspace...")
+    dec_w = sae.dec.weight.detach().cpu().numpy()   # [d, m]
+    dec_pruned = prune_and_normalize_decoder(dec_w, prune_threshold=1e-6)  # returns [d, r]
     U = build_U_from_decoder(dec_w, feat_idx)
     print(f"  U shape: {U.shape}")
 
-    # 8) compute LEACE projector in U
-    P_r = np.eye(U.shape[1])
-    mu_r = np.zeros((1, U.shape[1])) if U.shape[1] > 0 else None
-    if leace and U.shape[1] > 0:
+    # 8) compute LEACE in U
+    P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
+    mu_r = None
+    if leace:
         print("[8/12] Computing LEACE projector in U...")
-        mask_dev = is_dev
-        Y_dev = y_binary[mask_dev].reshape(-1, 1)
-        if mask_dev.sum() == 0:
-            raise RuntimeError("No dev samples found for LEACE computation.")
+        mask_dev = np.array([s.endswith(':dev') for s in sets], dtype=bool)
+        dev_indices = np.where(mask_dev)[0]
+        Y_dev = np.array([1 if manifest[i]['command'] in forget_commands else 0 for i in dev_indices], dtype=int).reshape(-1, 1)
+        # safety check: shapes must align
+        if Y_dev.shape[0] != Z_all[mask_dev].shape[0]: 
+            raise RuntimeError("Mismatch between Y_dev and Z_all[mask_dev] lengths")
         try:
             P_r, mu_r = leace_projector_in_U(Z_all[mask_dev], U, Y_dev, ridge=leace_ridge)
-            np.savez(os.path.join(save_dir, "leace_Pr.npz"), U=U, P_r=P_r)
         except Exception as e:
-            print("  LEACE computation failed, falling back to identity. Error:", e)
-            P_r = np.eye(U.shape[1])
-            mu_r = np.zeros((1, U.shape[1])) if U.shape[1] > 0 else None
+            print(f"  Warning: LEACE computation failed ({e}), falling back to identity projector")
+            P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
+            mu_r = np.zeros((1, U.shape[1]))
     else:
         print("[8/12] Skipping LEACE (identity)")
 
-    # 9) Apply SAUCE gating, LEACE, and noise
-    print("[9/12] Applying SAUCE gating and LEACE edit...")
+    # 9) Apply SAUCE gating (optional) then LEACE and optional noise
+    print("[9/12] Applying SAUCE gating (beta) and LEACE edit...")
     Z_edit = Z_all.copy()
-    if beta and beta > 0.0 and len(feat_idx) > 0:
+    if beta > 0.0:
+        print("  applying SAUCE gating with beta", beta)
         Z_edit = apply_sauce_gating(sae, Z_all, feat_idx, beta=beta, device=device, batch=8192)
-    if leace and U.shape[1] > 0:
+    if leace:
         Z_edit = apply_subspace_leace(Z_edit, U, P_r, mu_r)
-    if noise_sigma and noise_sigma > 0 and U.shape[1] > 0:
+    if noise_sigma and noise_sigma > 0:
         Z_edit = inject_noise_in_subspace(Z_edit, U, sigma=noise_sigma)
 
+    # map back to embedding space and l2 normalize
     E_edit = invert_whitener(Z_edit, mu, W)
-    E_all_norm, E_edit_norm = E_all / (np.linalg.norm(E_all, axis=1, keepdims=True) + 1e-12), E_edit / (np.linalg.norm(E_edit, axis=1, keepdims=True) + 1e-12)
+    E_all_norm, E_edit_norm = l2_normalize(E_all), l2_normalize(E_edit)
 
-    # 10) Evaluations
-    print("[10/12] Command classification accuracy before/after edits...")
-    all_commands = sorted(set(labels_commands))
-    cmd2id = {c:i for i,c in enumerate(all_commands)}
+    results = {}
 
-    # Train classifier on dev data
-    X_cls_train = E_all_norm[is_dev]
-    y_cls_train = [cmd2id[c] for c in np.array(labels_commands)[is_dev]]
-    X_cls_val = E_all_norm[is_test]
-    y_cls_val = [cmd2id[c] for c in np.array(labels_commands)[is_test]]
+    # ================= Verification Steps =================
+    # 10) Per-class EERs
+    print("[10/12] Per-class verification EERs...")
+    test_trials, test_labels = build_verification_trials(labels, forget_commands, M_ret_test | M_fgt_test)
+    scores_test_before, scores_test_after = compute_scores(E_all_norm, test_trials), compute_scores(E_edit_norm, test_trials)
+    eer_before, eer_after = eer_from_scores(scores_test_before, test_labels), eer_from_scores(scores_test_after, test_labels) 
+    results["EER_before_raw"], results["EER_after_raw"] = eer_before, eer_after
+    print(f"  Global EER: before {eer_before:.4f}, after {eer_after:.4f}")
 
-    if len(y_cls_train) == 0 or len(y_cls_val) == 0:
-         print("Warning: Not enough samples for classifier training or validation. Skipping classification evaluation.")
-         acc_ret_before = float('nan')
-         acc_fgt_before = float('nan')
-         acc_ret_after = float('nan')
-         acc_fgt_after = float('nan')
-         clf = None
-    else:
-        clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(all_commands), device=device, epochs=20, batch_size=512, lr=1e-3)
+    per_class_test = per_class_eers(E_all_norm, E_edit_norm, labels, mask=M_ret_test | M_fgt_test, rng_seed=seed)
+    per_class_ret = {c: vals for c, vals in per_class_test.items() if c in retain_commands}
+    per_class_fgt = {c: vals for c, vals in per_class_test.items() if c in forget_commands}
 
-        # Build test sets
-        E_ret_test = E_all_norm[M_retain_test]
-        L_ret_test = [cmd2id[c] for c in np.array(labels_commands)[M_retain_test]]
-        E_fgt_test = E_all_norm[M_forget_test]
-        L_fgt_test = [cmd2id[c] for c in np.array(labels_commands)[M_forget_test]]
-        E_ret_test_edit = E_edit_norm[M_retain_test]
-        E_fgt_test_edit = E_edit_norm[M_forget_test]
+    retain_avg_before, retain_avg_after = avg_eers(per_class_ret)
+    forget_avg_before, forget_avg_after = avg_eers(per_class_fgt)
+    results.update({
+        "retain_EER_before_avg": retain_avg_before,
+        "retain_EER_after_avg": retain_avg_after,
+        "forget_EER_before_avg": forget_avg_before,
+        "forget_EER_after_avg": forget_avg_after,
+    })
 
-        # Evaluate before edits
-        acc_ret_before = evaluate_classifier(clf, E_ret_test, L_ret_test, device=device) if len(L_ret_test) > 0 else float('nan')
-        acc_fgt_before = evaluate_classifier(clf, E_fgt_test, L_fgt_test, device=device) if len(L_fgt_test) > 0 else float('nan')
+    # 11) Linear Probing
+    print("[11/12] Linear probing evaluation...")
+    split_mask = {"dev": M_ret_dev | M_fgt_dev, "test": M_ret_test | M_fgt_test}
+    acc_before, auc_before = linear_probe_U(Z_all, labels, U, split_mask, forget_classes=forget_commands)
+    acc_after, auc_after = linear_probe_U(Z_edit, labels, U, split_mask, forget_classes=forget_commands)
+    results.update({
+        "linear_probe_acc_before": acc_before,
+        "linear_probe_acc_after": acc_after,
+        "linear_probe_auc_before": auc_before,
+        "linear_probe_auc_after": auc_after,
+    })
 
-        # Evaluate after edits
-        acc_ret_after = evaluate_classifier(clf, E_ret_test_edit, L_ret_test, device=device) if len(L_ret_test) > 0 else float('nan')
-        acc_fgt_after = evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=device) if len(L_fgt_test) > 0 else float('nan')
+    print(f'  Linear Probing accuracies and AUC, before: ({acc_before:.4f}, {auc_before:.4f}), after: ({acc_after:.4f}, {auc_after:.4f})')
+
+    # Print summary
+    print("\n--- Average EER summary ---")
+    print(f"  Retain avg EER: before {retain_avg_before:.4f}, after {retain_avg_after:.4f}")
+    print(f"  Forget avg EER: before {forget_avg_before:.4f}, after {forget_avg_after:.4f}")
+
+    stats_path = os.path.join(save_dir, "verification_eer_summary.json")
+    with open(stats_path, "w") as fh: json.dump(results, fh, indent=2)
+
+    # 12) Classifier
+    print("[12/12] Command classification accuracy (ResNet) ...")
+    all_commands = sorted(list(set(labels)))
+    cmd2id = {c: i for i, c in enumerate(all_commands)}
+
+    X_cls_train = E_all_norm[M_ret_dev | M_fgt_dev]
+    y_cls_train = [cmd2id[c] for i, c in enumerate(labels) if (M_ret_dev | M_fgt_dev)[i]]
+    X_cls_val = E_all_norm[M_ret_test | M_fgt_test]
+    y_cls_val = [cmd2id[c] for i, c in enumerate(labels) if (M_ret_test | M_fgt_test)[i]]
+
+    clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(all_commands), 
+                          device=device, epochs=20, batch_size=512, lr=1e-3)
+
+    # Evaluate retain/forget sets before and after
+    E_ret_test = E_all_norm[M_ret_test]
+    L_ret_test = [cmd2id[c] for c in np.array(labels)[M_ret_test]]
+    E_fgt_test = E_all_norm[M_fgt_test]
+    L_fgt_test = [cmd2id[c] for c in np.array(labels)[M_fgt_test]]
+    E_ret_test_edit = E_edit_norm[M_ret_test]
+    E_fgt_test_edit = E_edit_norm[M_fgt_test]
+
+    acc_ret_before = evaluate_classifier(clf, E_ret_test, L_ret_test, device=device)
+    acc_fgt_before = evaluate_classifier(clf, E_fgt_test, L_fgt_test, device=device)
+    acc_ret_after = evaluate_classifier(clf, E_ret_test_edit, L_ret_test, device=device)
+    acc_fgt_after = evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=device)
 
     print(f"  Classifier Retain: before {acc_ret_before*100:.2f}% after {acc_ret_after*100:.2f}%")
     print(f"  Classifier Forget: before {acc_fgt_before*100:.2f}% after {acc_fgt_after*100:.2f}%")
 
-    print("[11/12] Verification evaluation (EER, minDCF, Linear Probe).")
-    print(f"  Verification trials: positive pairs within forget commands {forget_commands}, negative pairs across forget/retain")
-    results = {}
-    
-    dev_trials, dev_labels = build_verification_trials(labels_commands, forget_commands, is_dev)
-    test_trials, test_labels = build_verification_trials(labels_commands, forget_commands, is_test)
+    results.update({
+        "resnet_acc_retain_before": acc_ret_before,
+        "resnet_acc_retain_after": acc_ret_after,
+        "resnet_acc_forget_before": acc_fgt_before,
+        "resnet_acc_forget_after": acc_fgt_after,
+    })
 
-    if len(test_trials) == 0:
-        print("Warning: Not enough test trials for verification evaluation. Skipping.")
-        results["EER_before_raw"] = float('nan')
-        results["EER_after_raw"] = float('nan')
-    else:
-        # Compute scores before edit
-        scores_dev_before = compute_scores(E_all_norm, dev_trials)
-        scores_test_before = compute_scores(E_all_norm, test_trials)
+    # Final save with all results
+    stats_path = os.path.join(save_dir, "verification_eer_summary.json")
+    with open(stats_path, "w") as fh: json.dump(results, fh, indent=2)
 
-        # Compute scores after edit
-        scores_dev_after = compute_scores(E_edit_norm, dev_trials)
-        scores_test_after = compute_scores(E_edit_norm, test_trials)
+    torch.save(sae.state_dict(), os.path.join(save_dir, "sae_state.pt"))
+    print(f"\nPipeline finished in {human_time(time.time() - t0_all)}. Results saved to {stats_path}")
 
-        # Compute EER
-        if len(np.unique(test_labels)) < 2:
-            print("Warning: Not enough positive and negative samples in test trials for EER calculation. EER will be NaN.")
-            eer_before = (float('nan'), float('nan'))
-            eer_after = (float('nan'), float('nan'))
-        else:
-            eer_before = eer_from_scores(scores_test_before, test_labels)
-            eer_after = eer_from_scores(scores_test_after, test_labels)
-
-        results["EER_before_raw"] = eer_before
-        results["EER_after_raw"] = eer_after
-
-    # Linear probe in reduced coordinates U
-    split_mask = {"dev": is_dev, "test": is_test}
-    if is_dev.sum() == 0 or is_test.sum() == 0:
-        print("Warning: Not enough dev or test samples for linear probe. Skipping.")
-        acc_before, auc_before = float('nan'), float('nan')
-        acc_after, auc_after = float('nan'), float('nan')
-    else:
-        acc_before, auc_before = linear_probe_U(Z_all, labels_commands, U, split_mask, forget_classes=forget_commands)
-        acc_after, auc_after = linear_probe_U(Z_edit, labels_commands, U, split_mask, forget_classes=forget_commands)
-        print(f'Linear probe accuracy before: {acc_before, auc_before}, after : {acc_after, auc_after}')
-
-    # Per-class EERs on TEST partition
-    print("[12/12] Computing per-class EERs and cosine similarities...")
-    per_class_test = per_class_eers(E_all_norm, E_edit_norm, labels_commands, mask=(M_retain_test | M_forget_test), rng_seed=seed)
-
-    # Intra-class cosine similarities on TEST partition
-    intra_sim_before = compute_intra_class_cosine_similarities(E_all_norm, labels_commands, mask=(M_retain_test | M_forget_test), rng_seed=seed)
-    intra_sim_after = compute_intra_class_cosine_similarities(E_edit_norm, labels_commands, mask=(M_retain_test | M_forget_test), rng_seed=seed)
-
-    # Partition per-class dict into retain vs forget classes
-    all_commands_sorted = sorted(set(labels_commands))
-    forget_classes = forget_commands
-    retain_classes = [c for c in all_commands_sorted if c not in forget_commands]
-
-    per_class_ret = {c: vals for c, vals in per_class_test.items() if c in retain_classes}
-    per_class_fgt = {c: vals for c, vals in per_class_test.items() if c in forget_classes}
-
-    retain_avg_before, retain_avg_after = avg_eers(per_class_ret)
-    forget_avg_before, forget_avg_after = avg_eers(per_class_fgt)
-
-    results["retain_EER_before_avg"] = retain_avg_before
-    results["retain_EER_after_avg"] = retain_avg_after
-    results["forget_EER_before_avg"] = forget_avg_before
-    results["forget_EER_after_avg"] = forget_avg_after
-
-    # Print summary
-    print("\n--- Verification Results ---")
-    for k, v in results.items():
-        print(f"{k}: {v}")
-
-    print("\nPer-class EERs:")
-    for c, (eb, ea) in sorted(per_class_test.items()):
-        if c in forget_commands:
-            print("  [FORGET COMMAND]")
-        print(f"  class {c}: EER_before={eb:.4f}, EER_after={ea:.4f}")
-
-    print("\nPer-class Intra-class Cosine Similarities:")
-    for c in sorted(intra_sim_before.keys()):
-        sim_before = intra_sim_before.get(c, float('nan'))
-        sim_after = intra_sim_after.get(c, float('nan'))
-        if c in forget_commands:
-            print("  [FORGET COMMAND]")
-        print(f"  class {c}: similarity_before={sim_before:.4f}, similarity_after={sim_after:.4f}")
-
-    print("\n--- Average EER summary ---")
-    print(f"  Retain avg EER: before {retain_avg_before:.4f}, after {retain_avg_after:.4f}")
-    print(f"  Forget avg EER: before {forget_avg_before:.4f}, after {forget_avg_after:.4f}")
-    print(f"  Forgot commands: {forget_commands}")
-    print(f"  Retained commands: {[c for c in commands if c not in forget_commands]}")
-    print("Done. Total time:", time.strftime('%H:%M:%S', time.gmtime(time.time() - t0_all)))
 
 # -------------------- CLI --------------------
 if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_root", default="../datasets/speech_commands", help="SpeechCommands root containing recordings/")
-    p.add_argument("--save_dir", default="./outputs_speechcommands", help="where to store artifacts")
-    p.add_argument("--device", default="cuda")
-    p.add_argument("--seed", type=int, default=1337)
-    p.add_argument("--dev_frac", type=float, default=0.9)
-    p.add_argument("--sae_hidden_mult", type=float, default=10.0)
-    p.add_argument("--sae_k", type=int, default=128)
-    p.add_argument("--sae_epochs", type=int, default=100)
-    p.add_argument("--build_U_top", type=int, default=200)
-    p.add_argument("--beta", type=float, default=0.0)
-    p.add_argument("--leace", action="store_true", help="Compute LEACE projector in U (default: False if not provided)")
-    p.add_argument("--leace_ridge", type=float, default=1e-6)
-    p.add_argument("--noise_sigma", type=float, default=0.02)
-    p.add_argument("--forget_commands", nargs='+', default=["yes"], help="Commands to forget, e.g. 'yes' 'no' 'up'")
-    p.add_argument("--encoder", type=str, default="ecapa", help="Encoder to use - 'ecapa', 'wav2vec2', 'hubert'")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", default="../datasets/speech_commands", help="SpeechCommands root containing command directories")
+    parser.add_argument("--save_dir", default="./outputs_speechcommands", help="store artifacts")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--retain_frac", type=float, default=0.7)
+    parser.add_argument("--dev_frac_per_cmd", type=float, default=0.7)
+    parser.add_argument("--sae_hidden_mult", type=float, default=10.0)
+    parser.add_argument("--sae_topk", type=int, default=128)
+    parser.add_argument("--sae_epochs", type=int, default=100)
+    parser.add_argument("--build_U_top", type=int, default=200)
+    parser.add_argument("--beta", type=float, default=0.0)
+    parser.add_argument("--no_leace", action="store_true")
+    parser.add_argument("--leace_ridge", type=float, default=1e-6)
+    parser.add_argument("--noise_sigma", type=float, default=0.02)
+    parser.add_argument("--forget_commands", nargs="*", default=["yes"], help="Commands to forget (e.g. 'yes' 'no' 'up')")
+    parser.add_argument("--encoder", type=str, default="ecapa", help="Encoder to use - 'ecapa', 'wav2vec2', 'hubert'")
+    args = parser.parse_args()
 
-    # Run
     run_pipeline(
         data_root=args.data_root, save_dir=args.save_dir, device=args.device, seed=args.seed,
-        dev_frac=args.dev_frac,
-        sae_hidden_mult=args.sae_hidden_mult, sae_k=args.sae_k, sae_epochs=args.sae_epochs,
-        build_U_top=args.build_U_top, beta=args.beta, leace=args.leace, leace_ridge=args.leace_ridge, noise_sigma=args.noise_sigma,
-        encoder=args.encoder, forget_commands=args.forget_commands
+        retain_frac=args.retain_frac, dev_frac_per_cmd=args.dev_frac_per_cmd,
+        sae_hidden_mult=args.sae_hidden_mult, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
+        build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge, 
+        noise_sigma=args.noise_sigma, forget_commands=args.forget_commands, encoder=args.encoder
     )
