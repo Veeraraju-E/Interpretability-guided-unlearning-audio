@@ -1,17 +1,14 @@
 from __future__ import annotations
 import os, time, json, random
-from pathlib import Path
 from typing import List, Dict, Optional
 import argparse
 import numpy as np
-import torch
 
 from common import (
     seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener,
     invert_whitener, l2_normalize, TopKSAE, train_sae, sae_encode_batch,
     prune_and_normalize_decoder, feature_stats, select_features_from_stats, build_U_from_decoder,
-    leace_projector_in_U, apply_subspace_leace, apply_sauce_gating,
-    inject_noise_in_subspace,
+    leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace, 
     compute_scores, eer_from_scores, build_verification_trials,
     train_classifier, evaluate_classifier, linear_probe_U, per_class_eers, avg_eers
 )
@@ -39,13 +36,8 @@ def read_voxceleb_manifest(manifest_path: str) -> List[Dict]:
     return manifest
 
 
-def build_manifest(manifest_path: str, embeddings_path: str = None,
-                  dev_frac_per_spk: float = 0.75, seed: int = 1337) -> List[Dict]:
-    """Build manifest and create dev/test splits similar to LibriSpeech pipeline.
-
-    Note: when embeddings_path is provided, raw_manifest is created from the embeddings' segment_ids
-    and labels, so the final manifest ordering can be deterministically mapped back to the npz file.
-    """
+def build_manifest(manifest_path: str, embeddings_path: str = None, dev_frac_per_spk: float = 0.75, seed: int = 1337) -> List[Dict]:
+    """Build manifest and create train/test splits."""
     if embeddings_path is not None:
         data = np.load(embeddings_path, allow_pickle=True)
         # support a few common key names
@@ -67,10 +59,8 @@ def build_manifest(manifest_path: str, embeddings_path: str = None,
     manifest = []
     for speaker, indices in by_speaker.items():
         rng.shuffle(indices)
-        # ensure that if speaker has >1 utts, we leave at least 1 for test
-        n_dev = max(1, int(len(indices) * dev_frac_per_spk))
-        if len(indices) > 1 and n_dev >= len(indices):
-            n_dev = len(indices) - 1
+        n_dev = max(1, int(len(indices) * dev_frac_per_spk))    # ensure that if speaker has >1 utts, we leave at least 1 for test
+        if len(indices) > 1 and n_dev >= len(indices): n_dev = len(indices) - 1
         dev_indices = indices[:n_dev]
         test_indices = indices[n_dev:]
         for idx in dev_indices:
@@ -86,28 +76,15 @@ def build_manifest(manifest_path: str, embeddings_path: str = None,
     return manifest
 
 
-# -------------------- Orchestration: full run --------------------
-def run_pipeline(manifest_path: str,
-                 save_dir: str = "./runs/exp",
-                 device: str = "cuda",
-                 seed: int = 1337,
-                 retain_frac: float = 0.975,
-                 dev_frac_per_spk: float = 0.75,
-                 sae_hidden_mult: float = 4.0,
-                 sae_topk: int = 128,
-                 sae_epochs: int = 30,
-                 build_U_top: int = 200,
-                 beta: float = 0.0,
-                 leace: bool = True,
-                 leace_ridge: float = 1e-6,
-                 noise_sigma: float = 0.02,
-                 per_speaker_union: bool = False,
-                 forget_spks: Optional[List[str]] = None,
-                 encoder: str = "ecapa",
-                 embeddings_path: str = None,
-                 wav2vec2_model: str = "facebook/wav2vec2-base",
-                 hubert_model: str = "facebook/hubert-base-ls960"):
-    """Main pipeline orchestration."""
+# -------------------- Orchestration --------------------
+def run_pipeline(
+    manifest_path: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337, retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_hidden_mult: float = 4.0,
+    sae_topk: int = 128, sae_epochs: int = 30,
+    build_U_top: int = 200, beta: float = 0.0, leace: bool = True, leace_ridge: float = 1e-6, noise_sigma: float = 0.02,
+    per_speaker_union: bool = False, forget_spks: Optional[List[str]] = None,
+    encoder: str = "ecapa", embeddings_path: str = None, wav2vec2_model: str = "facebook/wav2vec2-base", hubert_model: str = "facebook/hubert-base-ls960"
+    ):
+
     seed_all(seed)
     os.makedirs(save_dir, exist_ok=True)
     t0_all = time.time()
@@ -205,24 +182,15 @@ def run_pipeline(manifest_path: str,
     else:
         print("[2/12] Extracting embeddings...")
         all_manifest = dev_manifest + test_manifest
-        E_all, L_all, P_all = extract_embeddings(all_manifest,
-                                                 encoder=encoder,
-                                                 device=device,
-                                                 wav2vec2_model=wav2vec2_model,
-                                                 hubert_model=hubert_model,
-                                                 label_key='speaker')
-        # note: extract_embeddings returns arrays ordered as all_manifest (dev+test)
-        # but we constructed 'manifest' previously in arbitrary order; ensure lengths align
-        # to keep consistency with the rest of the code (which expects manifest order = dev_manifest+test_manifest)
-        # here we override manifest to the order used for extraction
+        E_all, L_all, P_all = extract_embeddings(all_manifest, encoder=encoder, device=device, wav2vec2_model=wav2vec2_model, hubert_model=hubert_model, label_key='speaker')
         manifest = list(dev_manifest) + list(test_manifest)
 
     labels = L_all
 
-    # Create set labels (same as LibriSpeech)
+    # Create set labels
     sets = [f"{m['set']}:{m['split']}" for m in manifest]
-
-    # masks (boolean arrays aligned with manifest / E_all / labels)
+    
+    # all masks
     M_ret_dev = np.array([s == 'retain:dev' for s in sets], dtype=bool)
     M_fgt_dev = np.array([s == 'forget:dev' for s in sets], dtype=bool)
     M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
@@ -231,8 +199,7 @@ def run_pipeline(manifest_path: str,
     # 3) Whitening on retain-dev
     print("[3/12] Fitting whitener on Train-retain (retain-dev)...")
     E_ret_train = E_all[M_ret_dev]
-    if E_ret_train.shape[0] < 2:
-        raise RuntimeError("Not enough retain-dev samples to fit whitener")
+    if E_ret_train.shape[0] < 2: raise RuntimeError("Not enough retain-dev samples to fit whitener")
     mu, W = fit_whitener(E_ret_train)
     Z_all = apply_whitener(E_all, mu, W)
 
@@ -265,10 +232,10 @@ def run_pipeline(manifest_path: str,
     print("[7/12] Building U subspace...")
     dec_w = sae.dec.weight.detach().cpu().numpy()   # [d, m]
     dec_pruned = prune_and_normalize_decoder(dec_w, prune_threshold=1e-6)  # returns [d, r]
-    U = build_U_from_decoder(dec_w, feat_idx)
+    U = build_U_from_decoder(dec_w, feat_idx)   # TODO: check by passing dec_pruned later
     print(f"  U shape: {U.shape}")
 
-    # 8) compute LEACE in U if requested
+    # 8) compute LEACE in U
     P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
     mu_r = None
     if leace:
@@ -277,8 +244,7 @@ def run_pipeline(manifest_path: str,
         dev_indices = np.where(mask_dev)[0]
         Y_dev = np.array([1 if manifest[i]['speaker'] in forget_spks else 0 for i in dev_indices], dtype=int).reshape(-1, 1)
         # safety check: shapes must align
-        if Y_dev.shape[0] != Z_all[mask_dev].shape[0]:
-            raise RuntimeError("Mismatch between Y_dev and Z_all[mask_dev] lengths")
+        if Y_dev.shape[0] != Z_all[mask_dev].shape[0]: raise RuntimeError("Mismatch between Y_dev and Z_all[mask_dev] lengths")
         try:
             P_r, mu_r = leace_projector_in_U(Z_all[mask_dev], U, Y_dev, ridge=leace_ridge)
         except Exception as e:
@@ -305,15 +271,13 @@ def run_pipeline(manifest_path: str,
 
     results = {}
 
+    # ================= Verification Steps =================
     # 10) Per-class EERs
     print("[10/12] Per-class verification EERs...")
     test_trials, test_labels = build_verification_trials(labels, forget_spks, M_ret_test | M_fgt_test)
-    scores_test_before = compute_scores(E_all_norm, test_trials)
-    scores_test_after = compute_scores(E_edit_norm, test_trials)
-    eer_before = eer_from_scores(scores_test_before, test_labels)
-    eer_after = eer_from_scores(scores_test_after, test_labels)
-    results["EER_before_raw"] = eer_before
-    results["EER_after_raw"] = eer_after
+    scores_test_before, scores_test_after = compute_scores(E_all_norm, test_trials), compute_scores(E_edit_norm, test_trials)
+    eer_before, eer_after = eer_from_scores(scores_test_before, test_labels), eer_from_scores(scores_test_after, test_labels) 
+    results["EER_before_raw"], results["EER_after_raw"] = eer_before, eer_after
     print(f"  Global EER: before {eer_before:.4f}, after {eer_after:.4f}")
 
     per_class_test = per_class_eers(E_all_norm, E_edit_norm, labels, mask=M_ret_test | M_fgt_test, rng_seed=seed)
@@ -347,8 +311,7 @@ def run_pipeline(manifest_path: str,
     print(f"  Forget avg EER: before {forget_avg_before:.4f}, after {forget_avg_after:.4f}")
 
     stats_path = os.path.join(save_dir, "verification_eer_summary.json")
-    with open(stats_path, "w") as fh:
-        json.dump(results, fh, indent=2)
+    with open(stats_path, "w") as fh: json.dump(results, fh, indent=2)
 
     # 12) Classifier
     print("[12/12] Speaker classification accuracy (ResNet) ...")
@@ -360,15 +323,13 @@ def run_pipeline(manifest_path: str,
     X_cls_val = E_all_norm[M_ret_test | M_fgt_test]
     y_cls_val = [spk2id[s] for i, s in enumerate(labels) if (M_ret_test | M_fgt_test)[i]]
 
-    clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val,
-                           num_classes=len(all_spks), device=device, epochs=20, batch_size=512, lr=1e-3)
+    clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(all_spks), device=device, epochs=20, batch_size=512, lr=1e-3)
 
     # Evaluate retain/forget sets before and after
     E_ret_test = E_all_norm[M_ret_test]
     L_ret_test = [spk2id[d] for d in np.array(labels)[M_ret_test]]
     E_fgt_test = E_all_norm[M_fgt_test]
     L_fgt_test = [spk2id[d] for d in np.array(labels)[M_fgt_test]]
-
     E_ret_test_edit = E_edit_norm[M_ret_test]
     E_fgt_test_edit = E_edit_norm[M_fgt_test]
 
@@ -388,8 +349,7 @@ def run_pipeline(manifest_path: str,
     })
 
     stats_path = os.path.join(save_dir, "verification_eer_summary.json")
-    with open(stats_path, "w") as fh:
-        json.dump(results, fh, indent=2)
+    with open(stats_path, "w") as fh: json.dump(results, fh, indent=2)
 
     print(f"\nPipeline finished in {human_time(time.time() - t0_all)}. Results saved to {stats_path}")
 
@@ -415,20 +375,12 @@ if __name__ == "__main__":
     parser.add_argument("--embeddings_path", type=str, default=None)
     args = parser.parse_args()
 
-    run_pipeline(args.manifest_path,
-                 save_dir=args.save_dir,
-                 device=args.device,
-                 seed=args.seed,
-                 retain_frac=args.retain_frac,
-                 dev_frac_per_spk=args.dev_frac_per_spk,
-                 sae_hidden_mult=args.sae_hidden_mult,
-                 sae_topk=args.sae_topk,
-                 sae_epochs=args.sae_epochs,
-                 build_U_top=args.build_U_top,
-                 beta=args.beta,
-                 leace=not args.no_leace,
-                 leace_ridge=args.leace_ridge,
-                 noise_sigma=args.noise_sigma,
-                 forget_spks=args.forget_spks,
-                 encoder=args.encoder,
-                 embeddings_path=args.embeddings_path)
+    run_pipeline(
+        manifest_path=args.manifest_path, save_dir=args.save_dir, device=args.device, seed=args.seed,
+        retain_frac=args.retain_frac, dev_frac_per_spk=args.dev_frac_per_spk,
+        sae_hidden_mult=args.sae_hidden_mult, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
+        build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge, noise_sigma=args.noise_sigma,
+        forget_spks=args.forget_spks,
+        encoder=args.encoder,
+        embeddings_path=args.embeddings_path
+        )
