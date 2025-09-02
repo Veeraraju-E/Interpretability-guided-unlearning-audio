@@ -1,60 +1,36 @@
 #!/usr/bin/env python3
 """
-run_voxceleb_unlearn.py
-
-VoxCeleb1 targeted speaker unlearning using final pooled embeddings from:
- - ECAPA-TDNN (SpeechBrain)
- - wav2vec2 (HuggingFace)
- - HuBERT (HuggingFace)
+VoxCeleb1/2 targeted speaker unlearning pipeline following LibriSpeech framework.
+- Updated to match librispeech.py structure and flow exactly
+- Preserves VoxCeleb-specific functionality (manifest format, precomputed embeddings)
+- Key alignments with LibriSpeech:
+  * Same pipeline step numbering and order
+  * Consistent parameter handling and defaults
+  * Identical result structure and evaluation metrics
+  * Same CLI argument structure where applicable
 """
-import os
-import sys
-import time
-import json
-import argparse
-import math
-from typing import List, Tuple, Dict, Any
-from itertools import combinations
 
+from __future__ import annotations
+import os, time, json, random
+from pathlib import Path
+from typing import List, Dict, Optional
+import argparse
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchaudio
-import soundfile as sf
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_curve, auc, accuracy_score
-from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split
-from torch.utils.data import TensorDataset, DataLoader
 
-try:
-    from speechbrain.pretrained import EncoderClassifier
-    SPEECHBRAIN_AVAILABLE = True
-except Exception:
-    SPEECHBRAIN_AVAILABLE = False
+from common import (
+    seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener,
+    invert_whitener, l2_normalize, TopKSAE, train_sae, sae_encode_batch,
+    prune_and_normalize_decoder, feature_stats, select_features_from_stats, build_U_from_decoder,
+    leace_projector_in_U, apply_subspace_leace, apply_sauce_gating,
+    inject_noise_in_subspace, compute_scores, eer_from_scores, build_verification_trials, 
+    train_classifier, evaluate_classifier, linear_probe_U, per_class_eers, avg_eers
+)
 
-try:
-    from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model, AutoFeatureExtractor, HubertModel
-    TRANSFORMERS_AVAILABLE = True
-except Exception:
-    TRANSFORMERS_AVAILABLE = False
 
-def human_time(s: float) -> str:
-    m, sec = divmod(int(s), 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h}h {m}m {sec}s"
-    if m:
-        return f"{m}m {sec}s"
-    return f"{sec}s"
-
-def l2_norm_rows(x: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(x, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return x / norms
-
-def read_manifest(manifest_path: str) -> List[Dict[str,Any]]:
+# -------------------- Manifest --------------------
+def read_voxceleb_manifest(manifest_path: str) -> List[Dict]:
+    """Read VoxCeleb manifest file and convert to common format."""
     manifest = []
     with open(manifest_path, 'r') as f:
         for line in f:
@@ -63,782 +39,382 @@ def read_manifest(manifest_path: str) -> List[Dict[str,Any]]:
                 continue
             parts = line.split(',')
             seg = {
+                'path': parts[1],  # wav_path -> path for common.py compatibility
+                'speaker': parts[4] if len(parts) > 4 else os.path.basename(os.path.dirname(parts[1])),
                 'segment_id': parts[0],
-                'wav_path': parts[1],
                 'start': float(parts[2]) if len(parts) > 2 and parts[2] != '' else 0.0,
                 'end': float(parts[3]) if len(parts) > 3 and parts[3] != '' else None,
-                'speaker_id': parts[4] if len(parts) > 4 else os.path.basename(os.path.dirname(parts[1])),
                 'session_id': parts[5] if len(parts) > 5 else None
             }
             manifest.append(seg)
     return manifest
 
-def load_audio(path: str, start: float = 0.0, end: float = None, target_sr: int = 16000) -> Tuple[torch.Tensor, int]:
-    data, sr = sf.read(path, dtype='float32')
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    if end is not None:
-        start_frame = int(round(start * sr))
-        end_frame = int(round(end * sr))
-        data = data[start_frame:end_frame]
-    elif start > 0:
-        start_frame = int(round(start * sr))
-        data = data[start_frame:]
-    if sr != target_sr:
-        data = torchaudio.functional.resample(torch.from_numpy(data).unsqueeze(0), orig_freq=sr, new_freq=target_sr).squeeze(0).numpy()
-        sr = target_sr
-    wav = torch.from_numpy(data).float()
-    return wav, sr
 
-def init_speechbrain_ecapa(device: str = 'cuda'):
-    if not SPEECHBRAIN_AVAILABLE:
-        raise RuntimeError("speechbrain not installed. pip install speechbrain")
-    savedir = "pretrained_models/spkrec_ecapa"
-    cls = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir=savedir)
-    cls.device = torch.device(device)
-    cls = cls.to(device)
-    return cls
-
-def extract_ecapa_embeddings(classifier, wavs: List[torch.Tensor], device: str='cuda', batch_size: int = 32) -> np.ndarray:
-    embeddings = []
-    classifier.eval()
-    device_obj = torch.device(device)
+def build_manifest(manifest_path: str, embeddings_path: str = None, 
+                  dev_frac_per_spk: float = 0.75, seed: int = 1337) -> List[Dict]:
+    """Build manifest and create dev/test splits similar to LibriSpeech pipeline.
     
-    with torch.no_grad():
-        for i in range(0, len(wavs), batch_size):
-            batch = wavs[i:i+batch_size]
-            max_len = max([w.shape[0] for w in batch])
-            
-            padded_batch = []
-            for w in batch:
-                if w.shape[0] < max_len:
-                    padded = torch.cat([w, torch.zeros(max_len - w.shape[0])], dim=0)
-                else:
-                    padded = w
-                padded_batch.append(padded)
-            
-            padded = torch.stack(padded_batch).to(device_obj)
-            
-            try:
-                emb = classifier.encode_batch(padded)
-                if hasattr(emb, 'squeeze'):
-                    emb = emb.squeeze()
-                if emb.dim() == 1:
-                    emb = emb.unsqueeze(0)
-            except Exception as e:
-                print(f"Batch encoding failed, trying individual encoding: {e}")
-                emb_list = []
-                for w in batch:
-                    w_input = w.unsqueeze(0).to(device_obj)
-                    emb_s = classifier.encode_batch(w_input)
-                    if hasattr(emb_s, 'squeeze'):
-                        emb_s = emb_s.squeeze()
-                    if emb_s.dim() == 1:
-                        emb_s = emb_s.unsqueeze(0)
-                    emb_list.append(emb_s.cpu())
-                emb = torch.cat(emb_list, dim=0)
-            
-            embeddings.append(emb.cpu().numpy())
+    Returns list of dict entries with keys: path, speaker, set, split
+    (matching LibriSpeech format exactly)
+    """
     
-    embeddings = np.vstack(embeddings)
-    return l2_norm_rows(embeddings.astype(np.float32))
-
-def init_wav2vec2(device: str='cuda', model_name: str='facebook/wav2vec2-large-960h'):
-    if not TRANSFORMERS_AVAILABLE:
-        raise RuntimeError("transformers not installed. pip install transformers")
-    feat = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
-    model = Wav2Vec2Model.from_pretrained(model_name)
-    model.to(device)
-    model.eval()
-    return feat, model
-
-def extract_wav2vec2_embeddings(feature_extractor, model, wavs: List[torch.Tensor], device: str='cuda', batch_size: int=8) -> np.ndarray:
-    embs = []
-    device_obj = torch.device(device)
-    
-    with torch.no_grad():
-        for i in range(0, len(wavs), batch_size):
-            batch = wavs[i:i+batch_size]
-            arr = [w.numpy() for w in batch]
-            inputs = feature_extractor(arr, sampling_rate=16000, return_tensors='pt', padding=True)
-            input_values = inputs['input_values'].to(device_obj)
-            out = model(input_values).last_hidden_state
-            pooled = out.mean(dim=1).cpu().numpy()
-            embs.append(pooled)
-    
-    embs = np.vstack(embs)
-    return l2_norm_rows(embs.astype(np.float32))
-
-def init_hubert(device: str='cuda', model_name: str='facebook/hubert-large-ls960-ft'):
-    if not TRANSFORMERS_AVAILABLE:
-        raise RuntimeError("transformers not installed. pip install transformers")
-    feat = AutoFeatureExtractor.from_pretrained(model_name)
-    model = HubertModel.from_pretrained(model_name)
-    model.to(device)
-    model.eval()
-    return feat, model
-
-def extract_hubert_embeddings(feature_extractor, model, wavs: List[torch.Tensor], device: str='cuda', batch_size: int=8) -> np.ndarray:
-    embs = []
-    device_obj = torch.device(device)
-    
-    with torch.no_grad():
-        for i in range(0, len(wavs), batch_size):
-            batch = wavs[i:i+batch_size]
-            arr = [w.numpy() for w in batch]
-            inputs = feature_extractor(arr, sampling_rate=16000, return_tensors='pt', padding=True)
-            input_values = inputs['input_values'].to(device_obj)
-            out = model(input_values).last_hidden_state
-            pooled = out.mean(dim=1).cpu().numpy()
-            embs.append(pooled)
-    
-    embs = np.vstack(embs)
-    return l2_norm_rows(embs.astype(np.float32))
-
-def extract_embeddings(manifest: List[Dict[str,Any]], encoder: str, device: str='cuda', batch_size: int=32, concat_list: List[str]=None) -> Tuple[np.ndarray, List[str], List[str]]:
-    wavs = []
-    labels = []
-    ids = []
-    
-    for m in manifest:
-        wav, sr = load_audio(m['wav_path'], m['start'], m['end'], target_sr=16000)
-        wavs.append(wav)
-        labels.append(m['speaker_id'])
-        ids.append(m['segment_id'])
-    
-    if encoder == 'ecapa':
-        cls = init_speechbrain_ecapa(device=device)
-        E = extract_ecapa_embeddings(cls, wavs, device=device, batch_size=batch_size)
-        return E, labels, ids
-    elif encoder == 'wav2vec2':
-        feat, model = init_wav2vec2(device=device)
-        E = extract_wav2vec2_embeddings(feat, model, wavs, device=device, batch_size=min(batch_size,8))
-        return E, labels, ids
-    elif encoder == 'hubert':
-        feat, model = init_hubert(device=device)
-        E = extract_hubert_embeddings(feat, model, wavs, device=device, batch_size=min(batch_size,8))
-        return E, labels, ids
-    elif encoder == 'concat':
-        assert concat_list and len(concat_list)>0
-        emb_list = []
-        for enc in concat_list:
-            E_sub, _, _ = extract_embeddings(manifest, enc, device=device, batch_size=batch_size)
-            emb_list.append(E_sub)
-        E = np.concatenate(emb_list, axis=1)
-        return l2_norm_rows(E.astype(np.float32)), labels, ids
+    if embeddings_path is not None:
+        # Load precomputed embeddings
+        data = np.load(embeddings_path, allow_pickle=True)
+        labels = data['labels'].tolist() if isinstance(data['labels'], np.ndarray) else list(data['labels'])
+        ids = data['segment_ids'].tolist() if isinstance(data['segment_ids'], np.ndarray) else list(data['segment_ids'])
+        raw_manifest = [{'path': f'dummy_{i}', 'speaker': labels[i], 'segment_id': ids[i]} for i in range(len(labels))]
     else:
-        raise ValueError("Unknown encoder")
-
-def compute_whitening(embeddings: np.ndarray, n_components: int = None) -> Tuple[np.ndarray, np.ndarray]:
-    X = np.asarray(embeddings, dtype=np.float64)
-    mu = np.mean(X, axis=0)
-    Xc = X - mu
-    if n_components is None:
-        n_components = Xc.shape[1]
-    pca = PCA(n_components=n_components, svd_solver='full', whiten=True)
-    pca.fit(Xc)
-    components = pca.components_
-    explained = pca.explained_variance_
-    W = (components.T / np.sqrt(explained + 1e-12))
-    return mu.astype(np.float32), W.astype(np.float32)
-
-def apply_whitening(embeddings: np.ndarray, mu: np.ndarray, W: np.ndarray) -> np.ndarray:
-    X = np.asarray(embeddings, dtype=np.float32)
-    Xc = X - mu
-    Xw = np.dot(Xc, W)
-    Xw = l2_norm_rows(Xw)
-    return Xw
-
-class TopKSAE(nn.Module):
-    def __init__(self, input_dim: int, hidden_mult: float = 8.0, k: int = 32, hidden_dim: int = None):
-        super().__init__()
-        self.input_dim = int(input_dim)
-        self.hidden_mult = float(hidden_mult)
-        self.m = int(hidden_dim) if hidden_dim is not None else int(round(self.input_dim * self.hidden_mult))
-        self.k = int(k)
-        self.enc = nn.Linear(self.input_dim, self.m, bias=True)
-        self.dec = nn.Linear(self.m, self.input_dim, bias=False)
-        nn.init.xavier_uniform_(self.enc.weight)
-        nn.init.zeros_(self.enc.bias)
-        nn.init.xavier_uniform_(self.dec.weight)
-
-    def _ensure_2d(self, z: torch.Tensor) -> torch.Tensor:
-        if z.ndim == 3 and z.size(1) == 1:
-            z = z.squeeze(1)
-        if z.ndim > 2:
-            z = z.view(z.size(0), -1)
-        return z
-
-    def encode(self, z: torch.Tensor) -> torch.Tensor:
-        z = self._ensure_2d(z)
-        assert z.size(1) == self.input_dim, f"Encoder expected in_features={self.input_dim}, got {z.size(1)}"
-        a = torch.relu(self.enc(z))
-        if 0 < self.k < a.shape[1]:
-            topk_vals, _ = torch.topk(a, self.k, dim=1)
-            kth = topk_vals[:, -1].unsqueeze(1)
-            mask = (a >= kth).float()
-            a = a * mask
-        return a
-
-    def decode(self, a: torch.Tensor) -> torch.Tensor:
-        assert a.ndim == 2 and a.size(1) == self.m
-        z_hat = self.dec(a)
-        return z_hat
-
-    def forward(self, z: torch.Tensor):
-        z = self._ensure_2d(z)
-        a = self.encode(z)
-        z_hat = self.decode(a)
-        return z_hat, a
-
-def train_sae_on_embeddings(sae: TopKSAE, embeddings: np.ndarray, mask: np.ndarray, device='cuda', epochs: int = 50, batch_size: int = 512, lr: float = 1e-3, l1_coeff: float = 1e-4):
-    idx = np.where(mask)[0]
-    if len(idx) == 0:
-        raise ValueError("No samples in TopKSAE training mask.")
+        # Read manifest
+        raw_manifest = read_voxceleb_manifest(manifest_path)
     
-    X = embeddings[idx].astype(np.float32)
-    tensorX = torch.from_numpy(X)
-    dataset = torch.utils.data.TensorDataset(tensorX)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Group utterances by speaker (same as LibriSpeech)
+    by_speaker = {}
+    for i, m in enumerate(raw_manifest):
+        speaker = m['speaker']
+        by_speaker.setdefault(speaker, []).append(i)
     
-    device_obj = torch.device(device)
-    sae.to(device_obj)
-    opt = optim.Adam(sae.parameters(), lr=lr)
-    mse_loss = nn.MSELoss()
+    # Create dev/test splits per speaker (same logic as LibriSpeech)
+    rng = random.Random(seed)
+    manifest = []
     
-    for ep in range(epochs):
-        sae.train()
-        total_loss = 0.0
-        total_mse = 0.0
-        total_l1 = 0.0
+    for speaker, indices in by_speaker.items():
+        rng.shuffle(indices)
+        n_dev = max(1, int(len(indices) * dev_frac_per_spk))
+        dev_indices = indices[:n_dev]
+        test_indices = indices[n_dev:]
         
-        for (batch,) in loader:
-            batch = batch.to(device_obj)
-            recon, activations = sae(batch)
-            
-            loss_mse = mse_loss(recon, batch)
-            loss_l1 = l1_coeff * torch.mean(torch.abs(activations))
-            loss = loss_mse + loss_l1
-            
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            
-            total_loss += float(loss.item()) * batch.size(0)
-            total_mse += float(loss_mse.item()) * batch.size(0)
-            total_l1 += float(loss_l1.item()) * batch.size(0)
+        for idx in dev_indices:
+            entry = raw_manifest[idx].copy()
+            entry['split'] = 'dev'
+            # 'set' will be added later based on forget_spks
+            manifest.append(entry)
         
-        avg_loss = total_loss / len(dataset)
-        avg_mse = total_mse / len(dataset)
-        avg_l1 = total_l1 / len(dataset)
-        
-        if (ep % 10) == 0 or ep == epochs-1:
-            print(f" TopKSAE epoch {ep+1}/{epochs} loss={avg_loss:.6f} mse={avg_mse:.6f} l1={avg_l1:.6f}")
+        for idx in test_indices:
+            entry = raw_manifest[idx].copy()
+            entry['split'] = 'test'
+            # 'set' will be added later based on forget_spks
+            manifest.append(entry)
     
-    sae.eval()
-    return sae
+    if len(manifest) == 0:
+        raise RuntimeError(f"No entries found in manifest")
+    
+    return manifest
 
-def compute_leace_projector(E: np.ndarray, labels: List[str], target_speakers: List[str], mask: np.ndarray, ridge: float = 1e-3):
-    X = np.asarray(E, dtype=np.float64)
-    labels_arr = np.array([1 if (lab in target_speakers) else 0 for lab in labels], dtype=int)
-    idx = np.where(mask)[0]
-    if len(idx) == 0:
-        raise ValueError("Empty mask for projector computation.")
-    Xtr = X[idx]
-    ytr = labels_arr[idx]
-    clf = LogisticRegression(penalty='l2', C=1.0/(ridge+1e-12), solver='lbfgs', max_iter=1000)
-    clf.fit(Xtr, ytr)
-    w = clf.coef_.ravel()
-    if np.linalg.norm(w) == 0:
-        return np.eye(X.shape[1], dtype=np.float32)
-    w = w / (np.linalg.norm(w) + 1e-12)
-    P = np.outer(w, w)
-    I = np.eye(P.shape[0], dtype=np.float32)
-    return I - P
 
-def apply_projector(E: np.ndarray, projector: np.ndarray) -> np.ndarray:
-    return np.dot(E, projector.astype(np.float32))
+# -------------------- Orchestration: full run --------------------
 
-def compute_scores(embeddings: np.ndarray, trials: List[Tuple[int,int]]) -> np.ndarray:
-    mat = l2_norm_rows(embeddings)
-    scores = np.array([float(np.dot(mat[i], mat[j])) for (i,j) in trials], dtype=float)
-    return scores
-
-def compute_eer(scores: np.ndarray, labels: np.ndarray) -> Tuple[float, float]:
-    fpr, tpr, thresholds = roc_curve(labels, scores, pos_label=1)
-    fnr = 1 - tpr
-    abs_diffs = np.abs(fpr - fnr)
-    idx = np.argmin(abs_diffs)
-    eer = (fpr[idx] + fnr[idx]) / 2.0
-    return float(eer), float(thresholds[idx])
-
-def calibrate_scores(dev_scores: np.ndarray, dev_labels: np.ndarray, test_scores: np.ndarray) -> np.ndarray:
-    dev_scores = dev_scores.reshape(-1,1)
-    test_scores = test_scores.reshape(-1,1)
-    clf = LogisticRegression(solver='lbfgs', max_iter=1000)
-    clf.fit(dev_scores, dev_labels)
-    probs = clf.predict_proba(test_scores)[:,1]
-    return probs
-
-def actual_dcf(scores: np.ndarray, labels: np.ndarray, p_tar: float=0.01, c_miss: float=1.0, c_fa: float=1.0) -> float:
-    scores = np.asarray(scores)
-    labels = np.asarray(labels)
-    thresholds = np.concatenate(([scores.min()-1e-6], np.sort(scores), [scores.max()+1e-6]))
-    min_cost = float('inf')
-    for thr in thresholds:
-        decisions = (scores >= thr).astype(int)
-        fn = np.sum((decisions == 0) & (labels == 1))
-        fp = np.sum((decisions == 1) & (labels == 0))
-        n_p = np.sum(labels == 1)
-        n_n = np.sum(labels == 0)
-        p_miss = fn / n_p if n_p > 0 else 0.0
-        p_fa = fp / n_n if n_n > 0 else 0.0
-        cost = c_miss * p_miss * p_tar + c_fa * p_fa * (1 - p_tar)
-        if cost < min_cost: min_cost = cost
-    return float(min_cost)
-
-def build_verification_trials(labels: List[str], target_speaker: str, mask: np.ndarray) -> Tuple[List[Tuple[int,int]], np.ndarray]:
-    labels = np.array(labels)
-    idx_in_mask = np.where(mask)[0].tolist()
-    pos_idx = [i for i in idx_in_mask if labels[i] == target_speaker]
-    ok_idx = [i for i in idx_in_mask if labels[i] != target_speaker]
-    trials = []
-    trial_labels = []
-    
-    for (i,j) in combinations(pos_idx, 2):
-        trials.append((i,j))
-        trial_labels.append(1)
-    
-    n_pos = max(1, len(trials))
-    if len(ok_idx) == 0 or len(pos_idx) == 0:
-        return trials, np.array(trial_labels, dtype=int) if len(trial_labels)>0 else ([], np.array([], dtype=int))
-    
-    rng = np.random.RandomState(1337)
-    neg_pairs = []
-    for _ in range(n_pos):
-        a = rng.choice(pos_idx)
-        b = rng.choice(ok_idx)
-        neg_pairs.append((a,b))
-    
-    trials.extend(neg_pairs)
-    trial_labels.extend([0]*len(neg_pairs))
-    return trials, np.array(trial_labels, dtype=int)
-
-def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[str], mask: np.ndarray, rng_seed: int = 1337):
-    rng = np.random.default_rng(rng_seed)
-    idx_in_mask = np.where(mask)[0].tolist()
-    classes = sorted({labels[i] for i in idx_in_mask})
-    per_class = {}
-    
-    for c in classes:
-        pos_idx = [i for i in idx_in_mask if labels[i] == c]
-        other_idx = [i for i in idx_in_mask if labels[i] != c]
-        if len(pos_idx) < 2 or len(other_idx) < 1:
-            continue
-        
-        pos_pairs_all = list(combinations(pos_idx, 2))
-        pos_pairs_sel = pos_pairs_all
-        n_neg = len(pos_pairs_sel)
-        pos_side_choices = rng.choice(pos_idx, size=n_neg, replace=True)
-        other_side_choices = rng.choice(other_idx, size=n_neg, replace=True)
-        neg_pairs_sel = [(int(a), int(b)) for a,b in zip(pos_side_choices, other_side_choices)]
-        
-        trials = pos_pairs_sel + neg_pairs_sel
-        trial_labels = np.array([1]*len(pos_pairs_sel) + [0]*len(neg_pairs_sel), dtype=int)
-        
-        scores_before = compute_scores(emb_before, trials)
-        scores_after = compute_scores(emb_after, trials)
-        
-        try:
-            eer_b, _ = compute_eer(scores_before, trial_labels)
-        except Exception:
-            eer_b = float('nan')
-        try:
-            eer_a, _ = compute_eer(scores_after, trial_labels)
-        except Exception:
-            eer_a = float('nan')
-        
-        per_class[c] = (float(eer_b), float(eer_a))
-    
-    return per_class
-
-def build_train_dev_test_splits(labels: List[str], test_size: float=0.1, dev_size: float=0.1, seed: int=1337) -> np.ndarray:
-    rng = np.random.RandomState(seed)
-    n = len(labels)
-    sets = np.array(['train'] * n, dtype=object)
-    label_to_indices = {}
-    
-    for i, lab in enumerate(labels):
-        label_to_indices.setdefault(lab, []).append(i)
-    
-    for lab, idxs in label_to_indices.items():
-        k = len(idxs)
-        if k < 3:
-            for i in idxs:
-                sets[i] = 'train'
-            continue
-        
-        shuffled = list(idxs)
-        rng.shuffle(shuffled)
-        n_test = max(1, int(math.ceil(test_size * k)))
-        n_dev = max(1, int(math.ceil(dev_size * k)))
-        
-        for i in shuffled[:n_test]:
-            sets[i] = 'test'
-        for i in shuffled[n_test:n_test+n_dev]:
-            sets[i] = 'dev'
-        for i in shuffled[n_test+n_dev:]:
-            sets[i] = 'train'
-    
-    return sets
-
-def build_masks_by_forget_speaker(labels: List[str], sets: np.ndarray, forget_speaker: str) -> Dict[str, np.ndarray]:
-    labels = np.array(labels)
-    M_forget_train = (labels == forget_speaker) & (sets == 'train')
-    M_forget_dev = (labels == forget_speaker) & (sets == 'dev')
-    M_forget_test = (labels == forget_speaker) & (sets == 'test')
-    M_retain_train = (labels != forget_speaker) & (sets == 'train')
-    M_retain_dev = (labels != forget_speaker) & (sets == 'dev')
-    M_retain_test = (labels != forget_speaker) & (sets == 'test')
-    
-    return {
-        'M_forget_train': M_forget_train,
-        'M_forget_dev': M_forget_dev,
-        'M_forget_test': M_forget_test,
-        'M_retain_train': M_retain_train,
-        'M_retain_dev': M_retain_dev,
-        'M_retain_test': M_retain_test
-    }
-
-class ResNetClassifier(nn.Module):
-    def __init__(self, emb_dim: int, num_classes: int):
-        super().__init__()
-        self.layer1 = nn.Sequential(nn.Linear(emb_dim,512), nn.BatchNorm1d(512), nn.ReLU())
-        self.res = nn.Sequential(nn.Linear(512,512), nn.BatchNorm1d(512), nn.ReLU(), nn.Linear(512,512), nn.BatchNorm1d(512))
-        self.relu = nn.ReLU()
-        self.out = nn.Linear(512, num_classes)
-    
-    def forward(self, x):
-        o = self.layer1(x)
-        r = self.res(o)
-        o = self.relu(o + r)
-        return self.out(o)
-
-def train_classifier(X_train: np.ndarray, y_train: List[int], X_val: np.ndarray, y_val: List[int], num_classes: int, device: str = 'cuda', epochs: int = 20, batch_size: int = 512, lr: float = 1e-3):
-    device_obj = torch.device(device)
-    model = ResNetClassifier(X_train.shape[1], num_classes).to(device_obj)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.CrossEntropyLoss()
-    
-    ds = TensorDataset(torch.from_numpy(X_train).float(), torch.tensor(y_train).long())
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
-    
-    best_acc = 0.0
-    best_state = None
-    
-    for ep in range(1, epochs+1):
-        model.train()
-        for xb, yb in dl:
-            xb, yb = xb.to(device_obj), yb.to(device_obj)
-            out = model(xb)
-            loss = loss_fn(out, yb)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-        
-        model.eval()
-        with torch.no_grad():
-            preds = model(torch.from_numpy(X_val).float().to(device_obj)).argmax(1).cpu().numpy()
-        acc = accuracy_score(y_val, preds)
-        print(f"[Classifier] ep {ep} val acc {acc*100:.2f}%")
-        
-        if acc > best_acc:
-            best_acc = acc
-            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
-    
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    return model
-
-def evaluate_classifier(model: ResNetClassifier, X: np.ndarray, y: List[int], device: str = 'cuda'):
-    device_obj = torch.device(device)
-    model.eval().to(device_obj)
-    with torch.no_grad():
-        preds = model(torch.from_numpy(X).float().to(device_obj)).argmax(1).cpu().numpy()
-    acc = accuracy_score(y, preds)
-    return acc
-
-def linear_probe_U(embeddings: np.ndarray, labels: List[str], U: np.ndarray, split_masks: Dict[str, np.ndarray], target_speaker: str):
-    X = embeddings if U is None else np.dot(embeddings, U)
-    labels_arr = np.array(labels)
-    y = (labels_arr == target_speaker).astype(int)
-    
-    train_idx = np.where(split_masks['train'])[0]
-    dev_idx = np.where(split_masks['dev'])[0]
-    test_idx = np.where(split_masks['test'])[0]
-    
-    if len(train_idx) == 0:
-        train_idx = dev_idx
-    
-    clf = LogisticRegression(solver='lbfgs', max_iter=1000)
-    clf.fit(X[train_idx], y[train_idx])
-    
-    if len(test_idx) == 0:
-        return float('nan'), float('nan')
-    
-    probs = clf.predict_proba(X[test_idx])[:,1]
-    preds = (probs >= 0.5).astype(int)
-    acc = accuracy_score(y[test_idx], preds)
-    
-    fpr, tpr, _ = roc_curve(y[test_idx], probs, pos_label=1)
-    auc_score = auc(fpr, tpr)
-    
-    return float(acc), float(auc_score)
-
-def parse_args():
-    p = argparse.ArgumentParser(description="VoxCeleb targeted speaker unlearning (ECAPA / wav2vec2 / HuBERT).")
-    p.add_argument('--manifest', type=str, default="../datasets/voxceleb2/manifest.csv", help='CSV manifest file')
-    p.add_argument('--embeddings', type=str, default=None, help='Load precomputed embeddings .npz (keys:embeddings,labels,segment_ids)')
-    p.add_argument('--encoder', type=str, default='ecapa', choices=['ecapa','wav2vec2','hubert','concat'], help="Which encoder to use; 'concat' requires --concat-list")
-    p.add_argument('--concat-list', type=str, default=None, help="Comma-separated list when using --encoder concat e.g. ecapa,wav2vec2")
-    p.add_argument('--save-dir', type=str, default='./vox_unlearn_out', help='Save dir')
-    p.add_argument('--forget-speaker', type=str, default="id00017", help='speaker id to forget')
-    p.add_argument('--device', type=str, default='cuda', help='cpu or cuda')
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--sae-hidden-mult', type=float, default=4.0, help='Hidden dimension multiplier for SAE')
-    p.add_argument('--sae-k', type=int, default=128, help='Top-k value for SAE activation')
-    p.add_argument('--sae-epochs', type=int, default=100)
-    p.add_argument('--sae-batch', type=int, default=512)
-    p.add_argument('--sae-lr', type=float, default=1e-3)
-    p.add_argument('--l1-coeff', type=float, default=1e-4, help='L1 regularization coefficient for SAE activations')
-    p.add_argument('--whiten-ncomp', type=int, default=None)
-    p.add_argument('--classifier-epochs', type=int, default=10)
-    p.add_argument('--classifier-batch', type=int, default=512)
-    return p.parse_args()
-
-def load_precomputed_embeddings(emb_path: str):
-    data = np.load(emb_path, allow_pickle=True)
-    embeddings = data['embeddings']
-    labels = data['labels'].tolist() if isinstance(data['labels'], np.ndarray) else list(data['labels'])
-    ids = data['segment_ids'].tolist() if isinstance(data['segment_ids'], np.ndarray) else list(data['segment_ids'])
-    return embeddings.astype(np.float32), labels, ids
-
-def main():
-    args = parse_args()
-    os.makedirs(args.save_dir, exist_ok=True)
+def run_pipeline(manifest_path: str,
+                 save_dir: str = "./runs/exp",
+                 device: str = "cuda",
+                 seed: int = 1337,
+                 retain_frac: float = 0.975,
+                 dev_frac_per_spk: float = 0.75,
+                 sae_hidden_mult: float = 4.0,
+                 sae_topk: int = 128,
+                 sae_epochs: int = 30,
+                 build_U_top: int = 200,
+                 beta: float = 0.0,
+                 leace: bool = True,
+                 leace_ridge: float = 1e-6,
+                 noise_sigma: float = 0.02,
+                 per_speaker_union: bool = False,
+                 forget_spks: Optional[List[str]] = None,
+                 encoder: str = "ecapa",
+                 embeddings_path: str = None,
+                 wav2vec2_model: str = "facebook/wav2vec2-base",
+                 hubert_model: str = "facebook/hubert-base-ls960"):
+    """
+    Main pipeline orchestration. Matches librispeech.py structure exactly.
+    """
+    seed_all(seed)
+    os.makedirs(save_dir, exist_ok=True)
     t0_all = time.time()
-    print("VoxCeleb unlearning pipeline starting. Device:", args.device)
 
-    print("[1/11] Extracting Manifest and Computing Embeddings")
-    manifest = read_manifest(args.manifest)
-    print("Manifest entries:", len(manifest))
-    
-    if args.embeddings is not None:
-        E_raw, labels, ids = load_precomputed_embeddings(args.embeddings)
+    # 1) manifest + splits
+    print("[1/12] Building manifest and splits...")
+    entries = build_manifest(manifest_path, embeddings_path, dev_frac_per_spk, seed)
+
+    # group utterances by speaker (same as LibriSpeech)
+    by = {}
+    for e in entries:
+        by.setdefault(e["speaker"], []).append(e["path"])
+
+    spks = sorted(by.keys())
+
+    # decide which speakers to forget (same logic as LibriSpeech)
+    rng = random.Random(seed)
+    if forget_spks is None:
+        # use retain_frac to derive how many speakers to *retain*; the rest become forget
+        n_total = len(spks)
+        n_retain = max(1, int(round(retain_frac * n_total)))
+        n_forget = max(1, n_total - n_retain)
+        forget_spks = rng.sample(spks, k=n_forget)
+    elif isinstance(forget_spks, str):
+        forget_spks = [forget_spks]
     else:
-        if args.encoder == 'concat':
-            if not args.concat_list:
-                raise ValueError("When --encoder concat you must provide --concat-list")
-            concat_list = [s.strip() for s in args.concat_list.split(',')]
-            E_raw, labels, ids = extract_embeddings(manifest, 'concat', device=args.device, concat_list=concat_list)
-        else:
-            E_raw, labels, ids = extract_embeddings(manifest, args.encoder, device=args.device)
-    
-    print("Raw embeddings shape:", E_raw.shape)
+        # ensure we have a list copy
+        forget_spks = list(forget_spks)
 
-    print("[2/11] Creating Dataset Splits and Masks")
-    sets = build_train_dev_test_splits(labels, test_size=0.1, dev_size=0.1, seed=args.seed)
-    masks = build_masks_by_forget_speaker(labels, sets, args.forget_speaker)
-    M_forget_train = masks['M_forget_train']
-    M_forget_dev = masks['M_forget_dev']
-    M_forget_test = masks['M_forget_test']
-    M_retain_train = masks['M_retain_train']
-    M_retain_dev = masks['M_retain_dev']
-    M_retain_test = masks['M_retain_test']
-    
-    print("Counts: forget train/dev/test:", int(M_forget_train.sum()), int(M_forget_dev.sum()), int(M_forget_test.sum()))
-    print("Counts: retain train/dev/test:", int(M_retain_train.sum()), int(M_retain_dev.sum()), int(M_retain_test.sum()))
+    # Validate that all requested forget speakers exist
+    for spk in forget_spks:
+        if spk not in spks:
+            raise ValueError(f"Requested forget speaker {spk} not found in dataset")
 
-    print("[3/11] Applying Whitening")
-    mu, W = compute_whitening(E_raw[sets=='train'], n_components=args.whiten_ncomp)
-    E_all_norm = apply_whitening(E_raw, mu, W)
-    print("E_all_norm shape:", E_all_norm.shape)
+    print(f"  FORGETTING SPEAKERS ({len(forget_spks)}): {forget_spks}")
 
-    print("[4/11] Training ResNet Classifier")
-    all_spks = sorted(list(set(labels)))
-    spk2id = {s:i for i,s in enumerate(all_spks)}
-    
-    cls_train_mask = (M_retain_dev | M_forget_dev)
-    cls_val_mask = (M_retain_test | M_forget_test)
-    X_cls_train = E_all_norm[cls_train_mask]
-    y_cls_train = [spk2id[s] for i,s in enumerate(labels) if cls_train_mask[i]]
-    X_cls_val = E_all_norm[cls_val_mask]
-    y_cls_val = [spk2id[s] for i,s in enumerate(labels) if cls_val_mask[i]]
-    
-    print("Classifier: train samples:", len(y_cls_train), "val samples:", len(y_cls_val))
-    
-    if len(y_cls_train) == 0 or len(y_cls_val) == 0:
-        print("Warning: empty train or val for classifier; skipping classification step.")
-        clf = None
-        acc_ret_before = acc_fgt_before = acc_ret_after = acc_fgt_after = float('nan')
+    retain_spks = [s for s in spks if s not in forget_spks]
+
+    # Add 'set' labels to manifest entries (same as LibriSpeech)
+    manifest = []
+    for entry in entries:
+        entry_copy = entry.copy()
+        entry_copy['set'] = 'forget' if entry['speaker'] in forget_spks else 'retain'
+        manifest.append(entry_copy)
+
+    # create lists for each split+set (same as LibriSpeech)
+    dev_manifest = [m for m in manifest if m['split'] == 'dev']
+    test_manifest = [m for m in manifest if m['split'] == 'test']
+    dev_retain = [m for m in dev_manifest if m['set'] == 'retain']
+    dev_forget = [m for m in dev_manifest if m['set'] == 'forget']
+    test_retain = [m for m in test_manifest if m['set'] == 'retain']
+    test_forget = [m for m in test_manifest if m['set'] == 'forget']
+    print(f"  retain_spks {len(retain_spks)} forget_spks {len(forget_spks)}")
+    print(f"  dev_retain {len(dev_retain)} dev_forget {len(dev_forget)} | test_retain {len(test_retain)} test_forget {len(test_forget)}")
+
+    # 2) Embedding extraction
+    if embeddings_path is not None:
+        print("[2/12] Loading precomputed embeddings...")
+        data = np.load(embeddings_path, allow_pickle=True)
+        E_all = data['embeddings'].astype(np.float32)
+        # Align labels and paths with manifest order
+        L_all = [m['speaker'] for m in manifest]
+        P_all = [m['path'] for m in manifest]
+        print(f"  Loaded {len(manifest)} samples, {len(set(L_all))} speakers")
+        print(f"  Embeddings shape: {E_all.shape}")
     else:
-        clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(all_spks),
-                               device=args.device, epochs=args.classifier_epochs, batch_size=args.classifier_batch, lr=1e-3)
-        
-        E_ret_test = E_all_norm[M_retain_test]
-        L_ret_test = [spk2id[s] for i,s in enumerate(labels) if M_retain_test[i]]
-        E_fgt_test = E_all_norm[M_forget_test]
-        L_fgt_test = [spk2id[s] for i,s in enumerate(labels) if M_forget_test[i]]
-        
-        acc_ret_before = evaluate_classifier(clf, E_ret_test, L_ret_test, device=args.device) if len(L_ret_test)>0 else float('nan')
-        acc_fgt_before = evaluate_classifier(clf, E_fgt_test, L_fgt_test, device=args.device) if len(L_fgt_test)>0 else float('nan')
-        print(f"  Classifier Retain BEFORE: {acc_ret_before*100:.2f}%  Forget BEFORE: {acc_fgt_before*100:.2f}%")
-
-    print("[5/11] Training TopKSAE")
-    input_dim = E_all_norm.shape[1]
-    sae = TopKSAE(input_dim=input_dim, hidden_mult=args.sae_hidden_mult, k=args.sae_k)
-    sae = train_sae_on_embeddings(sae, E_all_norm, M_retain_train | M_forget_train, device=args.device, 
-                                 epochs=args.sae_epochs, batch_size=args.sae_batch, lr=args.sae_lr, 
-                                 l1_coeff=args.l1_coeff)
+        print("[2/12] Extracting embeddings...")
+        all_manifest = dev_manifest + test_manifest
+        E_all, L_all, P_all = extract_embeddings(all_manifest,
+                                                 encoder=encoder,
+                                                 device=device,
+                                                 wav2vec2_model=wav2vec2_model,
+                                                 hubert_model=hubert_model,
+                                                 label_key='speaker')
     
-    torch.save(sae.state_dict(), os.path.join(args.save_dir, "sae_state.pt"))
+    labels = L_all
 
-    print("[6/11] Encoding to SAE latent space")
-    device_obj = torch.device(args.device)
-    with torch.no_grad():
-        sae.to(device_obj)
-        X_tensor = torch.from_numpy(E_all_norm.astype(np.float32)).to(device_obj)
-        batch_sz = 1024
-        activations = []
-        for i in range(0, X_tensor.shape[0], batch_sz):
-            b = X_tensor[i:i+batch_sz]
-            a = sae.encode(b)
-            activations.append(a.cpu().numpy())
-        Z_all = np.vstack(activations)
-    
-    Z_all = l2_norm_rows(Z_all.astype(np.float32))
+    # Create set labels (same as LibriSpeech)
+    sets = [f"{m['set']}:{m['split']}" for m in manifest]
 
-    print("[7/11] Computing LEACE projector and applying")
-    project_mask = (M_forget_train | M_retain_train | M_retain_dev)
-    projector = compute_leace_projector(Z_all, labels, [args.forget_speaker], mask=project_mask)
-    Z_edit = apply_projector(Z_all, projector)
-    Z_edit = l2_norm_rows(Z_edit)
+    # masks (boolean arrays aligned with all_manifest / E_all / labels) - same as LibriSpeech
+    M_ret_dev = np.array([s == 'retain:dev' for s in sets], dtype=bool)
+    M_fgt_dev = np.array([s == 'forget:dev' for s in sets], dtype=bool)
+    M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
+    M_fgt_test = np.array([s == 'forget:test' for s in sets], dtype=bool)
 
-    print("[8/11] Decoding edited activations back to embedding space")
-    with torch.no_grad():
-        Zedt = torch.from_numpy(Z_edit.astype(np.float32)).to(device_obj)
-        recs = []
-        batch_sz = 1024
-        for i in range(0, Zedt.shape[0], batch_sz):
-            b = Zedt[i:i+batch_sz]
-            rec = sae.decode(b)
-            recs.append(rec.cpu().numpy())
-        E_edit = np.vstack(recs).astype(np.float32)
-    
-    E_edit_norm = l2_norm_rows(E_edit)
+    # 3) Whitening on retain-dev (same as LibriSpeech)
+    print("[3/12] Fitting whitener on Train-retain (retain-dev)...")
+    E_ret_train = E_all[M_ret_dev]
+    if E_ret_train.shape[0] < 2:
+        raise RuntimeError("Not enough retain-dev samples to fit whitener")
+    mu, W = fit_whitener(E_ret_train)
+    Z_all = apply_whitener(E_all, mu, W)
 
-    print("[9/11] Evaluating classifier on edited embeddings")
-    if clf is not None:
-        E_ret_test_edit = E_edit_norm[M_retain_test]
-        L_ret_test = [spk2id[s] for i,s in enumerate(labels) if M_retain_test[i]]
-        E_fgt_test_edit = E_edit_norm[M_forget_test]
-        L_fgt_test = [spk2id[s] for i,s in enumerate(labels) if M_forget_test[i]]
-        
-        acc_ret_after = evaluate_classifier(clf, E_ret_test_edit, L_ret_test, device=args.device) if len(L_ret_test)>0 else float('nan')
-        acc_fgt_after = evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=args.device) if len(L_fgt_test)>0 else float('nan')
-        print(f"  Classifier Retain AFTER: {acc_ret_after*100:.2f}%  Forget AFTER: {acc_fgt_after*100:.2f}%")
+    # 4) SAE training on dev (retain + forget) - same as LibriSpeech
+    print("[4/12] Training SAE on Z_train (dev union: retain+forget)...")
+    Z_train = Z_all[M_ret_dev | M_fgt_dev]
+    perm = np.random.permutation(Z_train.shape[0])
+    cut = int(0.8 * len(perm))
+    Z_sae_train = Z_train[perm[:cut]]
+    Z_sae_val = Z_train[perm[cut:]]
+    sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=sae_hidden_mult, k=sae_topk)
+    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=4096, lr=1e-3, device=device)
+
+    # 5) SAE encodes for feature mining (train-retain & train-forget) - same as LibriSpeech
+    print("[5/12] Encoding SAE activations for train-retain and train-forget...")
+    Z_ret_dev = Z_all[M_ret_dev]
+    Z_fgt_dev = Z_all[M_fgt_dev]
+    A_ret = sae_encode_batch(sae, Z_ret_dev, device=device, batch=8192)
+    A_fgt = sae_encode_batch(sae, Z_fgt_dev, device=device, batch=8192)
+
+    # 6) feature stats & selection (supports per-speaker union) - same as LibriSpeech
+    print("[6/12] Computing feature statistics and selecting features...")
+    stats = feature_stats(A_fgt, A_ret)
+    feat_idx_global = select_features_from_stats(stats, top_k=build_U_top, fdr=0.05)
+    feat_idx = feat_idx_global
+    if per_speaker_union:
+        print("  computing per-forget-speaker feature unions... (not implemented, using global)")
+        feat_idx = feat_idx_global
+
+    # 7) prune & normalize decoder & build U - same as LibriSpeech
+    print("[7/12] Building U subspace...")
+    dec_w = sae.dec.weight.detach().cpu().numpy()   # [d, m]
+    dec_pruned = prune_and_normalize_decoder(dec_w, prune_threshold=1e-6)  # returns [d, r]
+    U = build_U_from_decoder(dec_w, feat_idx)
+    print(f"  U shape: {U.shape}")
+
+    # 8) compute LEACE in U if requested - same as LibriSpeech
+    P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
+    mu_r = None
+    if leace:
+        print("[8/12] Computing LEACE projector in U...")
+        mask_dev = np.array([s.endswith(':dev') for s in sets], dtype=bool)
+        # use indices to avoid repeated index() lookups (same fix as LibriSpeech)
+        dev_indices = np.where(mask_dev)[0]
+        Y_dev = np.array([1 if manifest[i]['speaker'] in forget_spks else 0 for i in dev_indices], dtype=int).reshape(-1, 1)
+        # safety check: shapes must align
+        assert Y_dev.shape[0] == Z_all[mask_dev].shape[0], "Y_dev rows must match dev rows of Z_all"
+        try:
+            P_r, mu_r = leace_projector_in_U(Z_all[mask_dev], U, Y_dev, ridge=leace_ridge)
+        except Exception as e:
+            print(f"  Warning: LEACE computation failed ({e}), falling back to identity projector")
+            P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
+            mu_r = np.zeros((1, U.shape[1]))
     else:
-        acc_ret_after = acc_fgt_after = float('nan')
+        print("[8/12] Skipping LEACE (identity)")
 
-    print("[10/11] Computing verification metrics")
-    mask_dev = (sets == 'dev')
-    mask_test = (sets == 'test')
-    dev_trials, dev_labels = build_verification_trials(labels, args.forget_speaker, mask_dev)
-    test_trials, test_labels = build_verification_trials(labels, args.forget_speaker, mask_test)
-    
-    scores_dev_before = compute_scores(E_all_norm, dev_trials) if len(dev_trials)>0 else np.array([])
-    scores_test_before = compute_scores(E_all_norm, test_trials) if len(test_trials)>0 else np.array([])
-    scores_dev_after = compute_scores(E_edit_norm, dev_trials) if len(dev_trials)>0 else np.array([])
-    scores_test_after = compute_scores(E_edit_norm, test_trials) if len(test_trials)>0 else np.array([])
+    # 9) Apply SAUCE gating (optional) then LEACE and optional noise - same as LibriSpeech
+    print("[9/12] Applying SAUCE gating (beta) and LEACE edit...")
+    Z_edit = Z_all.copy()
+    if beta > 0.0:
+        print("  applying SAUCE gating with beta", beta)
+        Z_edit = apply_sauce_gating(sae, Z_all, feat_idx, beta=beta, device=device, batch=8192)
+    if leace:
+        Z_edit = apply_subspace_leace(Z_edit, U, P_r, mu_r)
+    if noise_sigma and noise_sigma > 0:
+        Z_edit = inject_noise_in_subspace(Z_edit, U, sigma=noise_sigma)
 
-    if len(scores_dev_before) > 0:
-        scores_test_before_cal = calibrate_scores(scores_dev_before, dev_labels, scores_test_before)
-        scores_test_after_cal = calibrate_scores(scores_dev_after, dev_labels, scores_test_after)
-    else:
-        scores_test_before_cal = scores_test_before
-        scores_test_after_cal = scores_test_after
+    # map back to embedding space and l2 normalize
+    E_edit = invert_whitener(Z_edit, mu, W)
+    E_all_norm, E_edit_norm = l2_normalize(E_all), l2_normalize(E_edit)
 
-    eer_before_raw = compute_eer(scores_test_before, test_labels) if len(scores_test_before)>0 else (float('nan'), float('nan'))
-    eer_after_raw = compute_eer(scores_test_after, test_labels) if len(scores_test_after)>0 else (float('nan'), float('nan'))
-    eer_before_cal = compute_eer(scores_test_before_cal, test_labels) if len(scores_test_before_cal)>0 else (float('nan'), float('nan'))
-    eer_after_cal = compute_eer(scores_test_after_cal, test_labels) if len(scores_test_after_cal)>0 else (float('nan'), float('nan'))
+    # -------------------- 10) Per-class EERs - same as LibriSpeech --------------------
+    print("[10/12] Per-class verification EERs (each class vs all others) ...")
+    test_trials, test_labels = build_verification_trials(labels, forget_spks, M_ret_test | M_fgt_test)
+    scores_test_before = compute_scores(E_all_norm, test_trials)
+    scores_test_after = compute_scores(E_edit_norm, test_trials)
+    eer_before = eer_from_scores(scores_test_before, test_labels)
+    eer_after = eer_from_scores(scores_test_after, test_labels)
+    results["EER_before_raw"] = eer_before
+    results["EER_after_raw"] = eer_after
+    print(f"  Global EER: before {eer_before:.4f}, after {eer_after:.4f}")
+    all_spks = sorted(set(labels))
+    spk2id = {d: i for i, d in enumerate(all_spks)}
 
-    results = {
-        'EER_before_raw': eer_before_raw,
-        'EER_after_raw': eer_after_raw,
-        'EER_before_cal': eer_before_cal,
-        'EER_after_cal': eer_after_cal,
-        'classifier_retain_before': acc_ret_before,
-        'classifier_forget_before': acc_fgt_before,
-        'classifier_retain_after': acc_ret_after,
-        'classifier_forget_after': acc_fgt_after
-    }
+    # Build test lists
+    E_ret_test = E_all_norm[M_ret_test]
+    L_ret_test = [spk2id[d] for d in np.array(labels)[M_ret_test]]
+    E_fgt_test = E_all_norm[M_fgt_test]
+    L_fgt_test = [spk2id[d] for d in np.array(labels)[M_fgt_test]]
+    E_ret_test_edit = E_edit_norm[M_ret_test]
+    E_fgt_test_edit = E_edit_norm[M_fgt_test]
 
-    for p_tar in [0.01, 0.001]:
-        if len(scores_test_before) > 0:
-            results[f'actualDCF_before_{p_tar}'] = actual_dcf(scores_test_before, test_labels, p_tar=p_tar)
-            results[f'actualDCF_after_{p_tar}'] = actual_dcf(scores_test_after, test_labels, p_tar=p_tar)
-        else:
-            results[f'actualDCF_before_{p_tar}'] = float('nan')
-            results[f'actualDCF_after_{p_tar}'] = float('nan')
+    per_class_test = per_class_eers(E_all_norm, E_edit_norm, labels, mask=M_ret_test | M_fgt_test, rng_seed=seed)
+    per_class_ret = {c: vals for c, vals in per_class_test.items() if c in retain_spks}
+    per_class_fgt = {c: vals for c, vals in per_class_test.items() if c in forget_spks}
 
-    split_masks = {'train': (sets=='train'), 'dev': (sets=='dev'), 'test': (sets=='test')}
-    acc_before, auc_before = linear_probe_U(Z_all, labels, None, split_masks, target_speaker=args.forget_speaker)
-    acc_after, auc_after = linear_probe_U(Z_edit, labels, None, split_masks, target_speaker=args.forget_speaker)
-    results['linear_probe_acc_before'] = acc_before
-    results['linear_probe_acc_after'] = acc_after
-    results['linear_probe_auc_before'] = auc_before
-    results['linear_probe_auc_after'] = auc_after
-
-    per_class_test = per_class_eers(E_all_norm, E_edit_norm, labels, mask_test, rng_seed=args.seed)
-    per_class_ret = {c:vals for c,vals in per_class_test.items() if c != args.forget_speaker}
-    per_class_fgt = {c:vals for c,vals in per_class_test.items() if c == args.forget_speaker}
-    
-    def avg_eers(per_class_dict):
-        if len(per_class_dict) == 0:
-            return (float('nan'), float('nan'))
-        be = [v[0] for v in per_class_dict.values() if not np.isnan(v[0])]
-        ae = [v[1] for v in per_class_dict.values() if not np.isnan(v[1])]
-        return (float(np.mean(be)) if len(be)>0 else float('nan'), float(np.mean(ae)) if len(ae)>0 else float('nan'))
-    
     retain_avg_before, retain_avg_after = avg_eers(per_class_ret)
     forget_avg_before, forget_avg_after = avg_eers(per_class_fgt)
-    results['retain_EER_before_avg'] = retain_avg_before
-    results['retain_EER_after_avg'] = retain_avg_after
-    results['forget_EER_before_avg'] = forget_avg_before
-    results['forget_EER_after_avg'] = forget_avg_after
 
-    print("\n--- Verification Results ---")
-    for k,v in results.items():
-        print(f"{k}: {v}")
+    results = {}
+    results["retain_EER_before_avg"] = retain_avg_before
+    results["retain_EER_after_avg"] = retain_avg_after
+    results["forget_EER_before_avg"] = forget_avg_before
+    results["forget_EER_after_avg"] = forget_avg_after
 
-    print("[11/11] Saving results")
-    out_npz = os.path.join(args.save_dir, "artifacts_voxceleb_unlearn.npz")
-    np.savez(out_npz,
-             mu=mu, W=W, embeddings_before=E_all_norm, embeddings_after=E_edit_norm,
-             labels=np.array(labels, dtype=object), segment_ids=np.array(ids, dtype=object),
-             sets=np.array(sets, dtype=object), results=results, per_class_test=json.dumps(per_class_test))
+    # -------------------- 11) Linear Probing Evaluation - same as LibriSpeech --------------------
+    print("[11/12] Linear probing evaluation in U subspace (forget vs retain speakers)...")
+    split_mask = {"dev": M_ret_dev | M_fgt_dev, "test": M_ret_test | M_fgt_test}
+    acc_before, auc_before = linear_probe_U(Z_all, labels, U, split_mask, forget_classes=forget_spks)
+    acc_after, auc_after = linear_probe_U(Z_edit, labels, U, split_mask, forget_classes=forget_spks)
+
+    print(f'  Linear Probing accuracies and AUC, before: ({acc_before:.4f}, {auc_before:.4f}), after: ({acc_after:.4f}, {auc_after:.4f})')
+    results["linear_probe_acc_before"] = acc_before
+    results["linear_probe_acc_after"] = acc_after
+    results["linear_probe_auc_before"] = auc_before
+    results["linear_probe_auc_after"] = auc_after
+
+    # Print detailed and summary outputs (same as LibriSpeech)
+    print("\nPer-class EERs (sample):")
+    for i, (c, (eb, ea)) in enumerate(sorted(per_class_test.items())):
+        if c in forget_spks:
+            print("  [FORGET SPEAKER]")
+        print(f"  class {c}: EER_before={eb:.4f}, EER_after={ea:.4f}")
+
+    print("\n--- Average EER summary ---")
+    print(f"  Retain avg EER: before {retain_avg_before:.4f}, after {retain_avg_after:.4f}")
+    print(f"  Forget avg EER: before {forget_avg_before:.4f}, after {forget_avg_after:.4f}")
+
+    # Save summary JSON (same format as LibriSpeech)
+    stats_path = os.path.join(save_dir, "verification_eer_summary.json")
+    with open(stats_path, "w") as fh:
+        json.dump({
+            "per_class_count_test": len(per_class_test),
+            "retain_avg": {"before": retain_avg_before, "after": retain_avg_after},
+            "forget_avg": {"before": forget_avg_before, "after": forget_avg_after},
+            "linear_probe": {
+                "acc_before": acc_before, "acc_after": acc_after,
+                "auc_before": auc_before, "auc_after": auc_after
+            },
+            "forget_spks": forget_spks,
+        }, fh, indent=2)
+
+    # -------------------- 12) Speaker classifier (ResNet) training - same as LibriSpeech --------------------
+    print("[12/12] Speaker classification accuracy (ResNet) before/after edits...")
+    all_spks = sorted(list(set(labels)))
+    spk2id = {s: i for i, s in enumerate(all_spks)}
+
+    X_cls_train = E_all_norm[M_ret_dev | M_fgt_dev]
+    y_cls_train = [spk2id[s] for i, s in enumerate(labels) if (M_ret_dev | M_fgt_dev)[i]]
+    X_cls_val = E_all_norm[M_ret_test | M_fgt_test]
+    y_cls_val = [spk2id[s] for i, s in enumerate(labels) if (M_ret_test | M_fgt_test)[i]]
+
+    clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(all_spks), device=device, epochs=20, batch_size=512, lr=1e-3)
+
+    acc_ret_before = evaluate_classifier(clf, E_ret_test, L_ret_test, device=device)
+    acc_fgt_before = evaluate_classifier(clf, E_fgt_test, L_fgt_test, device=device)
+    acc_ret_after = evaluate_classifier(clf, E_ret_test_edit, L_ret_test, device=device)
+    acc_fgt_after = evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=device)
+
+    print(f"  Classifier Retain: before {acc_ret_before*100:.2f}% after {acc_ret_after*100:.2f}%")
+    print(f"  Classifier Forget: before {acc_fgt_before*100:.2f}% after {acc_fgt_after*100:.2f}%")
+
+    torch.save(sae.state_dict(), os.path.join(save_dir, "sae_state.pt"))
+    print("Done. Total time:", human_time(time.time() - t0_all))
+
+
+# -------------------- CLI --------------------
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--manifest_path", default="../datasets/voxceleb2/manifest.csv", help="VoxCeleb manifest file")
+    p.add_argument("--save_dir", default="./outputs", help="store artifacts")
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--retain_frac", type=float, default=0.7)
+    p.add_argument("--dev_frac_per_spk", type=float, default=0.7)
+    p.add_argument("--sae_hidden_mult", type=float, default=10.0)
+    p.add_argument("--sae_topk", type=int, default=128)
+    p.add_argument("--sae_epochs", type=int, default=150)
+    p.add_argument("--build_U_top", type=int, default=200)
+    p.add_argument("--beta", type=float, default=0.0)
+    p.add_argument("--leace", action="store_true")
+    p.add_argument("--leace_ridge", type=float, default=1e-6)
+    p.add_argument("--noise_sigma", type=float, default=0.02)
+    p.add_argument("--forget_spks", nargs='+', default=["id00017"], help="Speaker IDs to forget (e.g. 'id00017' 'id00018')")
+    p.add_argument("--encoder", type=str, default="ecapa", help="Encoder to use - 'ecapa', 'wav2vec2', 'hubert'")
+    p.add_argument("--embeddings_path", type=str, default=None, help="Load precomputed embeddings .npz")
+    p.add_argument("--wav2vec2_model", type=str, default="facebook/wav2vec2-base")
+    p.add_argument("--hubert_model", type=str, default="facebook/hubert-base-ls960")
     
-    np.save(os.path.join(args.save_dir, "Z_all.npy"), Z_all)
-    np.save(os.path.join(args.save_dir, "Z_edit.npy"), Z_edit)
-    
-    if clf is not None:
-        torch.save(clf.state_dict(), os.path.join(args.save_dir, "resnet_classifier.pt"))
-    
-    torch.save(sae.state_dict(), os.path.join(args.save_dir, "sae_state.pt"))
+    args = p.parse_args()
 
-    print("Saved results to", args.save_dir)
-    print("Total time:", human_time(time.time()-t0_all))
-
-if __name__ == '__main__':
-    main()
+    run_pipeline(
+        manifest_path=args.manifest_path, save_dir=args.save_dir,
+        device=args.device, seed=args.seed,
+        retain_frac=args.retain_frac, dev_frac_per_spk=args.dev_frac_per_spk,
+        sae_hidden_mult=args.sae_hidden_mult, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
+        build_U_top=args.build_U_top, beta=args.beta, leace=args.leace, leace_ridge=args.leace_ridge,
+        noise_sigma=args.noise_sigma, encoder=args.encoder, forget_spks=args.forget_spks,
+        embeddings_path=args.embeddings_path, wav2vec2_model=args.wav2vec2_model, hubert_model=args.hubert_model
+    )
