@@ -3,9 +3,6 @@ import os, time, random, glob
 from pathlib import Path
 from typing import List, Dict
 import numpy as np
-from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score
-from sklearn.linear_model import LogisticRegression
-from itertools import combinations
 
 from common import (
     seed_all, extract_embeddings, fit_whitener, apply_whitener, 
@@ -13,7 +10,9 @@ from common import (
     feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating,
     inject_noise_in_subspace, eer_from_scores, compute_scores,
-    train_classifier, evaluate_classifier
+    train_classifier, evaluate_classifier, linear_probe_U, 
+    build_verification_trials, per_class_eers, compute_intra_class_cosine_similarities,
+    compute_forget_inter_class_similarities, avg_eers
 )
 
 # -------------------- Manifest builder for AudioMNIST --------------------
@@ -37,208 +36,6 @@ def build_manifest_from_audiomnist(data_root: str) -> List[Dict]:
         raise RuntimeError(f"No AudioMNIST wav files found under {data_root}")
     return entries
 
-# -------------------- Evaluation helpers --------------------
-def actual_dcf(scores, labels, p_tar=0.01, c_miss=1., c_fa=1., threshold=None):
-    """
-    Compute actual DCF at a fixed threshold.
-    If threshold=None, use the EER operating point threshold.
-    """
-    fpr, tpr, thresh = roc_curve(labels, scores, pos_label=1)
-    
-    if threshold is None:
-        # pick threshold at closest to EER point (FNR ~ FPR)
-        fnr = 1 - tpr
-        idx = np.argmin(np.abs(fnr - fpr))
-        threshold = thresh[idx]
-    decisions = (scores >= threshold).astype(int)    
-    n_target = sum(labels)
-    n_non = len(labels) - n_target
-    miss = sum((decisions == 0) & (np.array(labels) == 1)) / max(1, n_target)
-    fa = sum((decisions == 1) & (np.array(labels) == 0)) / max(1, n_non)
-    
-    return c_miss * miss * p_tar + c_fa * fa * (1 - p_tar)
-
-
-def calibrate_scores(scores_dev: np.ndarray, labels_dev: np.ndarray, scores_test: np.ndarray) -> np.ndarray:
-    if len(scores_dev.shape) == 1: scores_dev = scores_dev.reshape(-1,1)
-    if len(scores_test.shape) == 1: scores_test = scores_test.reshape(-1,1)
-    clf = LogisticRegression(solver='liblinear')
-    clf.fit(scores_dev, labels_dev)
-    prob = clf.predict_proba(scores_test)[:,1]
-    eps = 1e-9
-    logits = np.log(prob + eps) - np.log(1 - prob + eps)
-    return logits
-
-# -------------------- utility measures --------------------
-def compute_intra_class_cosine_similarities(embeddings: np.ndarray, labels: List[str], mask: np.ndarray, rng_seed: int = 1337):
-    """
-    Compute intra-class cosine similarities for each class present in the mask.
-    For each class, computes cosine similarities between all pairs of samples from that class.
-    Returns dict: class_label -> (mean_similarity_before, mean_similarity_after)
-    """
-    rng = np.random.default_rng(rng_seed)
-    idx_in_mask = np.where(mask)[0].tolist()
-    classes = sorted({labels[i] for i in idx_in_mask})
-    per_class_similarities = {}
-    
-    for c in classes:
-        pos_idx = [i for i in idx_in_mask if labels[i] == c]
-        
-        if len(pos_idx) < 2:
-            continue
-            
-        # all possible positive pairs (i<j) within the same class
-        pos_pairs_all = list(combinations(pos_idx, 2))
-        
-        # compute cosine similarities for all pairs
-        similarities = compute_scores(embeddings, pos_pairs_all)
-        
-        # store mean similarity
-        mean_similarity = float(np.mean(similarities))
-        per_class_similarities[c] = mean_similarity
-    
-    return per_class_similarities
-
-def compute_forget_inter_class_similarities(embeddings: np.ndarray, labels: List[str], mask: np.ndarray, forget_digits: List[str], rng_seed: int = 1337, max_pairs_per_class: int = 100):
-    """
-    Compute inter-class cosine similarities between forget digits and other digits.
-    For each forget digit, computes cosine similarities with samples from other classes.
-    Returns dict: (forget_digit, other_digit) -> mean_similarity
-    """
-    rng = np.random.default_rng(rng_seed)
-    idx_in_mask = np.where(mask)[0].tolist()
-    all_classes = sorted({labels[i] for i in idx_in_mask})
-    other_classes = [c for c in all_classes if c not in forget_digits]
-    inter_class_similarities = {}
-    
-    for forget_digit in forget_digits:
-        for other_digit in other_classes:
-            idx_forget = [j for j in idx_in_mask if labels[j] == forget_digit]
-            idx_other = [j for j in idx_in_mask if labels[j] == other_digit]
-            
-            if len(idx_forget) < 1 or len(idx_other) < 1:
-                continue
-            
-            # sample pairs between forget and other class (limit to avoid too many computations)
-            n_pairs = min(max_pairs_per_class, len(idx_forget) * len(idx_other))
-            if n_pairs > 0:
-                # randomly sample pairs
-                pairs = []
-                for _ in range(n_pairs):
-                    i1 = rng.choice(idx_forget)
-                    i2 = rng.choice(idx_other)
-                    pairs.append((i1, i2))
-                
-                # compute cosine similarities
-                similarities = compute_scores(embeddings, pairs)
-                mean_similarity = float(np.mean(similarities))
-                inter_class_similarities[(forget_digit, other_digit)] = mean_similarity
-    
-    return inter_class_similarities
-
-def build_verification_trials(labels, forget_digits, split_mask, seed=42):
-    """
-    Build balanced verification trials for a given split (dev/test).
-    Returns: list of (i,j,label) where label=1 for target (both in forget_digits), 0 otherwise.
-    """
-    rng = random.Random(seed)
-    indices = [i for i, m in enumerate(split_mask) if m]
-    trials, trial_labels = [], []
-    
-    # separate indices
-    forget_indices = [i for i in indices if labels[i] in forget_digits]
-    retain_indices = [i for i in indices if labels[i] not in forget_digits]
-    
-    # positive trials: both digit in forget_digits
-    for i in forget_indices:
-        others = [j for j in forget_indices if j != i]
-        rng.shuffle(others)
-        for j in others:
-            trials.append((i, j))
-            trial_labels.append(1)
-    
-    # negative trials: one in forget_digits, one not
-    for i in forget_indices:
-        others = retain_indices.copy()
-        rng.shuffle(others)
-        for j in others:
-            trials.append((i, j))
-            trial_labels.append(0)
-    
-    return trials, np.array(trial_labels)
-
-def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[str], mask: np.ndarray, rng_seed: int = 1337):
-    """
-    For each class present in `mask`, compute EER using:
-        - positives = (pairs of samples both from that class, inside mask)
-        - negatives = (pairs where one sample is from that class and the other sample is from any other class in mask)
-    Returns dict: class_label -> (eer_before, eer_after)
-    """
-    rng = np.random.default_rng(rng_seed)
-    idx_in_mask = np.where(mask)[0].tolist()
-    classes = sorted({labels[i] for i in idx_in_mask})
-    per_class = {}
-    for c in classes:
-        pos_idx = [i for i in idx_in_mask if labels[i] == c]
-        other_idx = [i for i in idx_in_mask if labels[i] != c]
-
-        if len(pos_idx) < 2 or len(other_idx) < 1:
-            continue
-
-        # all possible positive pairs (i<j)
-        pos_pairs_all = list(combinations(pos_idx, 2))
-        # keep all positive pairs (you can subsample if desired)
-        pos_pairs_sel = pos_pairs_all
-
-        # sample negatives to match number of positives
-        n_neg = len(pos_pairs_sel)
-        pos_side_choices = rng.choice(pos_idx, size=n_neg, replace=True)
-        other_side_choices = rng.choice(other_idx, size=n_neg, replace=True)
-        neg_pairs_sel = [(int(a), int(b)) for a, b in zip(pos_side_choices, other_side_choices)]
-
-        # assemble combined trials and labels
-        trials = pos_pairs_sel + neg_pairs_sel
-        trial_labels = np.array([1] * len(pos_pairs_sel) + [0] * len(neg_pairs_sel), dtype=int)
-
-        # compute scores using compute_scores helper
-        scores_before = compute_scores(emb_before, trials)
-        scores_after = compute_scores(emb_after, trials)
-
-        # compute EER (eer_from_scores returns (eer, threshold))
-        try:
-            eer_b, _ = eer_from_scores(scores_before, trial_labels)
-        except Exception:
-            eer_b, _ = (float('nan'), float('nan'))
-        try:
-            eer_a, _ = eer_from_scores(scores_after, trial_labels)
-        except Exception:
-            eer_a, _ = (float('nan'), float('nan'))
-        per_class[c] = (float(eer_b), float(eer_a))
-
-    return per_class
-
-
-def linear_probe_U(Z_all, labels, U, split_mask, forget_digits=["0"]):
-    """Train/test a linear probe in reduced coordinates ZU for forget vs not-forget classification."""
-    if U.shape[1] == 0:
-        return float('nan'), float('nan')
-    # ZU = Z_all @ U  # reduced representation
-    
-    # Binarize labels: 1 = forget_digits, 0 = others
-    y = np.array([1 if l in forget_digits else 0 for l in labels])
-    
-    ZU_train = Z_all[split_mask['dev']]
-    y_train = y[split_mask['dev']]
-    ZU_test = Z_all[split_mask['test']]
-    y_test = y[split_mask['test']]
-    
-    clf = LogisticRegression(max_iter=500)
-    clf.fit(ZU_train, y_train)    
-    y_pred = clf.predict(ZU_test)
-    acc = accuracy_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, clf.decision_function(ZU_test))
-    return acc, auc
-
 # -------------------- Run full pipeline --------------------
 def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
                  dev_frac: float = 0.75,
@@ -260,7 +57,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"Forgetting digits: {forget_digits}")
 
     # 1) manifest + splits
-    print("[1/13] Building manifest and splits (AudioMNIST; digit-unlearning)...")
+    print("[1/12] Building manifest and splits (AudioMNIST; digit-unlearning)...")
     entries = build_manifest_from_audiomnist(data_root)
     # group by digit
     by_digit = {}
@@ -316,7 +113,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"  forget-dev: {M_forget_dev.sum()}, forget-test: {M_forget_test.sum()}, retain-dev: {M_retain_dev.sum()}, retain-test: {M_retain_test.sum()}")
 
     # 3) Whitener on retain-dev (we whiten on non-forget dev samples)
-    print("[3/13] Fitting whitener on retain-dev (non-forget dev)...")
+    print("[3/12] Fitting whitener on retain-dev (non-forget dev)...")
     E_ret_train = E_all[M_retain_dev]
     if E_ret_train.shape[0] < 2:
         raise RuntimeError("Not enough retain-dev (non-forget) samples to fit whitener")
@@ -324,7 +121,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     Z_all = apply_whitener(E_all, mu, W)
 
     # 4) SAE training on Z_dev (retain + forget union, unsupervised)
-    print("[4/13] Training SAE on Z_dev (all digits: retain+forget union)...")
+    print("[4/12] Training SAE on Z_dev (all digits: retain+forget union)...")
     Z_dev = Z_all[is_dev]   # retain + forget
     if Z_dev.shape[0] < 2:
         raise RuntimeError("Not enough dev samples to train SAE")
@@ -337,44 +134,44 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=min(4096, max(8, Z_sae_train.shape[0])), lr=1e-3, device=device)
 
     # 5) SAE activations for forget-dev vs retain-dev
-    print("[5/13] Encoding SAE activations...")
+    print("[5/12] Encoding SAE activations...")
     Z_ret_dev = Z_all[M_retain_dev]
     Z_fgt_dev = Z_all[M_forget_dev]
     A_ret = sae_encode_batch(sae, Z_ret_dev, device=device, batch=8192)
     A_fgt = sae_encode_batch(sae, Z_fgt_dev, device=device, batch=8192) if Z_fgt_dev.shape[0] > 0 else np.zeros((0, sae.m))
 
     # 6) feature stats & selection: features that predict forget-digits (A_fgt positive, A_ret negative)
-    print("[6/13] Computing feature statistics and selecting discriminative features (forget digits vs rest)...")
+    print("[6/12] Computing feature statistics and selecting discriminative features (forget digits vs rest)...")
     stats = feature_stats(A_fgt, A_ret)
     feat_idx_global = select_features_from_stats(stats, top_k=build_U_top, fdr=0.05)
     feat_idx = feat_idx_global
 
     # 7) build U from decoder atoms corresponding to selected features
-    print("[7/13] Building subspace U from decoder atoms...")
+    print("[7/12] Building subspace U from decoder atoms...")
     dec_w = sae.dec.weight.detach().cpu().numpy()  # [d, m]
     U = build_U_from_decoder(dec_w, feat_idx)
     print(f"  U shape: {U.shape}")
 
     # 8) compute LEACE projector in U to remove predictivity of forget-digits (Y=1 for forget digits)
     P_r = np.eye(U.shape[1])
+    mu_r = np.zeros((1, U.shape[1])) if U.shape[1] > 0 else None
     if leace and U.shape[1] > 0:
-        print("[8/13] Computing LEACE projector in U (removing component predictive of forget-digits)...")
+        print("[8/12] Computing LEACE projector in U (removing component predictive of forget-digits)...")
         mask_dev = is_dev
         Y_dev = y_binary[mask_dev].reshape(-1, 1)
         if mask_dev.sum() == 0:
             raise RuntimeError("No dev samples found for LEACE computation.")
         try:
             P_r, mu_r = leace_projector_in_U(Z_all[mask_dev], U, Y_dev, ridge=leace_ridge)
-            np.savez(os.path.join(save_dir, "leace_Pr.npz"), U=U, P_r=P_r)
         except Exception as e:
             print("  LEACE computation failed, falling back to identity. Error:", e)
             P_r = np.eye(U.shape[1])
+            mu_r = np.zeros((1, U.shape[1])) if U.shape[1] > 0 else None
     else:
-        print("[8/13] Skipping LEACE (identity)")
-        mu_r = np.zeros((1, U.shape[1])) if U.shape[1] > 0 else None
+        print("[8/12] Skipping LEACE (identity)")
 
     # 9) Apply SAUCE gating (optional) then LEACE, optionally add noise
-    print("[9/13] Applying SAUCE gating and LEACE edit...")
+    print("[9/12] Applying SAUCE gating and LEACE edit...")
     Z_edit = Z_all.copy()
     if beta and beta > 0.0 and len(feat_idx) > 0:
         Z_edit = apply_sauce_gating(sae, Z_all, feat_idx, beta=beta, device=device, batch=8192)
@@ -387,7 +184,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     E_all_norm, E_edit_norm = E_all / (np.linalg.norm(E_all, axis=1, keepdims=True) + 1e-12), E_edit / (np.linalg.norm(E_edit, axis=1, keepdims=True) + 1e-12)
 
     # 10) Evaluations
-    print("[10/13] Digit classification accuracy (ResNet) before/after edits...")
+    print("[10/12] Digit classification accuracy (ResNet) before/after edits...")
     all_digits = sorted(set(labels_digits))
     digit2id = {d:i for i,d in enumerate(all_digits)}
 
@@ -417,20 +214,17 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"  Classifier Retain: before {acc_ret_before*100:.2f}% after {acc_ret_after*100:.2f}%")
     print(f"  Classifier Forget: before {acc_fgt_before*100:.2f}% after {acc_fgt_after*100:.2f}%")
 
-    print("[11/13] Verification evaluation (EER, minDCF, Linear Probe).")
+    print("[11/12] Verification evaluation (EER, minDCF, Linear Probe).")
     print(f"  Verification trials: positive pairs within forget digits {forget_digits}, negative pairs across forget/retain")
     results = {}
 
     # --- Build dev/test trials
-    # dev_trials, dev_labels = build_verification_trials(labels_digits, forget_digits, is_dev)
     test_trials, test_labels = build_verification_trials(labels_digits, forget_digits, is_test)
 
     # --- Compute scores BEFORE edit ---
-    # scores_dev_before = compute_scores(E_all_norm, dev_trials)
     scores_test_before = compute_scores(E_all_norm, test_trials)
 
     # --- Compute scores AFTER edit ---
-    # scores_dev_after = compute_scores(E_edit_norm, dev_trials)
     scores_test_after = compute_scores(E_edit_norm, test_trials)
 
     # --- Compute EER (global forget-vs-rest) ---
@@ -442,21 +236,21 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
 
     # --- Linear probe in reduced coordinates U (existing) ---
     split_mask = {"dev": is_dev, "test": is_test}
-    acc_before, auc_before = linear_probe_U(Z_all, labels_digits, U, split_mask, forget_digits=forget_digits)
-    acc_after, auc_after = linear_probe_U(Z_edit, labels_digits, U, split_mask, forget_digits=forget_digits)
+    acc_before, auc_before = linear_probe_U(Z_all, labels_digits, U, split_mask, forget_classes=forget_digits)
+    acc_after, auc_after = linear_probe_U(Z_edit, labels_digits, U, split_mask, forget_classes=forget_digits)
     print(f'Linear Probing accuracies and auc, before : {acc_before, auc_before}, after: {acc_after, auc_after}')
 
     # --- Per-class EERs on TEST partition ---
     per_class_test = per_class_eers(E_all_norm, E_edit_norm, labels_digits, mask=(M_retain_test | M_forget_test), rng_seed=seed)
     
     # --- Intra-class cosine similarities on TEST partition ---
-    print("[12/13] Computing intra-class cosine similarities...")
+    print("[12/12] Computing intra-class cosine similarities...")
     intra_sim_before = compute_intra_class_cosine_similarities(E_all_norm, labels_digits, mask=(M_retain_test | M_forget_test), rng_seed=seed)
     intra_sim_after = compute_intra_class_cosine_similarities(E_edit_norm, labels_digits, mask=(M_retain_test | M_forget_test), rng_seed=seed)
 
     # --- Inter-class cosine similarities on TEST partition ---
-    inter_sim_before = compute_forget_inter_class_similarities(E_all_norm, labels_digits, mask=(M_retain_test | M_forget_test), forget_digits=forget_digits, rng_seed=seed)
-    inter_sim_after = compute_forget_inter_class_similarities(E_edit_norm, labels_digits, mask=(M_retain_test | M_forget_test), forget_digits=forget_digits, rng_seed=seed)
+    inter_sim_before = compute_forget_inter_class_similarities(E_all_norm, labels_digits, mask=(M_retain_test | M_forget_test), forget_classes=forget_digits, rng_seed=seed)
+    inter_sim_after = compute_forget_inter_class_similarities(E_edit_norm, labels_digits, mask=(M_retain_test | M_forget_test), forget_classes=forget_digits, rng_seed=seed)
 
     # Partition per-class dict into retain vs forget classes (for averages)
     all_digits_sorted = sorted(set(labels_digits))
@@ -466,25 +260,15 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     per_class_ret = {c: vals for c, vals in per_class_test.items() if c in retain_classes}
     per_class_fgt = {c: vals for c, vals in per_class_test.items() if c in forget_classes}
 
-    def avg_eers(per_class_dict):
-        if len(per_class_dict) == 0:
-            return (float('nan'), float('nan'))
-        be = [v[0] for v in per_class_dict.values() if not np.isnan(v[0])]
-        ae = [v[1] for v in per_class_dict.values() if not np.isnan(v[1])]
-        return float(np.mean(be)) if len(be) > 0 else float('nan'), float(np.mean(ae)) if len(ae) > 0 else float('nan')
-
     retain_avg_before, retain_avg_after = avg_eers(per_class_ret)
     forget_avg_before, forget_avg_after = avg_eers(per_class_fgt)
+    results['retain_EER_before_avg'] = retain_avg_before
+    results['retain_EER_after_avg'] = retain_avg_after
+    results['forget_EER_before_avg'] = forget_avg_before
+    results['forget_EER_after_avg'] = forget_avg_after
 
-    results["retain_EER_before_avg"] = retain_avg_before
-    results["retain_EER_after_avg"] = retain_avg_after
-    results["forget_EER_before_avg"] = forget_avg_before
-    results["forget_EER_after_avg"] = forget_avg_after
-
-    print("\n[13/13] Final Results")
-    # --- Print summary ---
     print("\n--- Verification Results ---")
-    for k, v in results.items():
+    for k,v in results.items():
         print(f"{k}: {v}")
 
     print("\nPer-class EERs (sample):")
@@ -523,10 +307,10 @@ if __name__ == "__main__":
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--dev_frac", type=float, default=0.9)
-    p.add_argument("--sae_hidden_mult", type=float, default=4.0)
+    p.add_argument("--sae_hidden_mult", type=float, default=10.0)
     p.add_argument("--sae_k", type=int, default=128)
-    p.add_argument("--sae_epochs", type=int, default=50)
-    p.add_argument("--build_U_top", type=int, default=100)
+    p.add_argument("--sae_epochs", type=int, default=100)
+    p.add_argument("--build_U_top", type=int, default=200)
     p.add_argument("--beta", type=float, default=0.0)
     p.add_argument("--leace", action="store_true", help="Compute LEACE projector in U (default: False if not provided)")
     p.add_argument("--leace_ridge", type=float, default=1e-6)

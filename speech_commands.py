@@ -1,20 +1,17 @@
 from __future__ import annotations
-import os, time, random, glob
+import os, time, random
 from pathlib import Path
 from typing import List, Dict
 import numpy as np
-import torch
-from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score
-from sklearn.linear_model import LogisticRegression
-
 
 from common import (
     seed_all, extract_embeddings, fit_whitener, apply_whitener,
     invert_whitener, TopKSAE, train_sae, sae_encode_batch,
     feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating,
-    inject_noise_in_subspace, compute_eer, compute_scores,
-    train_classifier, evaluate_classifier
+    inject_noise_in_subspace, eer_from_scores, compute_scores,
+    train_classifier, evaluate_classifier, linear_probe_U, 
+    build_verification_trials, per_class_eers, compute_intra_class_cosine_similarities, avg_eers
 )
 
 from itertools import combinations
@@ -65,170 +62,6 @@ def build_manifest_from_speechcommands(data_root: str, allowed_exts: List[str]=[
     print(f"Found {len(entries)} audio files across {len(command_dirs)} command categories.")
     return entries
 
-# -------------------- Evaluation helpers --------------------
-def actual_dcf(scores, labels, p_tar=0.01, c_miss=1., c_fa=1., threshold=None):
-    """
-    Compute actual DCF at a fixed threshold.
-    If threshold=None, use the EER operating point threshold.
-    """
-    fpr, tpr, thresh = roc_curve(labels, scores, pos_label=1)
-
-    if threshold is None:
-        # pick threshold at closest to EER point (FNR ~ FPR)
-        fnr = 1 - tpr
-        idx = np.argmin(np.abs(fnr - fpr))
-        threshold = thresh[idx]
-    decisions = (scores >= threshold).astype(int)
-    n_target = sum(labels)
-    n_non = len(labels) - n_target
-    miss = sum((decisions == 0) & (np.array(labels) == 1)) / max(1, n_target)
-    fa = sum((decisions == 1) & (np.array(labels) == 0)) / max(1, n_non)
-
-    return c_miss * miss * p_tar + c_fa * fa * (1 - p_tar)
-
-
-def calibrate_scores(scores_dev: np.ndarray, labels_dev: np.ndarray, scores_test: np.ndarray) -> np.ndarray:
-    if len(scores_dev.shape) == 1: scores_dev = scores_dev.reshape(-1,1)
-    if len(scores_test.shape) == 1: scores_test = scores_test.reshape(-1,1)
-    clf = LogisticRegression(solver='liblinear')
-    clf.fit(scores_dev, labels_dev)
-    prob = clf.predict_proba(scores_test)[:,1]
-    eps = 1e-9
-    logits = np.log(prob + eps) - np.log(1 - prob + eps)
-    return logits
-
-# -------------------- utility measures --------------------
-def compute_intra_class_cosine_similarities(embeddings: np.ndarray, labels: List[str], mask: np.ndarray, rng_seed: int = 1337):
-    """
-    Compute intra-class cosine similarities for each class present in the mask (all pairs inside class)
-    Returns dict: class_label -> mean_similarity
-    """
-    rng = random.Random(rng_seed)
-    idx_in_mask = np.where(mask)[0].tolist()
-    classes = sorted({labels[i] for i in idx_in_mask})
-    per_class_similarities = {}
-
-    for c in classes:
-        pos_idx = [i for i in idx_in_mask if labels[i] == c]
-
-        if len(pos_idx) < 2: continue
-
-        pos_pairs_all = list(combinations(pos_idx, 2))
-        similarities = compute_scores(embeddings, pos_pairs_all)
-        mean_similarity = float(np.mean(similarities))
-        per_class_similarities[c] = mean_similarity
-
-    return per_class_similarities
-
-def build_verification_trials(labels, forget_commands, split_mask, seed=42):
-    """
-    Build balanced verification trials for a given split (dev/test).
-    Limits the number of positive and negative pairs generated.
-    Returns: list of (i,j,label) where label=1 for target (both in forget_commands), 0 otherwise.
-    """
-    rng = random.Random(seed)
-    indices = [i for i, m in enumerate(split_mask) if m]
-    trials, trial_labels = [], []
-
-    forget_indices = [i for i in indices if labels[i] in forget_commands]
-    retain_indices = [i for i in indices if labels[i] not in forget_commands]
-
-    # positive trials: both command in forget_commands
-    pos_pairs = []
-    if len(forget_indices) >= 2:
-         all_pos_pairs = list(combinations(forget_indices, 2))
-         pos_pairs = rng.sample(all_pos_pairs, len(all_pos_pairs))
-
-    # negative trials: one in forget_commands, one not
-    neg_pairs = []
-    if len(forget_indices) > 0 and len(retain_indices) > 0:
-        all_neg_pairs = [(f, r) for f in forget_indices for r in retain_indices]
-        neg_pairs = rng.sample(all_neg_pairs, len(all_neg_pairs))
-
-    trials = pos_pairs + neg_pairs
-    trial_labels = np.array([1] * len(pos_pairs) + [0] * len(neg_pairs), dtype=int)
-    combined = list(zip(trials, trial_labels))
-    rng.shuffle(combined)
-    trials, trial_labels = zip(*combined) if combined else ([], [])
-    print(f"  Built {len(trials)} verification trials ({len(pos_pairs)} positive, {len(neg_pairs)} negative).")
-    return list(trials), np.array(trial_labels)
-
-def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[str], mask: np.ndarray, rng_seed: int = 1337):
-    """
-    For each class present in `mask`, compute EER using:
-        - positives = (pairs of samples both from that class, inside mask)
-        - negatives = (pairs where one sample is from that class and the other sample is from any other class in mask)
-    Returns dict: class_label -> (eer_before, eer_after)
-    """
-    rng = random.Random(rng_seed)
-    idx_in_mask = np.where(mask)[0].tolist()
-    classes = sorted({labels[i] for i in idx_in_mask})
-    per_class = {}
-
-    for c in classes:
-        pos_idx = [i for i in idx_in_mask if labels[i] == c]
-        other_idx = [i for i in idx_in_mask if labels[i] != c]
-
-        if len(pos_idx) < 2 or len(other_idx) < 1: continue
-
-        pos_pairs_all = list(combinations(pos_idx, 2))
-        pos_pairs_sel = rng.sample(pos_pairs_all,len(pos_pairs_all))
-
-        n_neg_target = len(pos_pairs_sel)
-        if len(pos_idx) > 0 and len(other_idx) > 0:
-            pos_side_choices = rng.choices(pos_idx, k=n_neg_target)
-            other_side_choices = rng.choices(other_idx, k=n_neg_target)
-            neg_pairs_sel = [(int(a), int(b)) for a, b in zip(pos_side_choices, other_side_choices)]
-        else: neg_pairs_sel = []
-
-
-        if not pos_pairs_sel and not neg_pairs_sel: continue
-
-        trials = pos_pairs_sel + neg_pairs_sel
-        trial_labels = np.array([1] * len(pos_pairs_sel) + [0] * len(neg_pairs_sel), dtype=int)
-        combined = list(zip(trials, trial_labels))
-        rng.shuffle(combined)
-        trials, trial_labels = zip(*combined) if combined else ([], [])
-        trials = list(trials)
-        scores_before = compute_scores(emb_before, trials)
-        scores_after = compute_scores(emb_after, trials)
-
-        try:
-            eer_b, _ = compute_eer(scores_before, trial_labels)
-        except Exception:
-            eer_b, _ = (float('nan'), float('nan'))
-        try:
-            eer_a, _ = compute_eer(scores_after, trial_labels)
-        except Exception:
-            eer_a, _ = (float('nan'), float('nan'))
-        per_class[c] = (float(eer_b), float(eer_a))
-
-    return per_class
-
-def linear_probe_U(Z_all, labels, U, split_mask, forget_commands=["0"]):
-    """Train/test a linear probe in reduced coordinates ZU for forget vs not-forget classification."""
-    if U.shape[1] == 0:
-        return float('nan'), float('nan')
-    ZU = Z_all @ U  # reduced representation
-
-    # Binarize labels: 1 = forget_commands, 0 = others
-    y = np.array([1 if l in forget_commands else 0 for l in labels])
-    ZU_train = ZU[split_mask['dev']]
-    y_train = y[split_mask['dev']]
-    ZU_test = ZU[split_mask['test']]
-    y_test = y[split_mask['test']]
-
-    if len(ZU_train) == 0 or len(ZU_test) == 0 or len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
-        print("Warning: Not enough samples or classes for linear probe evaluation. Skipping.")
-        return float('nan'), float('nan')
-
-    clf = LogisticRegression(max_iter=500)
-    clf.fit(ZU_train, y_train)
-    y_pred = clf.predict(ZU_test)
-    acc = accuracy_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, clf.decision_function(ZU_test))
-    return acc, auc
-
 # -------------------- Command classifier (ResNet-like) --------------------
 def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
                  dev_frac: float = 0.75,
@@ -250,7 +83,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"Forgetting commands: {forget_commands}")
 
     # 1) manifest + splits
-    print("[1/11] Building manifest and splits...")
+    print("[1/12] Building manifest and splits...")
     entries = build_manifest_from_speechcommands(data_root)
 
     # group by command label
@@ -305,7 +138,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"  forget-dev: {M_forget_dev.sum()}, forget-test: {M_forget_test.sum()}, retain-dev: {M_retain_dev.sum()}, retain-test: {M_retain_test.sum()}")
 
     # 3) Whitener on retain-dev
-    print("[3/11] Fitting whitener on retain-dev...")
+    print("[3/12] Fitting whitener on retain-dev...")
     E_ret_train = E_all[M_retain_dev]
     if E_ret_train.shape[0] < 2:
         raise RuntimeError("Not enough retain-dev samples to fit whitener")
@@ -313,7 +146,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     Z_all = apply_whitener(E_all, mu, W)
 
     # 4) SAE training on Z_dev
-    print("[4/11] Training SAE on Z_dev...")
+    print("[4/12] Training SAE on Z_dev...")
     Z_dev = Z_all[is_dev]
     if Z_dev.shape[0] < 2:
         raise RuntimeError("Not enough dev samples to train SAE")
@@ -326,20 +159,20 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=min(4096, max(8, Z_sae_train.shape[0])), lr=1e-3, device=device)
 
     # 5) SAE activations
-    print("[5/11] Encoding SAE activations...")
+    print("[5/12] Encoding SAE activations...")
     Z_ret_dev = Z_all[M_retain_dev]
     Z_fgt_dev = Z_all[M_forget_dev]
     A_ret = sae_encode_batch(sae, Z_ret_dev, device=device, batch=8192)
     A_fgt = sae_encode_batch(sae, Z_fgt_dev, device=device, batch=8192) if Z_fgt_dev.shape[0] > 0 else np.zeros((0, sae.m))
 
     # 6) feature stats & selection
-    print("[6/11] Computing feature statistics and selecting discriminative features...")
+    print("[6/12] Computing feature statistics and selecting discriminative features...")
     stats = feature_stats(A_fgt, A_ret)
     feat_idx_global = select_features_from_stats(stats, top_k=build_U_top, fdr=0.05)
     feat_idx = feat_idx_global
 
     # 7) build U from decoder atoms
-    print("[7/11] Building subspace U from decoder atoms...")
+    print("[7/12] Building subspace U from decoder atoms...")
     dec_w = sae.dec.weight.detach().cpu().numpy()
     U = build_U_from_decoder(dec_w, feat_idx)
     print(f"  U shape: {U.shape}")
@@ -348,7 +181,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     P_r = np.eye(U.shape[1])
     mu_r = np.zeros((1, U.shape[1])) if U.shape[1] > 0 else None
     if leace and U.shape[1] > 0:
-        print("[8/11] Computing LEACE projector in U...")
+        print("[8/12] Computing LEACE projector in U...")
         mask_dev = is_dev
         Y_dev = y_binary[mask_dev].reshape(-1, 1)
         if mask_dev.sum() == 0:
@@ -361,11 +194,10 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
             P_r = np.eye(U.shape[1])
             mu_r = np.zeros((1, U.shape[1])) if U.shape[1] > 0 else None
     else:
-        print("[8/11] Skipping LEACE (identity)")
-
+        print("[8/12] Skipping LEACE (identity)")
 
     # 9) Apply SAUCE gating, LEACE, and noise
-    print("[9/11] Applying SAUCE gating and LEACE edit...")
+    print("[9/12] Applying SAUCE gating and LEACE edit...")
     Z_edit = Z_all.copy()
     if beta and beta > 0.0 and len(feat_idx) > 0:
         Z_edit = apply_sauce_gating(sae, Z_all, feat_idx, beta=beta, device=device, batch=8192)
@@ -378,7 +210,7 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     E_all_norm, E_edit_norm = E_all / (np.linalg.norm(E_all, axis=1, keepdims=True) + 1e-12), E_edit / (np.linalg.norm(E_edit, axis=1, keepdims=True) + 1e-12)
 
     # 10) Evaluations
-    print("[10/11] Command classification accuracy before/after edits...")
+    print("[10/12] Command classification accuracy before/after edits...")
     all_commands = sorted(set(labels_commands))
     cmd2id = {c:i for i,c in enumerate(all_commands)}
 
@@ -417,13 +249,12 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
     print(f"  Classifier Retain: before {acc_ret_before*100:.2f}% after {acc_ret_after*100:.2f}%")
     print(f"  Classifier Forget: before {acc_fgt_before*100:.2f}% after {acc_fgt_after*100:.2f}%")
 
-    print("[11/11] Verification evaluation (EER, minDCF, Linear Probe).")
+    print("[11/12] Verification evaluation (EER, minDCF, Linear Probe).")
     print(f"  Verification trials: positive pairs within forget commands {forget_commands}, negative pairs across forget/retain")
     results = {}
     
     dev_trials, dev_labels = build_verification_trials(labels_commands, forget_commands, is_dev)
     test_trials, test_labels = build_verification_trials(labels_commands, forget_commands, is_test)
-
 
     if len(test_trials) == 0:
         print("Warning: Not enough test trials for verification evaluation. Skipping.")
@@ -444,12 +275,11 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
             eer_before = (float('nan'), float('nan'))
             eer_after = (float('nan'), float('nan'))
         else:
-            eer_before = compute_eer(scores_test_before, test_labels)
-            eer_after = compute_eer(scores_test_after, test_labels)
+            eer_before = eer_from_scores(scores_test_before, test_labels)
+            eer_after = eer_from_scores(scores_test_after, test_labels)
 
         results["EER_before_raw"] = eer_before
         results["EER_after_raw"] = eer_after
-
 
     # Linear probe in reduced coordinates U
     split_mask = {"dev": is_dev, "test": is_test}
@@ -458,8 +288,8 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
         acc_before, auc_before = float('nan'), float('nan')
         acc_after, auc_after = float('nan'), float('nan')
     else:
-        acc_before, auc_before = linear_probe_U(Z_all, labels_commands, U, split_mask, forget_commands=forget_commands)
-        acc_after, auc_after = linear_probe_U(Z_edit, labels_commands, U, split_mask, forget_commands=forget_commands)
+        acc_before, auc_before = linear_probe_U(Z_all, labels_commands, U, split_mask, forget_classes=forget_commands)
+        acc_after, auc_after = linear_probe_U(Z_edit, labels_commands, U, split_mask, forget_classes=forget_commands)
         print(f'Linear probe accuracy before: {acc_before, auc_before}, after : {acc_after, auc_after}')
 
     # Per-class EERs on TEST partition
@@ -477,14 +307,6 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
 
     per_class_ret = {c: vals for c, vals in per_class_test.items() if c in retain_classes}
     per_class_fgt = {c: vals for c, vals in per_class_test.items() if c in forget_classes}
-
-    def avg_eers(per_class_dict):
-        if len(per_class_dict) == 0:
-            return (float('nan'), float('nan'))
-        be = [v[0] for v in per_class_dict.values() if not np.isnan(v[0])]
-        ae = [v[1] for v in per_class_dict.values() if not np.isnan(v[1])]
-        return (float(np.mean(be)) if len(be) > 0 else float('nan'),
-                float(np.mean(ae)) if len(ae) > 0 else float('nan'))
 
     retain_avg_before, retain_avg_after = avg_eers(per_class_ret)
     forget_avg_before, forget_avg_after = avg_eers(per_class_fgt)
@@ -524,14 +346,14 @@ def run_pipeline(data_root: str, save_dir: str = "./runs/exp", device: str = "cu
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", default="./datasets/speech_commands", help="SpeechCommands root containing recordings/")
+    p.add_argument("--data_root", default="../datasets/speech_commands", help="SpeechCommands root containing recordings/")
     p.add_argument("--save_dir", default="./outputs_speechcommands", help="where to store artifacts")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--dev_frac", type=float, default=0.9)
-    p.add_argument("--sae_hidden_mult", type=float, default=4.0)
+    p.add_argument("--sae_hidden_mult", type=float, default=10.0)
     p.add_argument("--sae_k", type=int, default=128)
-    p.add_argument("--sae_epochs", type=int, default=50)
+    p.add_argument("--sae_epochs", type=int, default=100)
     p.add_argument("--build_U_top", type=int, default=200)
     p.add_argument("--beta", type=float, default=0.0)
     p.add_argument("--leace", action="store_true", help="Compute LEACE projector in U (default: False if not provided)")
