@@ -1,3 +1,3 @@
 # Interpretability-guided-unlearning-audio
 
-- the basic pipeline from the pdf
+- the original implementation pipeline from the pdf
