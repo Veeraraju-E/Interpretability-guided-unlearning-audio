@@ -2,7 +2,6 @@ from __future__ import annotations
 import math
 import random
 import os
-import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,45 +14,13 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
-
-# optional dependencies
-try:
-    from statsmodels.stats.multitest import multipletests as _multipletests
-    multipletests = _multipletests
-except Exception:
-    multipletests = None
-
-try:
-    from sklearn.covariance import LedoitWolf
-    _HAS_LED = True
-except Exception:
-    LedoitWolf = None
-    _HAS_LED = False
-
-try:
-    from transformers import AutoFeatureExtractor, AutoModel
-    _HAS_TRANSFORMERS = True
-except Exception:
-    AutoFeatureExtractor = AutoModel = None
-    _HAS_TRANSFORMERS = False
-
-try:
-    import umap
-    _HAS_UMAP = True
-except Exception:
-    _HAS_UMAP = False
-
-try:
-    import torchaudio
-except Exception:
-    torchaudio = None
-
-try:
-    from speechbrain.pretrained import EncoderClassifier
-except Exception:
-    EncoderClassifier = None
-
+from sklearn.covariance import LedoitWolf
+from statsmodels.stats.multitest import multipletests as _multipletests
+multipletests = _multipletests
+import torchaudio
+from speechbrain.pretrained import EncoderClassifier
 from typing import List, Dict, Optional, Tuple
+from transformers import AutoFeatureExtractor, AutoModel
 
 # -------------------- Utilities --------------------
 
@@ -112,9 +79,6 @@ def extract_ecapa_embeddings(entries, device='cuda', label_key='speaker'):
 # -------------------- HF wav2vec2 / hubert extraction --------------------
 @torch.no_grad()
 def _extract_hf_embeddings(entries: list, model_name: str, device: str = 'cuda', target_sr: int = 16000, label_key='speaker'):
-    if not _HAS_TRANSFORMERS:
-        raise RuntimeError("transformers is not installed. Please `pip install transformers` to enable wav2vec2/hubert.")
-
     processor = AutoFeatureExtractor.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name).to(device).eval()
 
@@ -167,7 +131,7 @@ def fit_whitener(X: np.ndarray, eps: float = 1e-8, use_shrinkage: bool = True, s
     Xc = X - mu
     N = Xc.shape[0]
 
-    if use_shrinkage and _HAS_LED and LedoitWolf is not None:
+    if use_shrinkage:
         try:
             lw = LedoitWolf(store_precision=False)
             lw.fit(Xc)
@@ -183,16 +147,13 @@ def fit_whitener(X: np.ndarray, eps: float = 1e-8, use_shrinkage: bool = True, s
     W = evecs @ np.diag(1.0 / np.sqrt(evals)) @ evecs.T
     return mu, W
 
-
 def apply_whitener(X: np.ndarray, mu: np.ndarray, W: np.ndarray) -> np.ndarray:
     return (X - mu) @ W
-
 
 def invert_whitener(Z: np.ndarray, mu: np.ndarray, W: np.ndarray) -> np.ndarray:
     # W is symmetric in our construction, but use pinv for numerical safety
     W_inv = np.linalg.pinv(W)
     return (Z @ W_inv.T) + mu
-
 
 def l2_normalize(X: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
@@ -214,18 +175,17 @@ class TopKSAE(nn.Module):
         nn.init.xavier_uniform_(self.dec.weight)
 
     def _ensure_2d(self, z: torch.Tensor) -> torch.Tensor:
-        if z.ndim == 3 and z.size(1) == 1:
-            z = z.squeeze(1)
-        if z.ndim > 2:
-            z = z.view(z.size(0), -1)
+        if z.ndim == 3 and z.size(1) == 1: z = z.squeeze(1)
+        if z.ndim > 2: z = z.view(z.size(0), -1)
         return z
 
     def encode(self, z: torch.Tensor) -> torch.Tensor:
         z = self._ensure_2d(z)
         assert z.size(1) == self.input_dim, f"Encoder expected in_features={self.input_dim}, got {z.size(1)}"
-        a = F.relu(self.enc(z))
+        # a = F.relu(self.enc(z))
+        a = self.enc(z)
         if 0 < self.k < a.shape[1]:
-            # top-k thresholding (keeps possible ties above kth)
+            # top-k thresholding
             topk_vals, _ = torch.topk(a, self.k, dim=1)
             kth = topk_vals[:, -1].unsqueeze(1)
             mask = (a >= kth).float()
@@ -324,7 +284,6 @@ def prune_and_normalize_decoder(dec_weight: np.ndarray, prune_threshold: float =
 
 
 # -------------------- Feature mining statistics --------------------
-
 def cohens_d(x_pos: np.ndarray, x_neg: np.ndarray) -> float:
     n1, n2 = len(x_pos), len(x_neg)
     m1, m2 = x_pos.mean(), x_neg.mean()
@@ -466,14 +425,11 @@ def inject_noise_in_subspace(Z: np.ndarray, U: np.ndarray, sigma: float = 0.02, 
     return Z + (noise @ U.T)
 
 
-from sklearn.metrics import roc_curve
-
 def compute_scores(embeddings, trials):
     scores = []
     for i, j in trials:
         scores.append(float(np.dot(embeddings[i], embeddings[j])))
     return np.array(scores)
-
 
 def eer_from_scores(scores: np.ndarray, labels: np.ndarray, return_threshold: bool = False):
     """
@@ -537,8 +493,7 @@ def evaluate_classifier(model: ResNetClassifier, X: np.ndarray, y: list[int], de
     return acc
 
 
-# -------------------- New helpers: effective rank & participation  --------------------
-
+# -------------------- Effective rank & participation  --------------------
 def effective_rank(svals: np.ndarray, threshold: float = 0.01) -> int:
     svals = np.array(svals)
     if svals.size == 0:
@@ -553,7 +508,7 @@ def participation_ratio(energy: np.ndarray) -> float:
     return float(num / den)
 
 
-# -------------------- Jacobian sensitivity estimate (finite differences) --------------------
+# -------------------- Jacobian sensitivity estimate --------------------
 def estimate_jacobian_alignment(sae: TopKSAE, Z_samples: np.ndarray, deltas: np.ndarray, eps: float = 1e-4, device: str = 'cpu') -> np.ndarray:
     sae = sae.to(device).eval()
     Z = Z_samples.copy()
@@ -573,11 +528,9 @@ def estimate_jacobian_alignment(sae: TopKSAE, Z_samples: np.ndarray, deltas: np.
 
 
 # -------------------- Plotting helpers --------------------
-
 def ensure_dir(path: str):
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
-
 
 def plot_whitening_spectrum(evals: np.ndarray, outpath: str):
     ensure_dir(os.path.dirname(outpath) or ".")
@@ -703,8 +656,7 @@ def plot_participation_ratio_hist(part_ratios: np.ndarray, outpath: str):
 
 # -------------------- Evaluation and Verification Functions --------------------
 
-def linear_probe_U(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_mask: Dict[str, np.ndarray], 
-                   forget_classes: List[str], device: str = 'cuda') -> Tuple[float, float]:
+def linear_probe_U(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_mask: Dict[str, np.ndarray],  forget_classes: List[str], device: str = 'cuda') -> Tuple[float, float]:
     """
     Train/test a linear probe **in the reduced frame**: X = ZU.
     Returns (accuracy, AUC) on the test split.
@@ -733,8 +685,7 @@ def linear_probe_U(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_ma
     return acc, auc_val
 
 
-def build_verification_trials(labels: List[str], forget_classes: List[str], split_mask: np.ndarray, 
-                             seed: int = 42, max_pairs_per_class: int = 100) -> Tuple[List[Tuple[int, int]], np.ndarray]:
+def build_verification_trials(labels: List[str], forget_classes: List[str], split_mask: np.ndarray, seed: int = 42, max_pairs_per_class: int = 100) -> Tuple[List[Tuple[int, int]], np.ndarray]:
     """
     Build balanced verification trials for a given split (dev/test).
     
@@ -779,8 +730,7 @@ def build_verification_trials(labels: List[str], forget_classes: List[str], spli
     return list(trials), np.array(trial_labels)
 
 
-def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[str], 
-                   mask: np.ndarray, rng_seed: int = 1337) -> Dict[str, Tuple[float, float]]:
+def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[str],  mask: np.ndarray, rng_seed: int = 1337) -> Dict[str, Tuple[float, float]]:
     """
     For each class present in `mask`, compute EER using:
         - positives = (pairs of samples both from that class, inside mask)
@@ -805,8 +755,7 @@ def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[s
         pos_idx = [i for i in idx_in_mask if labels[i] == c]
         other_idx = [i for i in idx_in_mask if labels[i] != c]
         
-        if len(pos_idx) < 2 or len(other_idx) < 1:
-            continue
+        if len(pos_idx) < 2 or len(other_idx) < 1: continue
         
         # all possible positive pairs (i<j)
         pos_pairs_all = list(combinations(pos_idx, 2))
@@ -841,20 +790,10 @@ def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[s
     return per_class
 
 
-def compute_intra_class_cosine_similarities(embeddings: np.ndarray, labels: List[str], 
-                                           mask: np.ndarray, rng_seed: int = 1337) -> Dict[str, float]:
+def compute_intra_class_cosine_similarities(embeddings: np.ndarray, labels: List[str],  mask: np.ndarray, rng_seed: int = 1337) -> Dict[str, float]:
     """
     Compute intra-class cosine similarities for each class present in the mask.
     For each class, computes cosine similarities between all pairs of samples from that class.
-    
-    Args:
-        embeddings: Embeddings to compute similarities for
-        labels: List of class labels
-        mask: Boolean mask for samples to consider
-        rng_seed: Random seed
-    
-    Returns:
-        Dict: class_label -> mean_similarity
     """
     rng = np.random.default_rng(rng_seed)
     idx_in_mask = np.where(mask)[0].tolist()
@@ -863,40 +802,20 @@ def compute_intra_class_cosine_similarities(embeddings: np.ndarray, labels: List
     
     for c in classes:
         pos_idx = [i for i in idx_in_mask if labels[i] == c]
+        if len(pos_idx) < 2: continue
         
-        if len(pos_idx) < 2:
-            continue
-        
-        # all possible positive pairs (i<j) within the same class
         pos_pairs_all = list(combinations(pos_idx, 2))
-        
-        # compute cosine similarities for all pairs
         similarities = compute_scores(embeddings, pos_pairs_all)
-        
-        # store mean similarity
         mean_similarity = float(np.mean(similarities))
         per_class_similarities[c] = mean_similarity
     
     return per_class_similarities
 
 
-def compute_forget_inter_class_similarities(embeddings: np.ndarray, labels: List[str], 
-                                           mask: np.ndarray, forget_classes: List[str], 
-                                           rng_seed: int = 1337, max_pairs_per_class: int = 100) -> Dict[Tuple[str, str], float]:
+def compute_forget_inter_class_similarities(embeddings: np.ndarray, labels: List[str],  mask: np.ndarray, forget_classes: List[str], rng_seed: int = 1337, max_pairs_per_class: int = 100) -> Dict[Tuple[str, str], float]:
     """
     Compute inter-class cosine similarities between forget classes and other classes.
     For each forget class, computes cosine similarities with samples from other classes.
-    
-    Args:
-        embeddings: Embeddings to compute similarities for
-        labels: List of class labels
-        mask: Boolean mask for samples to consider
-        forget_classes: List of classes to forget
-        rng_seed: Random seed
-        max_pairs_per_class: Maximum pairs to sample per class combination
-    
-    Returns:
-        Dict: (forget_class, other_class) -> mean_similarity
     """
     rng = np.random.default_rng(rng_seed)
     idx_in_mask = np.where(mask)[0].tolist()
@@ -922,7 +841,6 @@ def compute_forget_inter_class_similarities(embeddings: np.ndarray, labels: List
                     i2 = rng.choice(idx_other)
                     pairs.append((i1, i2))
                 
-                # compute cosine similarities
                 similarities = compute_scores(embeddings, pairs)
                 mean_similarity = float(np.mean(similarities))
                 inter_class_similarities[(forget_class, other_class)] = mean_similarity
@@ -930,75 +848,9 @@ def compute_forget_inter_class_similarities(embeddings: np.ndarray, labels: List
     return inter_class_similarities
 
 
-def actual_dcf(scores: np.ndarray, labels: np.ndarray, p_tar: float = 0.01, 
-               c_miss: float = 1.0, c_fa: float = 1.0, threshold: float = None) -> float:
-    """
-    Compute actual DCF at a fixed threshold.
-    If threshold=None, use the EER operating point threshold.
-    
-    Args:
-        scores: Similarity scores
-        labels: Binary labels (1=positive, 0=negative)
-        p_tar: Target prior
-        c_miss: Cost of miss
-        c_fa: Cost of false alarm
-        threshold: Decision threshold (if None, uses EER threshold)
-    
-    Returns:
-        Actual DCF value
-    """
-    fpr, tpr, thresh = roc_curve(labels, scores, pos_label=1)
-    
-    if threshold is None:
-        # pick threshold at closest to EER point (FNR ~ FPR)
-        fnr = 1 - tpr
-        idx = np.argmin(np.abs(fnr - fpr))
-        threshold = thresh[idx]
-    
-    decisions = (scores >= threshold).astype(int)
-    n_target = sum(labels)
-    n_non = len(labels) - n_target
-    miss = sum((decisions == 0) & (np.array(labels) == 1)) / max(1, n_target)
-    fa = sum((decisions == 1) & (np.array(labels) == 0)) / max(1, n_non)
-    
-    return c_miss * miss * p_tar + c_fa * fa * (1 - p_tar)
-
-
-def calibrate_scores(scores_dev: np.ndarray, labels_dev: np.ndarray, 
-                    scores_test: np.ndarray) -> np.ndarray:
-    """
-    Calibrate test scores using dev set.
-    
-    Args:
-        scores_dev: Development set scores
-        labels_dev: Development set labels
-        scores_test: Test set scores
-    
-    Returns:
-        Calibrated test scores
-    """
-    if len(scores_dev.shape) == 1:
-        scores_dev = scores_dev.reshape(-1, 1)
-    if len(scores_test.shape) == 1:
-        scores_test = scores_test.reshape(-1, 1)
-    
-    clf = LogisticRegression(solver='liblinear')
-    clf.fit(scores_dev, labels_dev)
-    prob = clf.predict_proba(scores_test)[:, 1]
-    eps = 1e-9
-    logits = np.log(prob + eps) - np.log(1 - prob + eps)
-    return logits
-
-
 def avg_eers(per_class_dict: Dict[str, Tuple[float, float]]) -> Tuple[float, float]:
     """
     Compute average EERs from per-class dictionary.
-    
-    Args:
-        per_class_dict: Dictionary mapping class labels to (eer_before, eer_after) tuples
-    
-    Returns:
-        Tuple of (avg_eer_before, avg_eer_after)
     """
     if len(per_class_dict) == 0:
         return float('nan'), float('nan')
@@ -1006,143 +858,4 @@ def avg_eers(per_class_dict: Dict[str, Tuple[float, float]]) -> Tuple[float, flo
     be = [v[0] for v in per_class_dict.values() if not np.isnan(v[0])]
     ae = [v[1] for v in per_class_dict.values() if not np.isnan(v[1])]
     
-    return (float(np.mean(be)) if len(be) > 0 else float('nan'),
-            float(np.mean(ae)) if len(ae) > 0 else float('nan'))
-
-
-# -------------------- Pipeline Framework --------------------
-
-class UnlearningPipeline:
-    """
-    Base class for unlearning pipelines across different datasets.
-    Provides a standardized framework for the unlearning process.
-    """
-    
-    def __init__(self, data_root: str, save_dir: str, device: str = 'cuda', seed: int = 1337):
-        self.data_root = data_root
-        self.save_dir = save_dir
-        self.device = device
-        self.seed = seed
-        self.t0_all = None
-        
-        # Initialize common attributes
-        self.manifest = []
-        self.entries = []
-        self.E_all = None
-        self.labels = []
-        self.sets = []
-        self.masks = {}
-        self.sae = None
-        self.clf = None
-        self.results = {}
-        
-    def setup(self):
-        """Initialize the pipeline."""
-        seed_all(self.seed)
-        os.makedirs(self.save_dir, exist_ok=True)
-        self.t0_all = time.time()
-        
-    def build_manifest(self):
-        """Build manifest from dataset. Override in subclasses."""
-        raise NotImplementedError
-        
-    def extract_embeddings(self, encoder: str = 'ecapa', **kwargs):
-        """Extract embeddings from manifest."""
-        print("[2/12] Extracting embeddings...")
-        self.E_all, self.labels, _ = extract_embeddings(
-            self.manifest, encoder=encoder, device=self.device, **kwargs
-        )
-        self.E_all = np.asarray(self.E_all)
-        
-    def create_splits_and_masks(self, forget_classes: List[str]):
-        """Create dataset splits and masks. Override in subclasses."""
-        raise NotImplementedError
-        
-    def apply_whitening(self, **kwargs):
-        """Apply whitening transformation."""
-        print("[3/12] Applying whitening...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def train_classifier(self, **kwargs):
-        """Train classification model."""
-        print("[4/12] Training classifier...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def train_sae(self, **kwargs):
-        """Train sparse autoencoder."""
-        print("[5/12] Training SAE...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def encode_sae_activations(self):
-        """Encode SAE activations."""
-        print("[6/12] Encoding SAE activations...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def compute_feature_statistics(self):
-        """Compute feature statistics and select features."""
-        print("[7/12] Computing feature statistics...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def build_subspace_U(self):
-        """Build subspace U from decoder atoms."""
-        print("[8/12] Building subspace U...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def compute_leace_projector(self):
-        """Compute LEACE projector."""
-        print("[9/12] Computing LEACE projector...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def apply_edits(self):
-        """Apply SAUCE gating, LEACE, and noise."""
-        print("[10/12] Applying edits...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def evaluate_classifier(self):
-        """Evaluate classifier performance."""
-        print("[11/12] Evaluating classifier...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def evaluate_verification(self):
-        """Evaluate verification performance."""
-        print("[12/12] Evaluating verification...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def save_results(self):
-        """Save results and artifacts."""
-        print("Saving results...")
-        # This should be implemented based on the specific dataset's needs
-        pass
-        
-    def run(self, forget_classes: List[str], encoder: str = 'ecapa', **kwargs):
-        """Run the complete pipeline."""
-        self.setup()
-        
-        # Execute pipeline steps
-        self.build_manifest()
-        self.extract_embeddings(encoder, **kwargs)
-        self.create_splits_and_masks(forget_classes)
-        self.apply_whitening(**kwargs)
-        self.train_classifier(**kwargs)
-        self.train_sae(**kwargs)
-        self.encode_sae_activations()
-        self.compute_feature_statistics()
-        self.build_subspace_U()
-        self.compute_leace_projector()
-        self.apply_edits()
-        self.evaluate_classifier()
-        self.evaluate_verification()
-        self.save_results()
-        
-        print(f"Done. Total time: {human_time(time.time() - self.t0_all)}")
-        return self.results
+    return float(np.mean(be)) if len(be) > 0 else float('nan'), float(np.mean(ae)) if len(ae) > 0 else float('nan')
