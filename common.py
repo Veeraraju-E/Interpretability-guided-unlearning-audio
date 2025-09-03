@@ -10,9 +10,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, accuracy_score
 from itertools import combinations
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
 from sklearn.covariance import LedoitWolf
 from statsmodels.stats.multitest import multipletests as _multipletests
@@ -526,136 +523,7 @@ def estimate_jacobian_alignment(sae: TopKSAE, Z_samples: np.ndarray, deltas: np.
         alignments.append(num / den)
     return np.concatenate(alignments, axis=0)
 
-
-# -------------------- Plotting helpers --------------------
-def ensure_dir(path: str):
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
-
-def plot_whitening_spectrum(evals: np.ndarray, outpath: str):
-    ensure_dir(os.path.dirname(outpath) or ".")
-    plt.figure(figsize=(10,6))
-    plt.plot(np.arange(1, len(evals)+1), evals, marker='o')
-    plt.axhline(1.0, color='red', linestyle='--', label='1.0')
-    plt.xlabel('Eigen-index'); plt.ylabel('Eigenvalue')
-    plt.title('Whitening eigen-spectrum')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
-
-
-def plot_decoder_overlap_matrix(D_selected: np.ndarray, outpath: str, top_n: int = 50):
-    ensure_dir(os.path.dirname(outpath) or ".")
-    cols = D_selected.copy()
-    cols = cols / (np.linalg.norm(cols, axis=0, keepdims=True) + 1e-12)
-    S = cols.T @ cols
-    np.fill_diagonal(S, 0.0)
-    plt.figure(figsize=(8,8))
-    im = plt.imshow(S, cmap='bwr', vmin=-1, vmax=1)
-    plt.title('Decoder column cosine similarities (selected atoms)')
-    plt.colorbar(im)
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
-
-
-def plot_U_svd_energy(D_selected: np.ndarray, outpath: str):
-    ensure_dir(os.path.dirname(outpath) or ".")
-    Uu, svals, Vt = np.linalg.svd(D_selected, full_matrices=False)
-    cum = np.cumsum(svals) / (svals.sum() + 1e-12)
-    plt.figure(figsize=(10,6))
-    plt.plot(np.arange(1, len(svals)+1), svals, marker='o', label='singular values')
-    plt.twinx()
-    plt.plot(np.arange(1, len(svals)+1), cum, color='orange', marker='x', label='cumulative energy')
-    plt.ylabel('cumulative energy (right)')
-    plt.title('SVD of selected decoder atoms')
-    plt.grid(True)
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
-
-
-def plot_edit_magnitude_histogram(edit_norms: np.ndarray, outpath: str):
-    ensure_dir(os.path.dirname(outpath) or ".")
-    plt.figure(figsize=(8,5))
-    plt.hist(edit_norms, bins=100)
-    plt.title('Edit magnitude per sample (L2 norm)')
-    plt.xlabel('||Z_edit - Z||'); plt.ylabel('Count')
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
-
-
-def plot_activation_change_histogram(A_before: np.ndarray, A_after: np.ndarray, feat_idx: List[int], outpath: str):
-    ensure_dir(os.path.dirname(outpath) or ".")
-    if len(feat_idx) == 0:
-        return
-    sel_before = A_before[:, feat_idx]
-    sel_after = A_after[:, feat_idx]
-    abs_change = np.mean(np.abs(sel_after - sel_before), axis=0)
-    sign_flip_frac = np.mean((np.sign(sel_before) != np.sign(sel_after)).astype(float), axis=0)
-    plt.figure(figsize=(10,6))
-    plt.bar(np.arange(len(feat_idx)), abs_change)
-    plt.title('Mean absolute activation change for selected atoms')
-    plt.xlabel('Selected atom index'); plt.ylabel('mean |a_after - a_before|')
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
-    plt.figure(figsize=(10,6))
-    plt.bar(np.arange(len(feat_idx)), sign_flip_frac)
-    plt.title('Sign flip fraction for selected atoms')
-    plt.xlabel('Selected atom index'); plt.ylabel('sign flip fraction')
-    plt.tight_layout(); plt.savefig(outpath.replace('.png', '_signflip.png')); plt.close()
-
-
-def plot_jacobian_alignment_histogram(alignments: np.ndarray, outpath: str):
-    ensure_dir(os.path.dirname(outpath) or ".")
-    plt.figure(figsize=(8,5))
-    plt.hist(alignments, bins=100)
-    plt.title('Jacobian alignment histogram: ||J v|| / ||v|| (approx)')
-    plt.xlabel('alignment'); plt.ylabel('count')
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
-
-
-def plot_superposition_energy_sorted(proj_coeffs: np.ndarray, outpath: str):
-    ensure_dir(os.path.dirname(outpath) or ".")
-    energy = (proj_coeffs ** 2)
-    order = np.argsort(energy)[::-1]
-    sorted_energy = energy[order]
-    cum = np.cumsum(sorted_energy) / (sorted_energy.sum() + 1e-12)
-    plt.figure(figsize=(10,6))
-    plt.bar(np.arange(len(sorted_energy)), sorted_energy)
-    plt.plot(np.arange(len(sorted_energy)), cum, color='orange', linewidth=2)
-    plt.title('Energy in decoder atoms for label direction (sorted)')
-    plt.xlabel('atom rank'); plt.ylabel('energy (squared projection)')
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
-
-
-def plot_embedding_tsne_before_after(Z_before: np.ndarray, Z_after: np.ndarray, labels: List[str], outpath: str, sample: int = 2000):
-    ensure_dir(os.path.dirname(outpath) or ".")
-    try:
-        from sklearn.manifold import TSNE
-    except Exception:
-        print("tsne not available; skipping")
-        return
-    N = min(sample, Z_before.shape[0])
-    idx = np.random.choice(Z_before.shape[0], N, replace=False)
-    X = np.vstack([Z_before[idx], Z_after[idx]])
-    ts = TSNE(n_components=2, init='pca', perplexity=30, n_iter=1000, random_state=0).fit_transform(X)
-    ts_b = ts[:N]; ts_a = ts[N:]
-    plt.figure(figsize=(12,6))
-    plt.subplot(1,2,1)
-    plt.scatter(ts_b[:,0], ts_b[:,1], c=[1 if labels[i] == 'forget' else 0 for i in idx], s=6)
-    plt.title('pre-edit tSNE (sample)')
-    plt.subplot(1,2,2)
-    plt.scatter(ts_a[:,0], ts_a[:,1], c=[1 if labels[i] == 'forget' else 0 for i in idx], s=6)
-    plt.title('post-edit tSNE (sample)')
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
-
-
-def plot_participation_ratio_hist(part_ratios: np.ndarray, outpath: str):
-    ensure_dir(os.path.dirname(outpath) or ".")
-    plt.figure(figsize=(8,5))
-    plt.hist(part_ratios, bins=100)
-    plt.title('Per-sample participation ratio (energy spread across atoms)')
-    plt.xlabel('participation ratio'); plt.ylabel('count')
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
-
-
 # -------------------- Evaluation and Verification Functions --------------------
-
 def linear_probe_U(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_mask: Dict[str, np.ndarray],  forget_classes: List[str], device: str = 'cuda') -> Tuple[float, float]:
     """
     Train/test a linear probe **in the reduced frame**: X = ZU.

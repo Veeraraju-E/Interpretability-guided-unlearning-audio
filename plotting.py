@@ -5,7 +5,7 @@ import seaborn as sns
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 import umap
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 import os
 
 # Set style
@@ -510,3 +510,46 @@ def create_all_plots(Z_before: np.ndarray, Z_after: np.ndarray,
     plot_whitening_diagnostics(Z_before, save_dir)
     
     print("All diagnostic plots created successfully!")
+
+def plot_probe_lens(probe_auc: dict, save_dir: str, filename="probe_lens.png"):
+    names = list(probe_auc.keys())
+    vals = [probe_auc[k] for k in names]
+    plt.figure(figsize=(8,4))
+    plt.plot(range(len(names)), vals, marker='o')
+    plt.xticks(range(len(names)), names, rotation=30, ha='right')
+    plt.ylabel('AUC (forget vs retain)')
+    plt.title('Probe-Lens Predictivity Across Stages')
+    plt.grid(True, alpha=0.3)
+    save_fig(save_dir, filename)
+
+def plot_principal_cosines(cosines: list, save_dir: str, filename="principal_cosines.png"):
+    plt.figure(figsize=(6,4))
+    plt.plot(sorted(cosines, reverse=True), marker='o')
+    plt.xlabel('Index (sorted)')
+    plt.ylabel('cos(θ)')
+    plt.title('Principal Cosines: span(D_F) vs span(U)')
+    plt.grid(True, alpha=0.3)
+    save_fig(save_dir, filename)
+
+def plot_cka_heatmap(cka_dict: dict, save_dir: str, filename="cka_heatmap.png"):
+    keys = sorted(set(k for pair in cka_dict for k in pair))
+    M = np.zeros((len(keys), len(keys)))
+    for i, a in enumerate(keys):
+        for j, b in enumerate(keys):
+            M[i, j] = cka_dict[(a, b)] if (a,b) in cka_dict else cka_dict[(b,a)]
+    fig, ax = plt.subplots(figsize=(6,5))
+    im = ax.imshow(M)
+    ax.set_xticks(range(len(keys))); ax.set_yticks(range(len(keys)))
+    ax.set_xticklabels(keys, rotation=30, ha='right'); ax.set_yticklabels(keys)
+    plt.colorbar(im, ax=ax, label='Linear CKA')
+    plt.title('Representation Similarity (CKA)')
+    save_fig(save_dir, filename)
+
+def plot_polysemanticity(counts: list, save_dir: str, filename="polysemanticity.png"):
+    plt.figure(figsize=(6,4))
+    plt.hist(counts, bins=20, density=True)
+    plt.xlabel('#classes to reach top-q mass')
+    plt.ylabel('Density')
+    plt.title('Polysemanticity Index per Atom')
+    plt.grid(True, alpha=0.3)
+    save_fig(save_dir, filename)

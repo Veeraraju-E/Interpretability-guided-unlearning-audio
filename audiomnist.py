@@ -368,7 +368,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--retain_frac", type=float, default=0.7)
     parser.add_argument("--dev_frac_per_digit", type=float, default=0.7)
-    parser.add_argument("--sae_hidden_mult", type=float, default=4.0)
+    parser.add_argument("--sae_hidden_mult", type=float, default=10.0)
     parser.add_argument("--sae_topk", type=int, default=128)
     parser.add_argument("--sae_epochs", type=int, default=30)
     parser.add_argument("--build_U_top", type=int, default=200)

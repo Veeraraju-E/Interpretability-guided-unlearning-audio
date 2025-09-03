@@ -12,7 +12,7 @@ from common import (
     compute_scores, eer_from_scores, build_verification_trials,
     train_classifier, evaluate_classifier, linear_probe_U, per_class_eers, avg_eers
 )
-
+from validation_checks import run_validation_checks
 
 # -------------------- Manifest --------------------
 def read_voxceleb_manifest(manifest_path: str) -> List[Dict]:
@@ -235,6 +235,7 @@ def run_pipeline(
     U = build_U_from_decoder(dec_w, feat_idx)   # TODO: check by passing dec_pruned later
     print(f"  U shape: {U.shape}")
 
+
     # 8) compute LEACE in U
     P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
     mu_r = None
@@ -251,6 +252,8 @@ def run_pipeline(
             print(f"  Warning: LEACE computation failed ({e}), falling back to identity projector")
             P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
             mu_r = np.zeros((1, U.shape[1]))
+
+        ZU_dev = Z_all[mask_dev] @ U
     else:
         print("[8/12] Skipping LEACE (identity)")
 
@@ -258,7 +261,7 @@ def run_pipeline(
     print("[9/12] Applying SAUCE gating (beta) and LEACE edit...")
     Z_edit = Z_all.copy()
     if beta > 0.0:
-        print("  applying SAUCE gating with beta", beta)
+        print(" applying SAUCE gating with beta", beta)
         Z_edit = apply_sauce_gating(sae, Z_all, feat_idx, beta=beta, device=device, batch=8192)
     if leace:
         Z_edit = apply_subspace_leace(Z_edit, U, P_r, mu_r)
@@ -269,10 +272,23 @@ def run_pipeline(
     E_edit = invert_whitener(Z_edit, mu, W)
     E_all_norm, E_edit_norm = l2_normalize(E_all), l2_normalize(E_edit)
 
-    results = {}
+    # ================= Extended Validation Checks =================
+    print("[9b] Running extended validation checks...")
+    run_validation_checks(
+        save_dir=os.path.join(save_dir, "validation"),
+        Z_all=Z_all, Z_edit=Z_edit,
+        E_all_norm=E_all_norm, E_edit_norm=E_edit_norm,
+        ZU_mean=ZU_dev.mean(axis=0, keepdims=True) if leace else (Z_all[mask_dev] @ U).mean(0, keepdims=True),
+        U=U, P_r=P_r, mu_r=mu_r, dec_w=dec_w, sae=sae,
+        feat_idx=feat_idx, sets=sets, labels=labels,
+        mask_dev=mask_dev, mask_test=(M_ret_test | M_fgt_test),
+        y_dev_bin=Y_dev, leace_ridge=leace_ridge,
+        mu=mu, W=W, device=device
+    )
 
     # ================= Verification Steps =================
     # 10) Per-class EERs
+    results = {}
     print("[10/12] Per-class verification EERs...")
     test_trials, test_labels = build_verification_trials(labels, forget_spks, M_ret_test | M_fgt_test)
     scores_test_before, scores_test_after = compute_scores(E_all_norm, test_trials), compute_scores(E_edit_norm, test_trials)
