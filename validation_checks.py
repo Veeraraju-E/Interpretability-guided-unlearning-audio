@@ -2,16 +2,507 @@ from __future__ import annotations
 import numpy as np, json, os, time
 from numpy.linalg import svd, norm
 from scipy.stats import entropy
-from sklearn.cluster import AgglomerativeClustering
-from diagnostics import (check_whitening, decoder_metrics, activation_sparsity_metrics,
-                         feature_discriminability, check_U, leace_invariants,
-                         probe_lens_auc, cka_matrix, polysemanticity_index, energy_share_in_U
-                         )
-from plotting import (plot_probe_lens, plot_cka_heatmap, plot_polysemanticity,
-                      plot_singular_value_spectrum, plot_decoder_overlap_matrix,
-                      plot_label_direction_energy, plot_atom_contribution_scores)
-
 from common import sae_encode_batch, invert_whitener
+from typing import Dict, List, Tuple, Optional
+from sklearn.metrics import roc_auc_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+import umap
+
+plt.style.use('default')
+sns.set_palette("husl")
+
+def save_fig(save_dir: str, filename: str, dpi: int = 300, bbox_inches: str = 'tight'):
+    os.makedirs(save_dir, exist_ok=True)
+    plt.savefig(os.path.join(save_dir, filename), dpi=dpi, bbox_inches=bbox_inches)
+    plt.close()
+
+def get_binary_labels(labels: List[str], forget_classes: List[str]) -> List[str]:
+    return ['forget' if label in forget_classes else 'retain' for label in labels]
+
+def plot_tsne_comparison(Z_before: np.ndarray, Z_after: np.ndarray, labels: List[str], forget_classes: List[str], save_dir: str, n_components: int = 2, perplexity: int = 30, random_state: int = 42):
+    
+    Z_combined = np.vstack([Z_before, Z_after])
+    n_samples = Z_combined.shape[0]
+    perplexity_eff = max(5, min(perplexity, max(2, (n_samples - 1) // 3)))
+    X = np.ascontiguousarray(Z_combined, dtype=np.float64)
+    tsne = TSNE(n_components=n_components, perplexity=perplexity_eff, random_state=random_state, init='random')
+    Z_tsne_combined = tsne.fit_transform(X)
+    
+    n_before = Z_before.shape[0]
+    Z_tsne_before = Z_tsne_combined[:n_before]
+    Z_tsne_after = Z_tsne_combined[n_before:]
+    
+    binary_labels = get_binary_labels(labels, forget_classes)
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    for bin_label in ['retain', 'forget']:
+        mask = np.array(binary_labels) == bin_label
+        color = '#4ecdc4' if bin_label == 'retain' else '#ff6b6b'
+        ax1.scatter(Z_tsne_before[mask, 0], Z_tsne_before[mask, 1], c=color, label=bin_label, alpha=0.7, s=20)
+    
+    ax1.set_title('Before Edit', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('t-SNE 1')
+    ax1.set_ylabel('t-SNE 2')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    for bin_label in ['retain', 'forget']:
+        mask = np.array(binary_labels) == bin_label
+        color = '#4ecdc4' if bin_label == 'retain' else '#ff6b6b'
+        ax2.scatter(Z_tsne_after[mask, 0], Z_tsne_after[mask, 1], c=color, label=bin_label, alpha=0.7, s=20)
+    
+    ax2.set_title('After Edit', fontsize=14, fontweight='bold')
+    ax2.set_xlabel('t-SNE 1')
+    ax2.set_ylabel('t-SNE 2')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    save_fig(save_dir, 'tsne_comparison.png')
+    
+    return Z_tsne_before, Z_tsne_after
+
+def plot_umap_comparison(Z_before: np.ndarray, Z_after: np.ndarray, labels: List[str], forget_classes: List[str], save_dir: str, n_components: int = 2, n_neighbors: int = 15, min_dist: float = 0.1, random_state: int = 42):
+    
+    Z_combined = np.vstack([Z_before, Z_after])
+    n_samples = Z_combined.shape[0]
+    n_neighbors_eff = max(2, min(n_neighbors, max(2, n_samples - 1)))
+    try:
+        reducer = umap.UMAP(n_components=n_components, n_neighbors=n_neighbors_eff, min_dist=min_dist, random_state=random_state)
+        Z_umap_combined = reducer.fit_transform(Z_combined)
+    except Exception:
+        pca = PCA(n_components=min(n_components, max(1, Z_combined.shape[1])))
+        Z_umap_combined = pca.fit_transform(Z_combined)
+    
+    n_before = Z_before.shape[0]
+    Z_umap_before = Z_umap_combined[:n_before]
+    Z_umap_after = Z_umap_combined[n_before:]
+    
+    binary_labels = get_binary_labels(labels, forget_classes)
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    for bin_label in ['retain', 'forget']:
+        mask = np.array(binary_labels) == bin_label
+        color = '#4ecdc4' if bin_label == 'retain' else '#ff6b6b'
+        ax1.scatter(Z_umap_before[mask, 0], Z_umap_before[mask, 1],  c=color, label=bin_label, alpha=0.7, s=20)
+    
+    ax1.set_title('Before Edit', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('UMAP 1')
+    ax1.set_ylabel('UMAP 2')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    for bin_label in ['retain', 'forget']:
+        mask = np.array(binary_labels) == bin_label
+        color = '#4ecdc4' if bin_label == 'retain' else '#ff6b6b'
+        ax2.scatter(Z_umap_after[mask, 0], Z_umap_after[mask, 1], c=color, label=bin_label, alpha=0.7, s=20)
+    
+    ax2.set_title('After Edit', fontsize=14, fontweight='bold')
+    ax2.set_xlabel('UMAP 1')
+    ax2.set_ylabel('UMAP 2')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    save_fig(save_dir, 'umap_comparison.png')
+    
+    return Z_umap_before, Z_umap_after
+
+def plot_subspace_scatter(ZU_before: np.ndarray, ZU_after: np.ndarray, labels: List[str], forget_classes: List[str], save_dir: str, n_components: int = 2):
+    
+    ZU_combined = np.vstack([ZU_before, ZU_after])
+    pca = PCA(n_components=min(n_components, ZU_combined.shape[1]))
+    ZU_pca_combined = pca.fit_transform(ZU_combined)
+    
+    n_before = ZU_before.shape[0]
+    ZU_pca_before = ZU_pca_combined[:n_before]
+    ZU_pca_after = ZU_pca_combined[n_before:]
+    
+    binary_labels = get_binary_labels(labels, forget_classes)
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    
+    for bin_label in ['retain', 'forget']:
+        mask = np.array(binary_labels) == bin_label
+        color = '#4ecdc4' if bin_label == 'retain' else '#ff6b6b'
+        ax1.scatter(ZU_pca_before[mask, 0], ZU_pca_before[mask, 1], c=color, label=bin_label, alpha=0.7, s=20)
+    
+    ax1.set_title('Before Edit (U subspace)', fontsize=14, fontweight='bold')
+    ax1.set_xlabel(f'PC 1 ({pca.explained_variance_ratio_[0]:.1%})')
+    ax1.set_ylabel(f'PC 2 ({pca.explained_variance_ratio_[1]:.1%})')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    for bin_label in ['retain', 'forget']:
+        mask = np.array(binary_labels) == bin_label
+        color = '#4ecdc4' if bin_label == 'retain' else '#ff6b6b'
+        ax2.scatter(ZU_pca_after[mask, 0], ZU_pca_after[mask, 1], c=color, label=bin_label, alpha=0.7, s=20)
+    
+    ax2.set_title('After Edit (U subspace)', fontsize=14, fontweight='bold')
+    ax2.set_xlabel(f'PC 1 ({pca.explained_variance_ratio_[0]:.1%})')
+    ax2.set_ylabel(f'PC 2 ({pca.explained_variance_ratio_[1]:.1%})')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    save_fig(save_dir, 'subspace_scatter.png')
+    
+    return ZU_pca_before, ZU_pca_after
+
+def compute_intra_inter_similarities(Z_before: np.ndarray, Z_after: np.ndarray, labels: List[str], forget_classes: List[str]):
+    from itertools import combinations
+    
+    binary_labels = get_binary_labels(labels, forget_classes)
+    
+    def cosine_sim(a, b):
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12)
+    
+    intra_sim_before = {'retain': [], 'forget': []}
+    intra_sim_after = {'retain': [], 'forget': []}
+    
+    for class_type in ['retain', 'forget']:
+        indices = [i for i, label in enumerate(binary_labels) if label == class_type]
+        if len(indices) >= 2:
+            for i, j in combinations(indices, 2):
+                intra_sim_before[class_type].append(cosine_sim(Z_before[i], Z_before[j]))
+                intra_sim_after[class_type].append(cosine_sim(Z_after[i], Z_after[j]))
+    
+    retain_indices = [i for i, label in enumerate(binary_labels) if label == 'retain']
+    forget_indices = [i for i, label in enumerate(binary_labels) if label == 'forget']
+    
+    inter_sim_before = []
+    inter_sim_after = []
+    
+    for r_idx in retain_indices:
+        for f_idx in forget_indices:
+            inter_sim_before.append(cosine_sim(Z_before[r_idx], Z_before[f_idx]))
+            inter_sim_after.append(cosine_sim(Z_after[r_idx], Z_after[f_idx]))
+    
+    return (intra_sim_before, intra_sim_after, 
+            {'inter': inter_sim_before}, {'inter': inter_sim_after})
+
+def plot_projection_distributions(ZU_before: np.ndarray, ZU_after: np.ndarray, labels: List[str], forget_classes: List[str], save_dir: str, top_directions: int = 5):
+    
+    var_before = np.var(ZU_before, axis=0)
+    top_indices = np.argsort(var_before)[-top_directions:]
+    
+    binary_labels = get_binary_labels(labels, forget_classes)
+    
+    fig, axes = plt.subplots(2, top_directions, figsize=(4*top_directions, 8))
+    if top_directions == 1:
+        axes = axes.reshape(2, 1)
+    
+    for i, idx in enumerate(top_indices):
+        ax = axes[0, i]
+        for bin_label in ['retain', 'forget']:
+            mask = np.array(binary_labels) == bin_label
+            color = '#4ecdc4' if bin_label == 'retain' else '#ff6b6b'
+            ax.hist(ZU_before[mask, idx], alpha=0.7, bins=20, color=color, label=bin_label, density=True)
+        ax.set_title(f'Direction {idx+1} (Before)')
+        ax.set_xlabel('Projection')
+        ax.set_ylabel('Density')
+        if i == 0:
+            ax.legend()
+        
+        ax = axes[1, i]
+        for bin_label in ['retain', 'forget']:
+            mask = np.array(binary_labels) == bin_label
+            color = '#4ecdc4' if bin_label == 'retain' else '#ff6b6b'
+            ax.hist(ZU_after[mask, idx], alpha=0.7, bins=20, color=color,  label=bin_label, density=True)
+        ax.set_title(f'Direction {idx+1} (After)')
+        ax.set_xlabel('Projection')
+        ax.set_ylabel('Density')
+        if i == 0:
+            ax.legend()
+    
+    plt.tight_layout()
+    save_fig(save_dir, 'projection_distributions.png')
+
+def plot_similarity_distributions(intra_sim_before: Dict, intra_sim_after: Dict, inter_sim_before: Dict, inter_sim_after: Dict, save_dir: str):
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Intra-class similarities - retain
+    ax = axes[0, 0]
+    if 'retain' in intra_sim_before and len(intra_sim_before['retain']) > 0:
+        ax.hist(intra_sim_before['retain'], alpha=0.7, bins=20, color='#4ecdc4',  label='Before', density=True)
+    if 'retain' in intra_sim_after and len(intra_sim_after['retain']) > 0:
+        ax.hist(intra_sim_after['retain'], alpha=0.7, bins=20, color='#45b7d1', label='After', density=True)
+    ax.set_title('Intra-class Similarities - Retain Classes')
+    ax.set_xlabel('Cosine Similarity')
+    ax.set_ylabel('Density')
+    ax.legend()
+    
+    # Intra-class similarities - forget
+    ax = axes[0, 1]
+    if 'forget' in intra_sim_before and len(intra_sim_before['forget']) > 0:
+        ax.hist(intra_sim_before['forget'], alpha=0.7, bins=20, color='#ff6b6b', label='Before', density=True)
+    if 'forget' in intra_sim_after and len(intra_sim_after['forget']) > 0:
+        ax.hist(intra_sim_after['forget'], alpha=0.7, bins=20, color='#ff8e8e', label='After', density=True)
+    ax.set_title('Intra-class Similarities - Forget Classes')
+    ax.set_xlabel('Cosine Similarity')
+    ax.set_ylabel('Density')
+    ax.legend()
+    
+    # Inter-class similarities
+    ax = axes[1, 0]
+    if 'inter' in inter_sim_before and len(inter_sim_before['inter']) > 0:
+        ax.hist(inter_sim_before['inter'], alpha=0.7, bins=20, color='#96ceb4', label='Before', density=True)
+    if 'inter' in inter_sim_after and len(inter_sim_after['inter']) > 0:
+        ax.hist(inter_sim_after['inter'], alpha=0.7, bins=20, color='#feca57', label='After', density=True)
+    ax.set_title('Inter-class Similarities (Retain vs Forget)')
+    ax.set_xlabel('Cosine Similarity')
+    ax.set_ylabel('Density')
+    ax.legend()
+    
+    # Remove the empty subplot
+    ax = axes[1, 1]
+    ax.axis('off')
+    
+    plt.tight_layout()
+    save_fig(save_dir, 'similarity_distributions.png')
+
+def plot_sae_activations(A_retain: np.ndarray, A_forget: np.ndarray, save_dir: str):
+    
+    avg_retain = np.mean(A_retain, axis=0)
+    avg_forget = np.mean(A_forget, axis=0)
+    
+    plt.figure(figsize=(15, 8))
+    
+    neurons = np.arange(len(avg_retain))
+    plt.plot(neurons, avg_retain, color='#4ecdc4', alpha=0.7, label='Retain Average', linewidth=1.5)
+    plt.plot(neurons, avg_forget, color='#ff6b6b', alpha=0.7, label='Forget Average', linewidth=1.5)
+    
+    plt.xlabel('Neuron Index')
+    plt.ylabel('Average Activation')
+    plt.title('SAE Latent Space Activations per Neuron')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    if len(avg_retain) > 50:
+        ax_inset = plt.axes([0.55, 0.55, 0.35, 0.35])
+        top_k = 50
+        top_indices = np.argsort(avg_retain + avg_forget)[-top_k:]
+        ax_inset.plot(top_indices, avg_retain[top_indices], 'o-', color='#4ecdc4', markersize=3, linewidth=1, label='Retain')
+        ax_inset.plot(top_indices, avg_forget[top_indices], 'o-', color='#ff6b6b', markersize=3, linewidth=1, label='Forget')
+        ax_inset.set_title(f'Top {top_k} Active Neurons')
+        ax_inset.grid(True, alpha=0.3)
+        ax_inset.legend()
+    
+    plt.tight_layout()
+    save_fig(save_dir, 'sae_activations.png')
+
+def create_all_plots(Z_before: np.ndarray, Z_after: np.ndarray,
+                     ZU_before: np.ndarray, ZU_after: np.ndarray,
+                     labels: List[str], forget_classes: List[str],
+                     decoder_weights: np.ndarray, feat_idx: List[int],
+                     A_retain: np.ndarray, A_forget: np.ndarray,
+                     save_dir: str, random_state: int = 42):
+    
+    print(f"Creating diagnostic plots in {save_dir}...")
+    
+    print("  - Creating t-SNE plots...")
+    plot_tsne_comparison(Z_before, Z_after, labels, forget_classes, save_dir, random_state=random_state)
+    
+    print("  - Creating UMAP plots...")
+    plot_umap_comparison(Z_before, Z_after, labels, forget_classes, save_dir, random_state=random_state)
+    
+    print("  - Creating subspace scatter plots...")
+    plot_subspace_scatter(ZU_before, ZU_after, labels, forget_classes, save_dir)
+    
+    print("  - Creating projection distributions plots...")
+    plot_projection_distributions(ZU_before, ZU_after, labels, forget_classes, save_dir)
+    
+    print("  - Computing similarity distributions...")
+    intra_sim_before, intra_sim_after, inter_sim_before, inter_sim_after = compute_intra_inter_similarities(Z_before, Z_after, labels, forget_classes)
+    
+    print("  - Creating similarity distributions plots...")
+    plot_similarity_distributions(intra_sim_before, intra_sim_after, inter_sim_before, inter_sim_after, save_dir)
+    
+    print("  - Creating SAE activations plots...")
+    plot_sae_activations(A_retain, A_forget, save_dir)
+    
+    print("All diagnostic plots created successfully!")
+
+def plot_probe_lens(probe_auc: dict, save_dir: str, filename="probe_lens.png"):
+    names = list(probe_auc.keys())
+    vals = [probe_auc[k] for k in names]
+    plt.figure(figsize=(8,4))
+    plt.plot(range(len(names)), vals, marker='o')
+    plt.xticks(range(len(names)), names, rotation=30, ha='right')
+    plt.ylabel('AUC (forget vs retain)')
+    plt.title('Probe-Lens Predictivity Across Stages')
+    plt.grid(True, alpha=0.3)
+    save_fig(save_dir, filename)
+
+def plot_principal_cosines(cosines: list, save_dir: str, filename="principal_cosines.png"):
+    plt.figure(figsize=(6,4))
+    plt.plot(sorted(cosines, reverse=True), marker='o')
+    plt.xlabel('Index (sorted)')
+    plt.ylabel('cos(θ)')
+    plt.title('Principal Cosines: span(D_F) vs span(U)')
+    plt.grid(True, alpha=0.3)
+    save_fig(save_dir, filename)
+
+def plot_cka_heatmap(cka_dict: dict, save_dir: str, filename="cka_heatmap.png"):
+    keys = sorted(set(k for pair in cka_dict for k in pair))
+    M = np.zeros((len(keys), len(keys)))
+    for i, a in enumerate(keys):
+        for j, b in enumerate(keys):
+            M[i, j] = cka_dict[(a, b)] if (a,b) in cka_dict else cka_dict[(b,a)]
+    fig, ax = plt.subplots(figsize=(6,5))
+    im = ax.imshow(M)
+    ax.set_xticks(range(len(keys))); ax.set_yticks(range(len(keys)))
+    ax.set_xticklabels(keys, rotation=30, ha='right'); ax.set_yticklabels(keys)
+    plt.colorbar(im, ax=ax, label='Linear CKA')
+    plt.title('Representation Similarity (CKA)')
+    save_fig(save_dir, filename)
+
+def plot_polysemanticity(counts: list, save_dir: str, filename="polysemanticity.png"):
+    plt.figure(figsize=(6,4))
+    plt.hist(counts, bins=20, density=True)
+    plt.xlabel('#classes to reach top-q mass')
+    plt.ylabel('Density')
+    plt.title('Polysemanticity Index per Atom')
+    plt.grid(True, alpha=0.3)
+    save_fig(save_dir, filename)
+
+def summary_stats(arr: np.ndarray) -> Dict:
+    return dict(mean=float(np.mean(arr)), std=float(np.std(arr)),
+                p5=float(np.percentile(arr,5)), p95=float(np.percentile(arr,95)))
+
+def check_whitening(Z_retain_dev: np.ndarray, tol_mean=5e-2, tol_cov=5e-2) -> Dict:
+    mu = Z_retain_dev.mean(axis=0, keepdims=True)
+    C = np.cov(Z_retain_dev - mu, rowvar=False)
+    d = C.shape[0]
+    off = C - np.eye(d)
+    np.fill_diagonal(off, 0.0)
+    out = {
+        "mean_l2": float(norm(mu)),
+        "mean_ok": bool(norm(mu) < tol_mean),
+        "offdiag_abs_mean": float(np.mean(np.abs(off))),
+        "offdiag_ok": bool(np.mean(np.abs(off)) < tol_cov),
+        "evals_desc": np.sort(np.linalg.eigvalsh(C))[::-1].tolist(),
+    }
+    return out
+
+def decoder_metrics(D: np.ndarray) -> Dict:
+    Dn = D / (norm(D, axis=0, keepdims=True) + 1e-12)
+    G = Dn.T @ Dn
+    np.fill_diagonal(G, 0.0)
+    mutual_coh = float(np.max(np.abs(G)))
+    svals = svd(Dn, full_matrices=False)[1]
+    stable_rank = float((svals**2).sum() / (svals.max()**2 + 1e-12))
+    return {"mutual_coherence": mutual_coh, "stable_rank": stable_rank}
+
+def activation_sparsity_metrics(A: np.ndarray, k_expected: Optional[int]=None) -> Dict:
+    l0 = (A != 0).sum(axis=1)
+    out = {"l0_summary": summary_stats(l0)}
+    if k_expected is not None:
+        out["topk_compliance_rate"] = float(np.mean(l0 == k_expected))
+    return out
+
+def feature_discriminability(A_forget: np.ndarray, A_retain: np.ndarray) -> Dict:
+    y = np.concatenate([np.ones(len(A_forget)), np.zeros(len(A_retain))])
+    A_all = np.vstack([A_forget, A_retain])
+    aucs = []
+    for j in range(A_all.shape[1]):
+        try:
+            auc = roc_auc_score(y, A_all[:, j])
+        except ValueError:
+            auc = 0.5
+        aucs.append(auc)
+    return {"feature_auc": aucs,
+            "feature_auc_summary": summary_stats(np.array(aucs))}
+
+def check_U(U: np.ndarray, D_selected: Optional[np.ndarray]=None) -> Dict:
+    I = U.T @ U
+    ortho_err = float(norm(I - np.eye(I.shape[0])))
+    out = {"U_orthonormality_err": ortho_err}
+    if D_selected is not None:
+        Ud, _s, _vt = svd(D_selected, full_matrices=False)
+        Uu = U
+        C = Ud.T @ Uu
+        s = svd(C, full_matrices=False)[1]
+        out["principal_cosines"] = s.tolist()
+    return out
+
+def energy_share_in_U(Z: np.ndarray, U: np.ndarray) -> float:
+    ZU = Z @ U
+    return float((ZU**2).sum() / max((Z**2).sum(), 1e-12))
+
+def leace_invariants(Z_all: np.ndarray, sets: List[str], U: np.ndarray, Y_dev: np.ndarray, P_r: np.ndarray, ZU_mean: np.ndarray, split_suffix=":dev") -> Dict:
+    mask_dev = np.array([s.endswith(split_suffix) for s in sets], bool)
+    Z_dev = Z_all[mask_dev]
+    ZU = Z_dev @ U
+    ZUc = ZU - ZU_mean
+    Yc = Y_dev - Y_dev.mean(0, keepdims=True)
+    CZY = (ZUc.T @ Yc) / max(len(ZUc)-1,1)
+    ZU_edit = (ZUc @ P_r.T) + ZU_mean
+    ZUc2 = ZU_edit - ZU_mean
+    CZY_after = (ZUc2.T @ Yc) / max(len(ZUc2)-1,1)
+    ZU_edit2 = ((ZU_edit - ZU_mean) @ P_r.T) + ZU_mean
+    idem_err = float(norm(ZU_edit2 - ZU_edit) / (norm(ZU_edit)+1e-12))
+    return {
+        "cross_cov_before_norm": float(norm(CZY)),
+        "cross_cov_after_norm": float(norm(CZY_after)),
+        "cross_cov_suppression_ratio": float((norm(CZY_after)+1e-12)/(norm(CZY)+1e-12)),
+        "idempotence_rel_err": idem_err,
+        "mean_preserved": float(norm(ZU_edit.mean(0) - ZU_mean))
+    }
+
+def probe_lens_auc(stages: Dict[str, np.ndarray], y_bin: np.ndarray) -> Dict:
+    out = {}
+    for name, X in stages.items():
+        Xc = X - X.mean(0, keepdims=True)
+        w, *_ = np.linalg.lstsq(Xc, y_bin - y_bin.mean(), rcond=None)
+        s = Xc @ w
+        try:
+            auc = roc_auc_score(y_bin, s)
+        except ValueError:
+            auc = 0.5
+        out[name] = float(auc)
+    return out
+
+def linear_cka(X: np.ndarray, Y: np.ndarray) -> float:
+    Xc = X - X.mean(0, keepdims=True)
+    Yc = Y - Y.mean(0, keepdims=True)
+    num = norm(Xc.T @ Yc, 'fro')**2
+    den = norm(Xc.T @ Xc, 'fro') * norm(Yc.T @ Yc, 'fro') + 1e-12
+    return float(num / den)
+
+def cka_matrix(reps: Dict[str, np.ndarray]) -> Dict[Tuple[str,str], float]:
+    keys = list(reps.keys())
+    out = {}
+    for i in range(len(keys)):
+        for j in range(i, len(keys)):
+            out[(keys[i], keys[j])] = linear_cka(reps[keys[i]], reps[keys[j]])
+    return out
+
+def polysemanticity_index(A: np.ndarray, labels: List[str], top_q=0.1) -> Dict:
+    labels_u = np.array(labels)
+    classes = np.unique(labels_u)
+    m = A.shape[1]
+    counts = []
+    for j in range(m):
+        totals = []
+        col = A[:, j]
+        for c in classes:
+            totals.append(col[labels_u==c].sum())
+        totals = np.array(totals)
+        pos = np.abs(totals)
+        order = np.argsort(pos)[::-1]
+        cum = np.cumsum(pos[order])
+        need = pos.sum() * top_q
+        k = int(np.searchsorted(cum, need) + 1)
+        counts.append(k)
+    return {"polysemanticity_counts": counts,
+            "summary": summary_stats(np.array(counts))}
 
 def check_projector_properties(P_r, tol=1e-6):
     idemp_err = norm(P_r @ P_r - P_r) / (norm(P_r) + 1e-12)
@@ -32,30 +523,10 @@ def atom_class_entropy(A_dev, labels_dev):
         entropies[j] = entropy(p, base=2)
     return entropies
 
-def remove_atoms_from_Z(Z, D_cols):
-    # Orthonormalize columns of D_cols via SVD and subtract projection
-    if D_cols.shape[1] == 0:
-        return Z.copy()
-    U_d, s, Vt = svd(D_cols, full_matrices=False)
-    Q = U_d[:, :D_cols.shape[1]]  # [d, r_sel]
-    Z_proj = (Z @ Q) @ Q.T
-    return Z - Z_proj
-
-# def atom_ablation_curve(Z_all, dec_w, feat_idx, mu, W, test_trials, test_labels, top_k=100):
-#     # Compute label direction in whitened ambient coordinates (ZU mean diff projected to ambient)
-#     # Here we pick top atoms by projection of label direction onto atoms
-#     # label_direction in ambient whitened frame: mean(forget dev) - mean(retain dev)
-#     # For simplicity user must supply indices; this function returns (k, EER)
-#     raise NotImplementedError("Use script in voxceleb.py to adapt to your variables")
-
-def run_validation_checks(save_dir,
-                          Z_all, Z_edit, E_all_norm, E_edit_norm,
+def run_validation_checks(save_dir, Z_all, Z_edit, E_all_norm, E_edit_norm,
                           ZU_mean, U, P_r, mu_r, dec_w, sae,
-                          feat_idx, sets, labels,
-                          mask_dev, mask_test,
-                          y_dev_bin, leace_ridge,
-                          mu, W,
-                          device='cpu'):
+                          feat_idx, sets, labels, mask_dev, mask_test,
+                          y_dev_bin, leace_ridge, mu, W, device='cpu'):
     os.makedirs(save_dir, exist_ok=True)
     out = {}
     t0 = time.time()
@@ -79,16 +550,15 @@ def run_validation_checks(save_dir,
     except Exception as e:
         out['sparsity_error'] = str(e)
 
-    # C) Feature discriminability (sanity on selected feat_idx)
+    # C) Feature discriminability
     try:
         A_ret = sae_encode_batch(sae, Z_all[np.array([s == 'retain:dev' for s in sets])], device=device, batch=8192)
         A_fgt = sae_encode_batch(sae, Z_all[np.array([s == 'forget:dev' for s in sets])], device=device, batch=8192)
         feat_disc = feature_discriminability(A_fgt, A_ret)
         out['feature_discriminability_summary'] = feat_disc.get('feature_auc_summary', {})
-        # selected feature AUCs
         feat_aucs = np.array(feat_disc['feature_auc'])
-        if len(feat_aucs) >= max(feat_idx)+1:
-            out['selected_feat_aucs'] = feat_aucs[feat_idx].tolist()
+        if len(feat_aucs) >= max(feat_idx)+1 if feat_idx else 0:
+            out['selected_feat_aucs'] = feat_aucs[feat_idx].tolist() if feat_idx else []
     except Exception as e:
         out['feature_disc_error'] = str(e)
 
@@ -104,8 +574,7 @@ def run_validation_checks(save_dir,
 
     # E) LEACE invariants
     try:
-        leace_diag = leace_invariants(Z_all, sets, U, np.array([1 if 'forget' in s else 0 for s in sets])[mask_dev],
-                                      P_r, ZU_mean)
+        leace_diag = leace_invariants(Z_all, sets, U, y_dev_bin, P_r, ZU_mean)
         out['leace_diag'] = leace_diag
         proj_props = check_projector_properties(P_r)
         out['P_r_props'] = proj_props
@@ -118,7 +587,7 @@ def run_validation_checks(save_dir,
             "E": invert_whitener(Z_all[mask_dev], mu, W),
             "Z": Z_all[mask_dev],
             "ZU": Z_all[mask_dev] @ U,
-            "ZU_center": (Z_all[mask_dev] @ U) - (ZU_mean),
+            "ZU_center": (Z_all[mask_dev] @ U) - ZU_mean,
             "ZU_edit": ((Z_all[mask_dev] @ U) - ZU_mean) @ P_r.T + ZU_mean,
         }
         lens = probe_lens_auc(stages, y_dev_bin)
@@ -145,16 +614,15 @@ def run_validation_checks(save_dir,
     # H) Polysemanticity
     try:
         A_dev_full = sae_encode_batch(sae, Z_all[mask_dev], device=device, batch=8192)
-        poly = polysemanticity_index(A_dev_full, [("forget" if (s.startswith('forget')) else "retain") for s in np.array(sets)[mask_dev]], top_q=0.1)
+        binary_labels = get_binary_labels([labels[i] for i in np.where(mask_dev)[0]], 
+                                        [l for l in set(labels) if 'forget' in l])
+        poly = polysemanticity_index(A_dev_full, binary_labels, top_q=0.1)
         out['polysemanticity'] = poly
-        ents = atom_class_entropy(A_dev_full, [("forget" if (s.startswith('forget')) else "retain") for s in np.array(sets)[mask_dev]])
+        ents = atom_class_entropy(A_dev_full, binary_labels)
         out['atom_entropies_summary'] = {"mean": float(np.mean(ents)), "std": float(np.std(ents))}
         plot_polysemanticity(list(ents), save_dir)
     except Exception as e:
         out['polysemanticity_error'] = str(e)
 
-    # I) Save JSON
-    with open(os.path.join(save_dir, "validation_checks_summary.json"), "w") as f:
-        json.dump(out, f, indent=2)
-    print("Validation checks finished in", time.time()-t0, "s. Output:", os.path.join(save_dir, "validation_checks_summary.json"))
+    print(f"Validation checks completed in {time.time() - t0:.2f}s")
     return out

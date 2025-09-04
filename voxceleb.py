@@ -10,13 +10,14 @@ from common import (
     prune_and_normalize_decoder, feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace, 
     compute_scores, eer_from_scores, build_verification_trials,
-    train_classifier, evaluate_classifier, linear_probe_U, per_class_eers, avg_eers
+    train_classifier, evaluate_classifier, per_class_eers, avg_eers
 )
-from validation_checks import run_validation_checks
+from validation_checks import (
+    run_validation_checks, create_all_plots, 
+    check_whitening, decoder_metrics
+)
 
-# -------------------- Manifest --------------------
 def read_voxceleb_manifest(manifest_path: str) -> List[Dict]:
-    """Read VoxCeleb manifest file and convert to common format."""
     manifest = []
     with open(manifest_path, 'r') as f:
         for line in f:
@@ -35,17 +36,13 @@ def read_voxceleb_manifest(manifest_path: str) -> List[Dict]:
             manifest.append(seg)
     return manifest
 
-
 def build_manifest(manifest_path: str, embeddings_path: str = None, dev_frac_per_spk: float = 0.75, seed: int = 1337) -> List[Dict]:
-    """Build manifest and create train/test splits."""
     if embeddings_path is not None:
         data = np.load(embeddings_path, allow_pickle=True)
-        # support a few common key names
         labels = data['labels'].tolist() if 'labels' in data else (data['y'].tolist() if 'y' in data else None)
         ids = data['segment_ids'].tolist() if 'segment_ids' in data else (data['ids'].tolist() if 'ids' in data else None)
         if labels is None:
             raise RuntimeError("embeddings .npz must contain 'labels' or 'y' array when embeddings_path is used")
-        # segment ids may be None (in which case we assume ordering aligns)
         raw_manifest = [{'path': f'dummy_{i}', 'speaker': labels[i], 'segment_id': ids[i] if ids is not None else None} for i in range(len(labels))]
     else:
         raw_manifest = read_voxceleb_manifest(manifest_path)
@@ -59,8 +56,9 @@ def build_manifest(manifest_path: str, embeddings_path: str = None, dev_frac_per
     manifest = []
     for speaker, indices in by_speaker.items():
         rng.shuffle(indices)
-        n_dev = max(1, int(len(indices) * dev_frac_per_spk))    # ensure that if speaker has >1 utts, we leave at least 1 for test
-        if len(indices) > 1 and n_dev >= len(indices): n_dev = len(indices) - 1
+        n_dev = max(1, int(len(indices) * dev_frac_per_spk))
+        if len(indices) > 1 and n_dev >= len(indices): 
+            n_dev = len(indices) - 1
         dev_indices = indices[:n_dev]
         test_indices = indices[n_dev:]
         for idx in dev_indices:
@@ -75,34 +73,73 @@ def build_manifest(manifest_path: str, embeddings_path: str = None, dev_frac_per
         raise RuntimeError("No entries found in manifest")
     return manifest
 
+def safe_linear_probe(Z_all: np.ndarray, labels: List[str], U: np.ndarray, 
+                     split_mask: Dict[str, np.ndarray], forget_classes: List[str]) -> tuple[float, float]:
+    try:
+        if U.shape[1] == 0:
+            return float('nan'), float('nan')
+        
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import accuracy_score, roc_auc_score
+        
+        Zu = Z_all @ U
+        train_mask = split_mask['dev']
+        test_mask = split_mask['test']
+        
+        if not np.any(train_mask) or not np.any(test_mask):
+            return float('nan'), float('nan')
+        
+        y_train = np.array([int(l in forget_classes) for i, l in enumerate(labels) if train_mask[i]])
+        y_test = np.array([int(l in forget_classes) for i, l in enumerate(labels) if test_mask[i]])
+        X_train = Zu[train_mask]
+        X_test = Zu[test_mask]
+        
+        if (len(X_train) == 0 or len(X_test) == 0 or 
+            len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2 or
+            np.any(np.isnan(X_train)) or np.any(np.isnan(X_test)) or
+            np.any(np.isinf(X_train)) or np.any(np.isinf(X_test))):
+            return float('nan'), float('nan')
+        
+        clf = LogisticRegression(max_iter=1000, C=1.0, solver='lbfgs', random_state=42)
+        clf.fit(X_train, y_train)
+        
+        y_pred = clf.predict(X_test)
+        y_score = clf.predict_proba(X_test)[:, 1] if hasattr(clf, 'predict_proba') else clf.decision_function(X_test)
+        
+        acc = accuracy_score(y_test, y_pred)
+        auc_val = roc_auc_score(y_test, y_score) if len(set(y_test)) == 2 else float('nan')
+        
+        return float(acc), float(auc_val)
+        
+    except Exception as e:
+        print(f"Linear probe failed: {e}")
+        return float('nan'), float('nan')
 
-# -------------------- Orchestration --------------------
 def run_pipeline(
-    manifest_path: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337, retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_hidden_mult: float = 4.0,
-    sae_topk: int = 128, sae_epochs: int = 30,
-    build_U_top: int = 200, beta: float = 0.0, leace: bool = True, leace_ridge: float = 1e-6, noise_sigma: float = 0.02,
+    manifest_path: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337, 
+    retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_hidden_mult: float = 4.0,
+    sae_topk: int = 128, sae_epochs: int = 30, build_U_top: int = 200, beta: float = 0.0, 
+    leace: bool = True, leace_ridge: float = 1e-6, noise_sigma: float = 0.02,
     per_speaker_union: bool = False, forget_spks: Optional[List[str]] = None,
-    encoder: str = "ecapa", embeddings_path: str = None, wav2vec2_model: str = "facebook/wav2vec2-base", hubert_model: str = "facebook/hubert-base-ls960"
-    ):
+    encoder: str = "ecapa", embeddings_path: str = None, 
+    wav2vec2_model: str = "facebook/wav2vec2-base", 
+    hubert_model: str = "facebook/hubert-base-ls960"):
 
     seed_all(seed)
     os.makedirs(save_dir, exist_ok=True)
     t0_all = time.time()
 
-    # 1) manifest + splits
+    # 1) Build manifest and splits
     print("[1/12] Building manifest and splits...")
     entries = build_manifest(manifest_path, embeddings_path, dev_frac_per_spk, seed)
 
-    # group utterances by speaker (use full entries ordering)
     by = {}
     for e in entries:
         by.setdefault(e["speaker"], []).append(e)
     spks = sorted(by.keys())
 
-    # compute per-speaker test counts to prefer selecting forget speakers that have test samples
     test_counts = {s: sum(1 for x in by[s] if x.get('split') == 'test') for s in spks}
 
-    # decide which speakers to forget (prefer those with test samples and >1 utt)
     rng = random.Random(seed)
     if forget_spks is None:
         n_total = len(spks)
@@ -112,7 +149,6 @@ def run_pipeline(
         if len(eligible) >= n_forget:
             forget_spks = rng.sample(eligible, k=n_forget)
         else:
-            # fallback to sampling from all speakers but warn (this only happens on tiny datasets)
             print(f"  Warning: not enough eligible speakers with test samples; sampling from all speakers (eligible {len(eligible)} < required {n_forget})")
             forget_spks = rng.sample(spks, k=n_forget)
     elif isinstance(forget_spks, str):
@@ -120,7 +156,6 @@ def run_pipeline(
     else:
         forget_spks = list(forget_spks)
 
-    # Validate that all requested forget speakers exist
     for spk in forget_spks:
         if spk not in spks:
             raise ValueError(f"Requested forget speaker {spk} not found in dataset")
@@ -129,7 +164,6 @@ def run_pipeline(
 
     retain_spks = [s for s in spks if s not in forget_spks]
 
-    # add 'set' labels to manifest
     manifest = []
     for entry in entries:
         entry_copy = entry.copy()
@@ -142,6 +176,7 @@ def run_pipeline(
     dev_forget = [m for m in dev_manifest if m['set'] == 'forget']
     test_retain = [m for m in test_manifest if m['set'] == 'retain']
     test_forget = [m for m in test_manifest if m['set'] == 'forget']
+    
     print(f"  retain_spks {len(retain_spks)} forget_spks {len(forget_spks)}")
     print(f"  dev_retain {len(dev_retain)} dev_forget {len(dev_forget)} | test_retain {len(test_retain)} test_forget {len(test_forget)}")
 
@@ -150,7 +185,7 @@ def run_pipeline(
         print("[2/12] Loading precomputed embeddings and aligning to manifest order...")
         data = np.load(embeddings_path, allow_pickle=True)
         embs = data['embeddings']
-        # attempt to reorder embeddings to match manifest using segment ids
+        
         seg_ids = None
         if 'segment_ids' in data:
             seg_ids = list(map(str, data['segment_ids']))
@@ -171,7 +206,6 @@ def run_pipeline(
             L_all = [m['speaker'] for m in manifest]
             P_all = [m['path'] for m in manifest]
         else:
-            # no segment ids: assume order matches manifest (best-effort)
             print("  Warning: embeddings file lacks 'segment_ids' - assuming ordering already matches manifest")
             if embs.shape[0] != len(manifest):
                 raise RuntimeError("Embeddings count does not match manifest length and no segment_ids provided for alignment")
@@ -182,15 +216,15 @@ def run_pipeline(
     else:
         print("[2/12] Extracting embeddings...")
         all_manifest = dev_manifest + test_manifest
-        E_all, L_all, P_all = extract_embeddings(all_manifest, encoder=encoder, device=device, wav2vec2_model=wav2vec2_model, hubert_model=hubert_model, label_key='speaker')
+        E_all, L_all, P_all = extract_embeddings(all_manifest, encoder=encoder, device=device, 
+                                                wav2vec2_model=wav2vec2_model, hubert_model=hubert_model, 
+                                                label_key='speaker')
         manifest = list(dev_manifest) + list(test_manifest)
 
     labels = L_all
-
-    # Create set labels
     sets = [f"{m['set']}:{m['split']}" for m in manifest]
     
-    # all masks
+    # Create masks
     M_ret_dev = np.array([s == 'retain:dev' for s in sets], dtype=bool)
     M_fgt_dev = np.array([s == 'forget:dev' for s in sets], dtype=bool)
     M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
@@ -199,11 +233,15 @@ def run_pipeline(
     # 3) Whitening on retain-dev
     print("[3/12] Fitting whitener on Train-retain (retain-dev)...")
     E_ret_train = E_all[M_ret_dev]
-    if E_ret_train.shape[0] < 2: raise RuntimeError("Not enough retain-dev samples to fit whitener")
+    if E_ret_train.shape[0] < 2: 
+        raise RuntimeError("Not enough retain-dev samples to fit whitener")
     mu, W = fit_whitener(E_ret_train)
     Z_all = apply_whitener(E_all, mu, W)
 
-    # 4) SAE training on dev (retain + forget)
+    whitening_stats = check_whitening(E_ret_train)
+    print("Whitening stats:", whitening_stats)
+
+    # 4) SAE training on dev
     print("[4/12] Training SAE on Z_train (dev union: retain+forget)...")
     Z_train = Z_all[M_ret_dev | M_fgt_dev]
     perm = np.random.permutation(Z_train.shape[0])
@@ -212,6 +250,10 @@ def run_pipeline(
     sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=sae_hidden_mult, k=sae_topk)
     sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=4096, lr=1e-3, device=device)
 
+    dec_w = sae.dec.weight.detach().cpu().numpy()
+    decoder_diag = decoder_metrics(dec_w)
+    print("Decoder metrics:", decoder_diag)
+
     # 5) SAE encodes for feature mining
     print("[5/12] Encoding SAE activations for train-retain and train-forget...")
     Z_ret_dev = Z_all[M_ret_dev]
@@ -219,7 +261,7 @@ def run_pipeline(
     A_ret = sae_encode_batch(sae, Z_ret_dev, device=device, batch=8192)
     A_fgt = sae_encode_batch(sae, Z_fgt_dev, device=device, batch=8192)
 
-    # 6) feature stats & selection
+    # 6) Feature stats & selection
     print("[6/12] Computing feature statistics and selecting features...")
     stats = feature_stats(A_fgt, A_ret)
     feat_idx_global = select_features_from_stats(stats, top_k=build_U_top, fdr=0.05)
@@ -228,15 +270,14 @@ def run_pipeline(
         print("  computing per-forget-speaker feature unions... (not implemented, using global)")
         feat_idx = feat_idx_global
 
-    # 7) prune & normalize decoder & build U
+    # 7) Build U subspace
     print("[7/12] Building U subspace...")
-    dec_w = sae.dec.weight.detach().cpu().numpy()   # [d, m]
-    dec_pruned = prune_and_normalize_decoder(dec_w, prune_threshold=1e-6)  # returns [d, r]
-    U = build_U_from_decoder(dec_w, feat_idx)   # TODO: check by passing dec_pruned later
+    dec_w = sae.dec.weight.detach().cpu().numpy()
+    dec_pruned = prune_and_normalize_decoder(dec_w, prune_threshold=1e-6)
+    U = build_U_from_decoder(dec_w, feat_idx)
     print(f"  U shape: {U.shape}")
 
-
-    # 8) compute LEACE in U
+    # 8) Compute LEACE in U
     P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
     mu_r = None
     if leace:
@@ -244,8 +285,9 @@ def run_pipeline(
         mask_dev = np.array([s.endswith(':dev') for s in sets], dtype=bool)
         dev_indices = np.where(mask_dev)[0]
         Y_dev = np.array([1 if manifest[i]['speaker'] in forget_spks else 0 for i in dev_indices], dtype=int).reshape(-1, 1)
-        # safety check: shapes must align
-        if Y_dev.shape[0] != Z_all[mask_dev].shape[0]: raise RuntimeError("Mismatch between Y_dev and Z_all[mask_dev] lengths")
+        
+        if Y_dev.shape[0] != Z_all[mask_dev].shape[0]: 
+            raise RuntimeError("Mismatch between Y_dev and Z_all[mask_dev] lengths")
         try:
             P_r, mu_r = leace_projector_in_U(Z_all[mask_dev], U, Y_dev, ridge=leace_ridge)
         except Exception as e:
@@ -256,8 +298,12 @@ def run_pipeline(
         ZU_dev = Z_all[mask_dev] @ U
     else:
         print("[8/12] Skipping LEACE (identity)")
+        ZU_dev = Z_all[mask_dev] @ U if U.shape[1] > 0 else Z_all[mask_dev][:, :0]
+        mask_dev = np.array([s.endswith(':dev') for s in sets], dtype=bool)
+        dev_indices = np.where(mask_dev)[0]
+        Y_dev = np.array([1 if manifest[i]['speaker'] in forget_spks else 0 for i in dev_indices], dtype=int).reshape(-1, 1)
 
-    # 9) Apply SAUCE gating (optional) then LEACE and optional noise
+    # 9) Apply SAUCE gating and LEACE edit
     print("[9/12] Applying SAUCE gating (beta) and LEACE edit...")
     Z_edit = Z_all.copy()
     if beta > 0.0:
@@ -268,11 +314,10 @@ def run_pipeline(
     if noise_sigma and noise_sigma > 0:
         Z_edit = inject_noise_in_subspace(Z_edit, U, sigma=noise_sigma)
 
-    # map back to embedding space and l2 normalize
     E_edit = invert_whitener(Z_edit, mu, W)
     E_all_norm, E_edit_norm = l2_normalize(E_all), l2_normalize(E_edit)
 
-    # ================= Extended Validation Checks =================
+    # 9b) Extended Validation Checks
     print("[9b] Running extended validation checks...")
     run_validation_checks(
         save_dir=os.path.join(save_dir, "validation"),
@@ -286,7 +331,22 @@ def run_pipeline(
         mu=mu, W=W, device=device
     )
 
-    # ================= Verification Steps =================
+    # 9c) Create all diagnostic plots
+    print("[9c] Creating all diagnostic plots...")
+    Z_before = Z_all[mask_dev]
+    Z_after = Z_edit[mask_dev]
+    ZU_before = Z_before @ U if U.shape[1] > 0 else Z_before[:, :0]
+    ZU_after = Z_after @ U if U.shape[1] > 0 else Z_after[:, :0]
+    
+    create_all_plots(
+        Z_before, Z_after, ZU_before, ZU_after,
+        labels=[labels[i] for i in np.where(mask_dev)[0]],
+        forget_classes=forget_spks,
+        decoder_weights=dec_w, feat_idx=feat_idx,
+        A_retain=A_ret, A_forget=A_fgt,
+        save_dir=os.path.join(save_dir, "validation"), random_state=seed
+    )
+
     # 10) Per-class EERs
     results = {}
     print("[10/12] Per-class verification EERs...")
@@ -309,11 +369,11 @@ def run_pipeline(
         "forget_EER_after_avg": forget_avg_after,
     })
 
-    # 11) Linear Probing
+    # 11) Linear Probing (with safe implementation)
     print("[11/12] Linear probing evaluation...")
     split_mask = {"dev": M_ret_dev | M_fgt_dev, "test": M_ret_test | M_fgt_test}
-    acc_before, auc_before = linear_probe_U(Z_all, labels, U, split_mask, forget_classes=forget_spks)
-    acc_after, auc_after = linear_probe_U(Z_edit, labels, U, split_mask, forget_classes=forget_spks)
+    acc_before, auc_before = safe_linear_probe(Z_all, labels, U, split_mask, forget_classes=forget_spks)
+    acc_after, auc_after = safe_linear_probe(Z_edit, labels, U, split_mask, forget_classes=forget_spks)
     results.update({
         "linear_probe_acc_before": acc_before,
         "linear_probe_acc_after": acc_after,
@@ -321,13 +381,13 @@ def run_pipeline(
         "linear_probe_auc_after": auc_after,
     })
 
-    # Print summary
     print("\n--- Average EER summary ---")
     print(f"  Retain avg EER: before {retain_avg_before:.4f}, after {retain_avg_after:.4f}")
     print(f"  Forget avg EER: before {forget_avg_before:.4f}, after {forget_avg_after:.4f}")
 
     stats_path = os.path.join(save_dir, "verification_eer_summary.json")
-    with open(stats_path, "w") as fh: json.dump(results, fh, indent=2)
+    with open(stats_path, "w") as fh: 
+        json.dump(results, fh, indent=2)
 
     # 12) Classifier
     print("[12/12] Speaker classification accuracy (ResNet) ...")
@@ -339,9 +399,9 @@ def run_pipeline(
     X_cls_val = E_all_norm[M_ret_test | M_fgt_test]
     y_cls_val = [spk2id[s] for i, s in enumerate(labels) if (M_ret_test | M_fgt_test)[i]]
 
-    clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(all_spks), device=device, epochs=20, batch_size=512, lr=1e-3)
+    clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, 
+                          num_classes=len(all_spks), device=device, epochs=20, batch_size=512, lr=1e-3)
 
-    # Evaluate retain/forget sets before and after
     E_ret_test = E_all_norm[M_ret_test]
     L_ret_test = [spk2id[d] for d in np.array(labels)[M_ret_test]]
     E_fgt_test = E_all_norm[M_fgt_test]
@@ -365,10 +425,10 @@ def run_pipeline(
     })
 
     stats_path = os.path.join(save_dir, "verification_eer_summary.json")
-    with open(stats_path, "w") as fh: json.dump(results, fh, indent=2)
+    with open(stats_path, "w") as fh: 
+        json.dump(results, fh, indent=2)
 
     print(f"\nPipeline finished in {human_time(time.time() - t0_all)}. Results saved to {stats_path}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -395,8 +455,7 @@ if __name__ == "__main__":
         manifest_path=args.manifest_path, save_dir=args.save_dir, device=args.device, seed=args.seed,
         retain_frac=args.retain_frac, dev_frac_per_spk=args.dev_frac_per_spk,
         sae_hidden_mult=args.sae_hidden_mult, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
-        build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge, noise_sigma=args.noise_sigma,
-        forget_spks=args.forget_spks,
-        encoder=args.encoder,
-        embeddings_path=args.embeddings_path
-        )
+        build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge, 
+        noise_sigma=args.noise_sigma, forget_spks=args.forget_spks,
+        encoder=args.encoder, embeddings_path=args.embeddings_path
+    )
