@@ -10,7 +10,7 @@ from common import (
     prune_and_normalize_decoder, feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace, 
     compute_scores, eer_from_scores, build_verification_trials,
-    train_classifier, evaluate_classifier, per_class_eers, avg_eers
+    train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe
 )
 from validation_checks import (
     run_validation_checks, create_all_plots, 
@@ -73,48 +73,6 @@ def build_manifest(manifest_path: str, embeddings_path: str = None, dev_frac_per
         raise RuntimeError("No entries found in manifest")
     return manifest
 
-def safe_linear_probe(Z_all: np.ndarray, labels: List[str], U: np.ndarray, 
-                     split_mask: Dict[str, np.ndarray], forget_classes: List[str]) -> tuple[float, float]:
-    try:
-        if U.shape[1] == 0:
-            return float('nan'), float('nan')
-        
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.metrics import accuracy_score, roc_auc_score
-        
-        Zu = Z_all @ U
-        train_mask = split_mask['dev']
-        test_mask = split_mask['test']
-        
-        if not np.any(train_mask) or not np.any(test_mask):
-            return float('nan'), float('nan')
-        
-        y_train = np.array([int(l in forget_classes) for i, l in enumerate(labels) if train_mask[i]])
-        y_test = np.array([int(l in forget_classes) for i, l in enumerate(labels) if test_mask[i]])
-        X_train = Zu[train_mask]
-        X_test = Zu[test_mask]
-        
-        if (len(X_train) == 0 or len(X_test) == 0 or 
-            len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2 or
-            np.any(np.isnan(X_train)) or np.any(np.isnan(X_test)) or
-            np.any(np.isinf(X_train)) or np.any(np.isinf(X_test))):
-            return float('nan'), float('nan')
-        
-        clf = LogisticRegression(max_iter=1000, C=1.0, solver='lbfgs', random_state=42)
-        clf.fit(X_train, y_train)
-        
-        y_pred = clf.predict(X_test)
-        y_score = clf.predict_proba(X_test)[:, 1] if hasattr(clf, 'predict_proba') else clf.decision_function(X_test)
-        
-        acc = accuracy_score(y_test, y_pred)
-        auc_val = roc_auc_score(y_test, y_score) if len(set(y_test)) == 2 else float('nan')
-        
-        return float(acc), float(auc_val)
-        
-    except Exception as e:
-        print(f"Linear probe failed: {e}")
-        return float('nan'), float('nan')
-
 def run_pipeline(
     manifest_path: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337, 
     retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_hidden_mult: float = 4.0,
@@ -123,7 +81,8 @@ def run_pipeline(
     per_speaker_union: bool = False, forget_spks: Optional[List[str]] = None,
     encoder: str = "ecapa", embeddings_path: str = None, 
     wav2vec2_model: str = "facebook/wav2vec2-base", 
-    hubert_model: str = "facebook/hubert-base-ls960"):
+    hubert_model: str = "facebook/hubert-base-ls960",
+    conformer_model: str = "facebook/wav2vec2-conformer-rel-pos-large"):
 
     seed_all(seed)
     os.makedirs(save_dir, exist_ok=True)
@@ -181,7 +140,7 @@ def run_pipeline(
     print(f"  dev_retain {len(dev_retain)} dev_forget {len(dev_forget)} | test_retain {len(test_retain)} test_forget {len(test_forget)}")
 
     # 2) Embedding extraction or load
-    if embeddings_path is not None:
+    if embeddings_path:
         print("[2/12] Loading precomputed embeddings and aligning to manifest order...")
         data = np.load(embeddings_path, allow_pickle=True)
         embs = data['embeddings']
@@ -218,7 +177,7 @@ def run_pipeline(
         all_manifest = dev_manifest + test_manifest
         E_all, L_all, P_all = extract_embeddings(all_manifest, encoder=encoder, device=device, 
                                                 wav2vec2_model=wav2vec2_model, hubert_model=hubert_model, 
-                                                label_key='speaker')
+                                                conformer_model=conformer_model, label_key='speaker')
         manifest = list(dev_manifest) + list(test_manifest)
 
     labels = L_all
@@ -369,7 +328,7 @@ def run_pipeline(
         "forget_EER_after_avg": forget_avg_after,
     })
 
-    # 11) Linear Probing (with safe implementation)
+    # 11) Linear Probing (robust, using linear_probe_U)
     print("[11/12] Linear probing evaluation...")
     split_mask = {"dev": M_ret_dev | M_fgt_dev, "test": M_ret_test | M_fgt_test}
     acc_before, auc_before = safe_linear_probe(Z_all, labels, U, split_mask, forget_classes=forget_spks)
@@ -380,16 +339,9 @@ def run_pipeline(
         "linear_probe_auc_before": auc_before,
         "linear_probe_auc_after": auc_after,
     })
+    print(f'  Linear Probing accuracies and AUC, before: ({acc_before:.4f}, {auc_before:.4f}), after: ({acc_after:.4f}, {auc_after:.4f})')
 
-    print("\n--- Average EER summary ---")
-    print(f"  Retain avg EER: before {retain_avg_before:.4f}, after {retain_avg_after:.4f}")
-    print(f"  Forget avg EER: before {forget_avg_before:.4f}, after {forget_avg_after:.4f}")
-
-    stats_path = os.path.join(save_dir, "verification_eer_summary.json")
-    with open(stats_path, "w") as fh: 
-        json.dump(results, fh, indent=2)
-
-    # 12) Classifier
+    # 12) Classifier (ResNet)
     print("[12/12] Speaker classification accuracy (ResNet) ...")
     all_spks = sorted(list(set(labels)))
     spk2id = {s: i for i, s in enumerate(all_spks)}
@@ -399,9 +351,9 @@ def run_pipeline(
     X_cls_val = E_all_norm[M_ret_test | M_fgt_test]
     y_cls_val = [spk2id[s] for i, s in enumerate(labels) if (M_ret_test | M_fgt_test)[i]]
 
-    clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, 
-                          num_classes=len(all_spks), device=device, epochs=20, batch_size=512, lr=1e-3)
+    clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(all_spks), device=device, epochs=20, batch_size=512, lr=1e-3)
 
+    # Evaluate retain/forget sets before and after
     E_ret_test = E_all_norm[M_ret_test]
     L_ret_test = [spk2id[d] for d in np.array(labels)[M_ret_test]]
     E_fgt_test = E_all_norm[M_fgt_test]
@@ -448,6 +400,7 @@ if __name__ == "__main__":
     parser.add_argument("--noise_sigma", type=float, default=0.02)
     parser.add_argument("--forget_spks", nargs="*", default=None)
     parser.add_argument("--encoder", type=str, default="ecapa")
+    parser.add_argument("--conformer_model", type=str, default="facebook/wav2vec2-conformer-rel-pos-large")
     parser.add_argument("--embeddings_path", type=str, default=None)
     args = parser.parse_args()
 
@@ -457,5 +410,8 @@ if __name__ == "__main__":
         sae_hidden_mult=args.sae_hidden_mult, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
         build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge, 
         noise_sigma=args.noise_sigma, forget_spks=args.forget_spks,
-        encoder=args.encoder, embeddings_path=args.embeddings_path
+        encoder=args.encoder, embeddings_path=args.embeddings_path,
+        wav2vec2_model=args.wav2vec2_model if hasattr(args, 'wav2vec2_model') else "facebook/wav2vec2-base",
+        hubert_model=args.hubert_model if hasattr(args, 'hubert_model') else "facebook/hubert-base-ls960",
+        conformer_model=args.conformer_model
     )

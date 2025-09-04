@@ -12,8 +12,9 @@ from common import (
     prune_and_normalize_decoder, feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace,
     compute_scores, eer_from_scores, build_verification_trials,
-    train_classifier, evaluate_classifier, linear_probe_U, per_class_eers, avg_eers
+    train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe
 )
+from validation_checks import run_validation_checks, create_all_plots
 
 
 # -------------------- Manifest --------------------
@@ -66,7 +67,8 @@ def run_pipeline(
     build_U_top: int = 200, beta: float = 0.0, leace: bool = True, leace_ridge: float = 1e-6, 
     noise_sigma: float = 0.02, per_speaker_union: bool = False, forget_spks: Optional[List[str]] = None,
     encoder: str = "ecapa", wav2vec2_model: str = "facebook/wav2vec2-base", 
-    hubert_model: str = "facebook/hubert-base-ls960"
+    hubert_model: str = "facebook/hubert-base-ls960",
+    conformer_model: str = "facebook/wav2vec2-conformer-rel-pos-large"
 ):
     seed_all(seed)
     os.makedirs(save_dir, exist_ok=True)
@@ -125,7 +127,7 @@ def run_pipeline(
     # 2) Embedding extraction
     print("[2/12] Extracting embeddings...")
     all_manifest = dev_manifest + test_manifest
-    E_all, L_all, P_all = extract_embeddings(all_manifest, encoder=encoder, device=device, wav2vec2_model=wav2vec2_model, hubert_model=hubert_model, label_key='speaker')
+    E_all, L_all, P_all = extract_embeddings(all_manifest, encoder=encoder, device=device, wav2vec2_model=wav2vec2_model, hubert_model=hubert_model, conformer_model=conformer_model, label_key='speaker')
     manifest = list(dev_manifest) + list(test_manifest)
     labels = L_all
 
@@ -209,6 +211,38 @@ def run_pipeline(
     E_edit = invert_whitener(Z_edit, mu, W)
     E_all_norm, E_edit_norm = l2_normalize(E_all), l2_normalize(E_edit)
 
+    # 9b) Extended Validation Checks
+    print("[9b] Running extended validation checks...")
+    mask_dev = np.array([s.endswith(':dev') for s in sets], dtype=bool)
+    ZU_dev = Z_all[mask_dev] @ U if U.shape[1] > 0 else Z_all[mask_dev][:, :0]
+    Y_dev = np.array([1 if manifest[i]['speaker'] in forget_spks else 0 for i in np.where(mask_dev)[0]], dtype=int).reshape(-1, 1)
+    run_validation_checks(
+        save_dir=os.path.join(save_dir, "validation"),
+        Z_all=Z_all, Z_edit=Z_edit,
+        E_all_norm=E_all_norm, E_edit_norm=E_edit_norm,
+        ZU_mean=ZU_dev.mean(axis=0, keepdims=True) if leace else (Z_all[mask_dev] @ U).mean(0, keepdims=True),
+        U=U, P_r=P_r, mu_r=mu_r, dec_w=dec_w, sae=sae,
+        feat_idx=feat_idx, sets=sets, labels=labels,
+        mask_dev=mask_dev, mask_test=(M_ret_test | M_fgt_test),
+        y_dev_bin=Y_dev, leace_ridge=leace_ridge,
+        mu=mu, W=W, device=device
+    )
+
+    # 9c) Create all diagnostic plots
+    print("[9c] Creating all diagnostic plots...")
+    Z_before = Z_all[mask_dev]
+    Z_after = Z_edit[mask_dev]
+    ZU_before = Z_before @ U if U.shape[1] > 0 else Z_before[:, :0]
+    ZU_after = Z_after @ U if U.shape[1] > 0 else Z_after[:, :0]
+    create_all_plots(
+        Z_before, Z_after, ZU_before, ZU_after,
+        labels=[labels[i] for i in np.where(mask_dev)[0]],
+        forget_classes=forget_spks,
+        decoder_weights=dec_w, feat_idx=feat_idx,
+        A_retain=A_ret, A_forget=A_fgt,
+        save_dir=os.path.join(save_dir, "validation"), random_state=seed
+    )
+
     results = {}
 
     # ================= Verification Steps =================
@@ -233,29 +267,20 @@ def run_pipeline(
         "forget_EER_after_avg": forget_avg_after,
     })
 
-    # 11) Linear Probing
+    # 11) Linear Probing (robust, using safe_linear_probe)
     print("[11/12] Linear probing evaluation...")
     split_mask = {"dev": M_ret_dev | M_fgt_dev, "test": M_ret_test | M_fgt_test}
-    acc_before, auc_before = linear_probe_U(Z_all, labels, U, split_mask, forget_classes=forget_spks)
-    acc_after, auc_after = linear_probe_U(Z_edit, labels, U, split_mask, forget_classes=forget_spks)
+    acc_before, auc_before = safe_linear_probe(Z_all, labels, U, split_mask, forget_classes=forget_spks)
+    acc_after, auc_after = safe_linear_probe(Z_edit, labels, U, split_mask, forget_classes=forget_spks)
     results.update({
         "linear_probe_acc_before": acc_before,
         "linear_probe_acc_after": acc_after,
         "linear_probe_auc_before": auc_before,
         "linear_probe_auc_after": auc_after,
     })
-
     print(f'  Linear Probing accuracies and AUC, before: ({acc_before:.4f}, {auc_before:.4f}), after: ({acc_after:.4f}, {auc_after:.4f})')
 
-    # Print summary
-    print("\n--- Average EER summary ---")
-    print(f"  Retain avg EER: before {retain_avg_before:.4f}, after {retain_avg_after:.4f}")
-    print(f"  Forget avg EER: before {forget_avg_before:.4f}, after {forget_avg_after:.4f}")
-
-    stats_path = os.path.join(save_dir, "verification_eer_summary.json")
-    with open(stats_path, "w") as fh: json.dump(results, fh, indent=2)
-
-    # 12) Classifier
+    # 12) Classifier (ResNet)
     print("[12/12] Speaker classification accuracy (ResNet) ...")
     all_spks = sorted(list(set(labels)))
     spk2id = {s: i for i, s in enumerate(all_spks)}
@@ -292,10 +317,7 @@ def run_pipeline(
 
     # Final save with all results
     stats_path = os.path.join(save_dir, "verification_eer_summary.json")
-    with open(stats_path, "w") as fh: 
-        json.dump(results, fh, indent=2)
-
-    torch.save(sae.state_dict(), os.path.join(save_dir, "sae_state.pt"))
+    with open(stats_path, "w") as fh: json.dump(results, fh, indent=2)
     print(f"\nPipeline finished in {human_time(time.time() - t0_all)}. Results saved to {stats_path}")
 
 
@@ -317,7 +339,8 @@ if __name__ == "__main__":
     parser.add_argument("--leace_ridge", type=float, default=1e-6)
     parser.add_argument("--noise_sigma", type=float, default=0.02)
     parser.add_argument("--forget_spks", nargs="*", default=None, help="Speaker IDs to forget (e.g. '174' '175' '176')")
-    parser.add_argument("--encoder", type=str, default="ecapa", help="Encoder to use - 'ecapa', 'wav2vec2', 'hubert'")
+    parser.add_argument("--encoder", type=str, default="ecapa", help="Encoder to use - 'ecapa', 'wav2vec2', 'hubert', 'conformer'")
+    parser.add_argument("--conformer_model", type=str, default="facebook/wav2vec2-conformer-rel-pos-large")
     args = parser.parse_args()
 
     run_pipeline(
@@ -326,4 +349,7 @@ if __name__ == "__main__":
         sae_hidden_mult=args.sae_hidden_mult, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
         build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge, 
         noise_sigma=args.noise_sigma, forget_spks=args.forget_spks, encoder=args.encoder
+        , wav2vec2_model=getattr(args, 'wav2vec2_model', "facebook/wav2vec2-base")
+        , hubert_model=getattr(args, 'hubert_model', "facebook/hubert-base-ls960")
+        , conformer_model=args.conformer_model
     )

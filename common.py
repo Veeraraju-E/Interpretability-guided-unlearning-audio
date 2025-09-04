@@ -2,6 +2,11 @@ from __future__ import annotations
 import math
 import random
 import os
+# Limit threading to avoid OpenMP/MKL conflicts with PyTorch
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import numpy as np
 import torch
 import torch.nn as nn
@@ -98,7 +103,7 @@ def _extract_hf_embeddings(entries: list, model_name: str, device: str = 'cuda',
 
 
 # Unified switch
-def extract_embeddings(entries: list, encoder: str, device: str = 'cuda', wav2vec2_model: str = "facebook/wav2vec2-base", hubert_model: str = "facebook/hubert-base-ls960", label_key='speaker'):
+def extract_embeddings(entries: list, encoder: str, device: str = 'cuda', wav2vec2_model: str = "facebook/wav2vec2-base", hubert_model: str = "facebook/hubert-base-ls960", conformer_model: str = "facebook/wav2vec2-conformer-rel-pos-large", label_key='speaker'):
     enc = encoder.strip().lower()
     if enc in {"ecapa", "ecapa-tdnn", "speechbrain-ecapa"}:
         print("[2/11] Extracting ECAPA embeddings...")
@@ -109,8 +114,11 @@ def extract_embeddings(entries: list, encoder: str, device: str = 'cuda', wav2ve
     elif enc in {"hubert"}:
         print(f"[2/11] Extracting HuBERT embeddings ({hubert_model})...")
         return _extract_hf_embeddings(entries, hubert_model, device=device, target_sr=16000, label_key=label_key)
+    elif enc in {"conformer", "wav2vec2-conformer"}:
+        print(f"[2/11] Extracting Conformer embeddings ({conformer_model})...")
+        return _extract_hf_embeddings(entries, conformer_model, device=device, target_sr=16000, label_key=label_key)
     else:
-        raise ValueError(f"Unknown encoder '{encoder}'. Choose from: ecapa | wav2vec2 | hubert")
+        raise ValueError(f"Unknown encoder '{encoder}'. Choose from: ecapa | wav2vec2 | hubert | conformer")
 
 
 # -------------------- Whitener --------------------
@@ -523,6 +531,39 @@ def estimate_jacobian_alignment(sae: TopKSAE, Z_samples: np.ndarray, deltas: np.
         alignments.append(num / den)
     return np.concatenate(alignments, axis=0)
 
+def _prepare_probe_data(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_mask: Dict[str, np.ndarray], forget_classes: List[str]):
+    Zu = Z_all @ U if U is not None else Z_all
+    train_mask = split_mask['dev']
+    test_mask  = split_mask['test']
+    y_train = np.array([int(l in forget_classes) for i,l in enumerate(labels) if train_mask[i]])
+    y_test  = np.array([int(l in forget_classes) for i,l in enumerate(labels) if test_mask[i]])
+    X_train = Zu[train_mask]
+    X_test  = Zu[test_mask]
+    # Ensure safe dtype/contiguity
+    X_train = np.ascontiguousarray(X_train, dtype=np.float64)
+    X_test  = np.ascontiguousarray(X_test, dtype=np.float64)
+    return X_train, y_train, X_test, y_test
+
+
+def safe_linear_probe(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_mask: Dict[str, np.ndarray], forget_classes: List[str]) -> Tuple[float, float]:
+    try:
+        if U is None or U.shape[1] == 0:
+            return float('nan'), float('nan')
+        X_train, y_train, X_test, y_test = _prepare_probe_data(Z_all, labels, U, split_mask, forget_classes)
+        if (len(X_train) == 0 or len(X_test) == 0 or 
+            len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2 or
+            np.any(~np.isfinite(X_train)) or np.any(~np.isfinite(X_test))):
+            return float('nan'), float('nan')
+        clf = LogisticRegression(max_iter=1000, solver='liblinear', random_state=42)
+        clf.fit(X_train, y_train)
+        s = clf.decision_function(X_test) if hasattr(clf, 'decision_function') else clf.predict_proba(X_test)[:,1]
+        acc = accuracy_score(y_test, (s > 0).astype(int))
+        auc_val = roc_auc_score(y_test, s) if len(set(y_test)) == 2 else float('nan')
+        return float(acc), float(auc_val)
+    except Exception:
+        return float('nan'), float('nan')
+
+
 # -------------------- Evaluation and Verification Functions --------------------
 def linear_probe_U(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_mask: Dict[str, np.ndarray],  forget_classes: List[str], device: str = 'cuda') -> Tuple[float, float]:
     """
@@ -531,24 +572,13 @@ def linear_probe_U(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_ma
     """
     if U.shape[1] == 0:
         return float('nan'), float('nan')
-    
-    Zu = Z_all @ U   # project to reduced frame
-    train_mask = split_mask['dev']
-    test_mask  = split_mask['test']
-    y_train = np.array([int(l in forget_classes) for i,l in enumerate(labels) if train_mask[i]])
-    y_test  = np.array([int(l in forget_classes) for i,l in enumerate(labels) if test_mask[i]])
-    X_train = Zu[train_mask]
-    X_test  = Zu[test_mask]
-    
+    X_train, y_train, X_test, y_test = _prepare_probe_data(Z_all, labels, U, split_mask, forget_classes)
     if len(X_train) == 0 or len(X_test) == 0 or len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
-        print("Warning: Not enough samples or classes for linear probe evaluation. Skipping.")
         return float('nan'), float('nan')
-    
-    clf = LogisticRegression(max_iter=1000)
+    clf = LogisticRegression(max_iter=1000, solver='liblinear', random_state=42)
     clf.fit(X_train, y_train)
-    s = clf.decision_function(X_test)
+    s = clf.decision_function(X_test) if hasattr(clf, 'decision_function') else clf.predict_proba(X_test)[:,1]
     acc = accuracy_score(y_test, (s > 0).astype(int))
-    # AUC only defined for binary-present test:
     auc_val = roc_auc_score(y_test, s) if len(set(y_test)) == 2 else float('nan')
     return acc, auc_val
 
