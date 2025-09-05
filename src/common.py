@@ -187,8 +187,8 @@ class TopKSAE(nn.Module):
     def encode(self, z: torch.Tensor) -> torch.Tensor:
         z = self._ensure_2d(z)
         assert z.size(1) == self.input_dim, f"Encoder expected in_features={self.input_dim}, got {z.size(1)}"
-        # a = F.relu(self.enc(z))
-        a = self.enc(z)
+        a = F.relu(self.enc(z))
+        # a = self.enc(z)
         if 0 < self.k < a.shape[1]:
             # top-k thresholding
             topk_vals, _ = torch.topk(a, self.k, dim=1)

@@ -12,10 +12,6 @@ from common import (
     compute_scores, eer_from_scores, build_verification_trials,
     train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe
 )
-from validation_checks import (
-    run_validation_checks, create_all_plots, 
-    check_whitening, decoder_metrics
-)
 
 def read_voxceleb_manifest(manifest_path: str) -> List[Dict]:
     manifest = []
@@ -197,9 +193,6 @@ def run_pipeline(
     mu, W = fit_whitener(E_ret_train)
     Z_all = apply_whitener(E_all, mu, W)
 
-    whitening_stats = check_whitening(E_ret_train)
-    print("Whitening stats:", whitening_stats)
-
     # 4) SAE training on dev
     print("[4/12] Training SAE on Z_train (dev union: retain+forget)...")
     Z_train = Z_all[M_ret_dev | M_fgt_dev]
@@ -210,8 +203,6 @@ def run_pipeline(
     sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=4096, lr=1e-3, device=device)
 
     dec_w = sae.dec.weight.detach().cpu().numpy()
-    decoder_diag = decoder_metrics(dec_w)
-    print("Decoder metrics:", decoder_diag)
 
     # 5) SAE encodes for feature mining
     print("[5/12] Encoding SAE activations for train-retain and train-forget...")
@@ -274,37 +265,7 @@ def run_pipeline(
         Z_edit = inject_noise_in_subspace(Z_edit, U, sigma=noise_sigma)
 
     E_edit = invert_whitener(Z_edit, mu, W)
-    E_all_norm, E_edit_norm = l2_normalize(E_all), l2_normalize(E_edit)
-
-    # 9b) Extended Validation Checks
-    print("[9b] Running extended validation checks...")
-    run_validation_checks(
-        save_dir=os.path.join(save_dir, "validation"),
-        Z_all=Z_all, Z_edit=Z_edit,
-        E_all_norm=E_all_norm, E_edit_norm=E_edit_norm,
-        ZU_mean=ZU_dev.mean(axis=0, keepdims=True) if leace else (Z_all[mask_dev] @ U).mean(0, keepdims=True),
-        U=U, P_r=P_r, mu_r=mu_r, dec_w=dec_w, sae=sae,
-        feat_idx=feat_idx, sets=sets, labels=labels,
-        mask_dev=mask_dev, mask_test=(M_ret_test | M_fgt_test),
-        y_dev_bin=Y_dev, leace_ridge=leace_ridge,
-        mu=mu, W=W, device=device
-    )
-
-    # 9c) Create all diagnostic plots
-    print("[9c] Creating all diagnostic plots...")
-    Z_before = Z_all[mask_dev]
-    Z_after = Z_edit[mask_dev]
-    ZU_before = Z_before @ U if U.shape[1] > 0 else Z_before[:, :0]
-    ZU_after = Z_after @ U if U.shape[1] > 0 else Z_after[:, :0]
-    
-    create_all_plots(
-        Z_before, Z_after, ZU_before, ZU_after,
-        labels=[labels[i] for i in np.where(mask_dev)[0]],
-        forget_classes=forget_spks,
-        decoder_weights=dec_w, feat_idx=feat_idx,
-        A_retain=A_ret, A_forget=A_fgt,
-        save_dir=os.path.join(save_dir, "validation"), random_state=seed
-    )
+    E_all_norm, E_edit_norm = l2_normalize(E_all), l2_normalize(E_edit)    
 
     # 10) Per-class EERs
     results = {}
@@ -384,7 +345,7 @@ def run_pipeline(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest_path", type=str, default="../datasets/voxceleb2/manifest.csv")
+    parser.add_argument("--manifest_path", type=str, default="../../datasets/voxceleb2/manifest.csv")
     parser.add_argument("--save_dir", type=str, default="./out_voxceleb")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=1337)

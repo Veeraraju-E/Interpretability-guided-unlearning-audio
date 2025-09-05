@@ -14,7 +14,6 @@ from common import (
     train_classifier, evaluate_classifier, linear_probe_U, 
     build_verification_trials, per_class_eers, avg_eers, safe_linear_probe
 )
-from validation_checks import run_validation_checks, create_all_plots
 
 # -------------------- Manifest builder for AudioMNIST --------------------
 def build_manifest_from_audiomnist(data_root: str, embeddings_path: str = None, dev_frac_per_digit: float = 0.75, seed: int = 1337) -> List[Dict]:
@@ -278,37 +277,7 @@ def run_pipeline(
 
     results = {}
 
-    # 9b) Extended Validation Checks
-    print("[9b] Running extended validation checks...")
-    mask_dev = np.array([s.endswith(':dev') for s in sets], dtype=bool)
-    ZU_dev = Z_all[mask_dev] @ U if U.shape[1] > 0 else Z_all[mask_dev][:, :0]
-    Y_dev = np.array([1 if manifest[i]['digit'] in forget_digits else 0 for i in np.where(mask_dev)[0]], dtype=int).reshape(-1, 1)
-    run_validation_checks(
-        save_dir=os.path.join(save_dir, "validation"),
-        Z_all=Z_all, Z_edit=Z_edit,
-        E_all_norm=E_all_norm, E_edit_norm=E_edit_norm,
-        ZU_mean=ZU_dev.mean(axis=0, keepdims=True) if U.shape[1] > 0 else (Z_all[mask_dev] @ U).mean(0, keepdims=True),
-        U=U, P_r=P_r, mu_r=mu_r, dec_w=dec_w, sae=sae,
-        feat_idx=feat_idx, sets=sets, labels=labels,
-        mask_dev=mask_dev, mask_test=(M_ret_test | M_fgt_test),
-        y_dev_bin=Y_dev, leace_ridge=leace_ridge,
-        mu=mu, W=W, device=device
-    )
-
-    # 9c) Create all diagnostic plots
-    print("[9c] Creating all diagnostic plots...")
-    Z_before = Z_all[mask_dev]
-    Z_after = Z_edit[mask_dev]
-    ZU_before = Z_before @ U if U.shape[1] > 0 else Z_before[:, :0]
-    ZU_after = Z_after @ U if U.shape[1] > 0 else Z_after[:, :0]
-    create_all_plots(
-        Z_before, Z_after, ZU_before, ZU_after,
-        labels=[labels[i] for i in np.where(mask_dev)[0]],
-        forget_classes=forget_digits,
-        decoder_weights=dec_w, feat_idx=feat_idx,
-        A_retain=A_ret, A_forget=A_fgt,
-        save_dir=os.path.join(save_dir, "validation"), random_state=seed
-    )
+    # Note: Extended validation checks and diagnostic plots are now handled by run_audiomnist_experiments.py
 
     # ================= Verification Steps =================
     # 10) Per-class EERs
@@ -396,7 +365,7 @@ def run_pipeline(
 # -------------------- CLI --------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", default="../datasets/audiomnist_data", help="AudioMNIST root containing recordings/")
+    parser.add_argument("--data_root", default="../../datasets/audiomnist_data", help="AudioMNIST root containing recordings/")
     parser.add_argument("--save_dir", default="./outputs_audiomnist", help="where to store artifacts")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1337)
