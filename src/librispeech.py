@@ -292,7 +292,7 @@ def run_pipeline(
 # -------------------- CLI --------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", default="../../datasets/librispeech_data_dev/LibriSpeech", help="LibriSpeech root containing dev-clean/dev-other")
+    parser.add_argument("--data_root", default="/data/veer/testing/new/datasets/librispeech_data_dev/LibriSpeech", help="LibriSpeech root containing dev-clean/dev-other")
     parser.add_argument("--save_dir", default="./outputs_librispeech", help="store artifacts")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1337)

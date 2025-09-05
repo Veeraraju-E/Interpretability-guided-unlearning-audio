@@ -340,7 +340,7 @@ def run_pipeline(
 # -------------------- CLI --------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", default="../../datasets/speech_commands", help="SpeechCommands root containing command directories")
+    parser.add_argument("--data_root", default="/data/veer/testing/new/datasets/speech_commands", help="SpeechCommands root containing command directories")
     parser.add_argument("--save_dir", default="./outputs_speechcommands", help="store artifacts")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1337)

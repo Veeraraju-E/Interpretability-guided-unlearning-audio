@@ -345,7 +345,7 @@ def run_pipeline(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest_path", type=str, default="../../datasets/voxceleb2/manifest.csv")
+    parser.add_argument("--manifest_path", type=str, default="/data/veer/testing/new/datasets/voxceleb2/manifest.csv")
     parser.add_argument("--save_dir", type=str, default="./out_voxceleb")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=1337)
