@@ -9,7 +9,7 @@ from validation_checks import run_validation_checks, create_all_plots, build_fea
 
 from common import (
     seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener,
-    invert_whitener, l2_normalize, TopKSAE, train_sae, sae_encode_batch,
+    invert_whitener, l2_normalize, SAE, train_sae, sae_encode_batch,
     prune_and_normalize_decoder, feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace,
     compute_scores, eer_from_scores, build_verification_trials,
@@ -62,7 +62,7 @@ def build_manifest(data_root: str, dev_frac_per_spk: float = 0.75, seed: int = 1
 def run_pipeline(
     data_root: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337, 
     retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_multiplier: float = 4.0,
-    sae_topk: int = 128, sae_epochs: int = 30,
+    sae_variant: str = "topk", sae_topk: int = 128, lambda_sparsity: float = 0.0, sae_epochs: int = 30,
     build_U_top: int = 200, beta: float = 0.0, leace: bool = True, leace_ridge: float = 1e-6, 
     noise_sigma: float = 0.02, per_speaker_union: bool = False, forget_spks: Optional[List[str]] = None,
     encoder: str = "ecapa", wav2vec2_model: str = "facebook/wav2vec2-base", 
@@ -150,8 +150,8 @@ def run_pipeline(
     perm = np.random.permutation(Z_train.shape[0])
     cut = int(0.8 * len(perm))
     Z_sae_train, Z_sae_val = Z_train[perm[:cut]], Z_train[perm[cut:]]
-    sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=sae_multiplier, k=sae_topk)
-    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=64, lr=1e-3, device=device)
+    sae = SAE(input_dim=Z_all.shape[1], hidden_mult=sae_multiplier, k=sae_topk, variant=sae_variant)
+    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=64, lr=1e-3, device=device, lambda_sparsity=lambda_sparsity)
 
     # 5) SAE encodes for feature mining
     print("[5/12] Encoding SAE activations for train-retain and train-forget...")
@@ -360,7 +360,9 @@ if __name__ == "__main__":
     parser.add_argument("--retain_frac", type=float, default=0.7)
     parser.add_argument("--dev_frac_per_spk", type=float, default=0.7)
     parser.add_argument("--sae_multiplier", type=float, default=10.0)
-    parser.add_argument("--sae_topk", type=int, default=128)
+    parser.add_argument("--sae_variant", type=str, default="topk", choices=["topk", "standard"], help="SAE variant: topk or standard")
+    parser.add_argument("--sae_topk", type=int, default=128, help="Top-K value for topk variant (ignored for standard)")
+    parser.add_argument("--lambda_sparsity", type=float, default=0.0, help="L1 sparsity penalty for standard SAE variant")
     parser.add_argument("--sae_epochs", type=int, default=100)
     parser.add_argument("--build_U_top", type=int, default=200)
     parser.add_argument("--beta", type=float, default=0.0)
@@ -375,7 +377,7 @@ if __name__ == "__main__":
     run_pipeline(
         data_root=args.data_root, save_dir=args.save_dir, device=args.device, seed=args.seed,
         retain_frac=args.retain_frac, dev_frac_per_spk=args.dev_frac_per_spk,
-        sae_multiplier=args.sae_multiplier, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
+        sae_multiplier=args.sae_multiplier, sae_variant=args.sae_variant, sae_topk=args.sae_topk, lambda_sparsity=args.lambda_sparsity, sae_epochs=args.sae_epochs,
         build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge, 
         noise_sigma=args.noise_sigma, forget_spks=args.forget_spks, encoder=args.encoder
         , wav2vec2_model=getattr(args, 'wav2vec2_model', "facebook/wav2vec2-base")

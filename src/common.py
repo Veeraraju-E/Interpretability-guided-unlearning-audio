@@ -165,14 +165,19 @@ def l2_normalize(X: np.ndarray) -> np.ndarray:
     return X / n
 
 
-# -------------------- Top-K SAE --------------------
-class TopKSAE(nn.Module):
-    def __init__(self, input_dim: int, hidden_mult: float = 8.0, k: int = 32, hidden_dim: int | None = None):
+# -------------------- SAE (Top-K and Standard variants) --------------------
+class SAE(nn.Module):
+    def __init__(self, input_dim: int, hidden_mult: float = 8.0, k: int = 32, hidden_dim: int | None = None, variant: str = "topk"):
         super().__init__()
         self.input_dim = int(input_dim)
         self.hidden_mult = float(hidden_mult)
         self.m = int(hidden_dim) if hidden_dim is not None else int(round(self.input_dim * self.hidden_mult))
         self.k = int(k)
+        self.variant = variant.lower()
+        
+        if self.variant not in ["topk", "standard"]:
+            raise ValueError(f"SAE variant must be 'topk' or 'standard', got '{variant}'")
+        
         self.enc = nn.Linear(self.input_dim, self.m, bias=True)
         self.dec = nn.Linear(self.m, self.input_dim, bias=False)
         nn.init.xavier_uniform_(self.enc.weight)
@@ -188,13 +193,15 @@ class TopKSAE(nn.Module):
         z = self._ensure_2d(z)
         assert z.size(1) == self.input_dim, f"Encoder expected in_features={self.input_dim}, got {z.size(1)}"
         a = F.relu(self.enc(z))
-        # a = self.enc(z)
-        if 0 < self.k < a.shape[1]:
+        
+        if self.variant == "topk" and 0 < self.k < a.shape[1]:
             # top-k thresholding
             topk_vals, _ = torch.topk(a, self.k, dim=1)
             kth = topk_vals[:, -1].unsqueeze(1)
             mask = (a >= kth).float()
             a = a * mask
+        # For standard variant, just return ReLU activations without top-k
+        
         return a
 
     def decode(self, a: torch.Tensor) -> torch.Tensor:
@@ -209,8 +216,12 @@ class TopKSAE(nn.Module):
         return z_hat, a
 
 
+# Backward compatibility alias
+TopKSAE = SAE
+
+
 # -------------------- Training SAE --------------------
-def train_sae(model: TopKSAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 30, batch_size: int = 4096, lr: float = 1e-3, device: str = 'cuda') -> TopKSAE:
+def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 30, batch_size: int = 4096, lr: float = 1e-3, device: str = 'cuda', lambda_sparsity: float = 0.0) -> SAE:
     Z_train = np.asarray(Z_train)
     Z_val = np.asarray(Z_val)
     if Z_train.ndim > 2:
@@ -228,24 +239,45 @@ def train_sae(model: TopKSAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: in
     best_val = float('inf'); best_state = None
     for ep in range(1, epochs+1):
         model.train()
-        acc_loss, n = 0.0, 0
+        acc_loss, acc_l1_loss, n = 0.0, 0.0, 0
         for (z_batch,) in dl:
             z_batch = z_batch.to(device)
             z_hat, a = model(z_batch)
             loss = F.mse_loss(z_hat, z_batch)
+            
+            # Add L1 sparsity penalty for standard SAE variant
+            l1_penalty = 0.0
+            if model.variant == "standard" and lambda_sparsity > 0:
+                l1_penalty = lambda_sparsity * torch.mean(torch.abs(a))
+                loss = loss + l1_penalty
+            
             opt.zero_grad(); loss.backward(); opt.step()
-            acc_loss += loss.item() * z_batch.size(0); n += z_batch.size(0)
+            acc_loss += loss.item() * z_batch.size(0)
+            acc_l1_loss += l1_penalty.item() * z_batch.size(0)
+            n += z_batch.size(0)
         train_loss = acc_loss / max(1, n)
+        train_l1_loss = acc_l1_loss / max(1, n)
 
-        model.eval(); acc_val = 0.0; nv = 0
+        model.eval(); acc_val, acc_val_l1, nv = 0.0, 0.0, 0
         all_a = []
         with torch.no_grad():
             for (z_batch,) in dl_val:
                 z_batch = z_batch.to(device)
                 z_hat, a = model(z_batch)
-                acc_val += F.mse_loss(z_hat, z_batch).item() * z_batch.size(0); nv += z_batch.size(0)
+                val_loss_batch = F.mse_loss(z_hat, z_batch).item()
+                
+                # Add L1 sparsity penalty for standard SAE variant
+                val_l1_penalty = 0.0
+                if model.variant == "standard" and lambda_sparsity > 0:
+                    val_l1_penalty = lambda_sparsity * torch.mean(torch.abs(a)).item()
+                    val_loss_batch = val_loss_batch + val_l1_penalty
+                
+                acc_val += val_loss_batch * z_batch.size(0)
+                acc_val_l1 += val_l1_penalty * z_batch.size(0)
+                nv += z_batch.size(0)
                 all_a.append(a.cpu())
         val_loss = acc_val / max(1, nv)
+        val_l1_loss = acc_val_l1 / max(1, nv)
 
         A = torch.cat(all_a, dim=0)  # shape: [N_val, latent_dim]
         mean_abs_per_latent = A.abs().mean(dim=0)  # [latent_dim]
@@ -257,13 +289,16 @@ def train_sae(model: TopKSAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: in
             best_val = val_loss
             best_state = {k: v.cpu() for k, v in model.state_dict().items()}
 
-        print(f"[SAE] ep {ep}/{epochs}, train {train_loss:.6f} val {val_loss:.6f}, dead_latents {avg_dead_latents}/{A.size(1)}, ({100*dead_frac:.1f}%)")
+        if model.variant == "standard" and lambda_sparsity > 0:
+            print(f"[SAE] ep {ep}/{epochs}, train {train_loss:.6f} (L1: {train_l1_loss:.6f}) val {val_loss:.6f} (L1: {val_l1_loss:.6f}), dead_latents {avg_dead_latents}/{A.size(1)}, ({100*dead_frac:.1f}%)")
+        else:
+            print(f"[SAE] ep {ep}/{epochs}, train {train_loss:.6f} val {val_loss:.6f}, dead_latents {avg_dead_latents}/{A.size(1)}, ({100*dead_frac:.1f}%)")
     if best_state is not None: model.load_state_dict(best_state)
     return model
 
 
 @torch.no_grad()
-def sae_encode_batch(model: TopKSAE, Z: np.ndarray, device: str = 'cuda', batch: int = 8192) -> np.ndarray:
+def sae_encode_batch(model: SAE, Z: np.ndarray, device: str = 'cuda', batch: int = 8192) -> np.ndarray:
     model = model.to(device).eval()
     Z = np.asarray(Z)
     if Z.ndim > 2:
@@ -408,7 +443,7 @@ def apply_subspace_leace(Z: np.ndarray, U: np.ndarray, P_r: np.ndarray, mu_r: np
 
 # -------------------- SAUCE gating --------------------
 @torch.no_grad()
-def apply_sauce_gating(sae_model: TopKSAE, Z: np.ndarray, feat_idx: list[int], beta: float = 0.0, device: str = 'cuda', batch: int = 8192) -> np.ndarray:
+def apply_sauce_gating(sae_model: SAE, Z: np.ndarray, feat_idx: list[int], beta: float = 0.0, device: str = 'cuda', batch: int = 8192) -> np.ndarray:
     assert 0.0 <= beta <= 1.0
     sae_model = sae_model.to(device).eval()
     Z_out = []
@@ -514,7 +549,7 @@ def participation_ratio(energy: np.ndarray) -> float:
 
 
 # -------------------- Jacobian sensitivity estimate --------------------
-def estimate_jacobian_alignment(sae: TopKSAE, Z_samples: np.ndarray, deltas: np.ndarray, eps: float = 1e-4, device: str = 'cpu') -> np.ndarray:
+def estimate_jacobian_alignment(sae: SAE, Z_samples: np.ndarray, deltas: np.ndarray, eps: float = 1e-4, device: str = 'cpu') -> np.ndarray:
     sae = sae.to(device).eval()
     Z = Z_samples.copy()
     alignments = []
