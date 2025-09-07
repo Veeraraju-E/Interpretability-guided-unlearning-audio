@@ -14,7 +14,7 @@ if _SRC_DIR not in sys.path:
 
 from common import (
     seed_all, extract_embeddings, fit_whitener, apply_whitener, invert_whitener,
-    TopKSAE, train_sae, sae_encode_batch, prune_and_normalize_decoder,
+    SAE, train_sae, sae_encode_batch, prune_and_normalize_decoder,
     feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating,
     inject_noise_in_subspace, l2_normalize,
@@ -409,8 +409,8 @@ def run_three_stage_leace_pipeline(entries: List[dict], cfg: Dict, dataset_api):
         perm = np.random.permutation(Z_train.shape[0])
         cut = int(0.8 * len(perm))
         Z_sae_train, Z_sae_val = Z_train[perm[:cut]], Z_train[perm[cut:]]
-        sae = TopKSAE(input_dim=Z_all_whitened.shape[1], hidden_mult=cfg['sae_multiplier'], k=cfg['sae_topk'])
-        sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae_epochs'], batch_size=64, lr=1e-3, device=cfg['device'])
+        sae = SAE(input_dim=Z_all_whitened.shape[1], hidden_mult=cfg['sae_multiplier'], k=cfg['sae_topk'], variant=cfg.get('sae_variant', 'topk'))
+        sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae_epochs'], batch_size=64, lr=1e-3, device=cfg['device'], lambda_sparsity=cfg.get('lambda_sparsity', 0.0))
         dec_w = sae.dec.weight.detach().cpu().numpy()
         # --- SAE encodes ---
         Z_ret_dev = Z_all_whitened[M_ret_dev]
@@ -590,8 +590,8 @@ def apply_sae_based_leace(E_all, labels, forget_classes, M_ret_dev, M_fgt_dev, M
     perm = np.random.permutation(Z_train.shape[0])
     cut = int(0.8 * len(perm))
     Z_sae_train, Z_sae_val = Z_train[perm[:cut]], Z_train[perm[cut:]]
-    sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=cfg['sae_multiplier'], k=cfg['sae_topk'])
-    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae_epochs'], batch_size=4096, lr=1e-3, device=cfg['device'])
+    sae = SAE(input_dim=Z_all.shape[1], hidden_mult=cfg['sae_multiplier'], k=cfg['sae_topk'], variant=cfg.get('sae_variant', 'topk'))
+    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae_epochs'], batch_size=4096, lr=1e-3, device=cfg['device'], lambda_sparsity=cfg.get('lambda_sparsity', 0.0))
     
     # SAE encodes for feature mining (matches voxceleb.py step 5)
     print("Encoding SAE activations for train-retain and train-forget...")
@@ -1097,8 +1097,8 @@ def run_pipeline(entries: List[dict], cfg: Dict, dataset_api):
     perm = np.random.permutation(Z_train.shape[0])
     cut = int(0.8 * len(perm))
     Z_sae_train, Z_sae_val = Z_train[perm[:cut]], Z_train[perm[cut:]]
-    sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=cfg['sae_multiplier'], k=cfg['sae_topk'])
-    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae_epochs'], batch_size=4096, lr=1e-3, device=cfg['device'])
+    sae = SAE(input_dim=Z_all.shape[1], hidden_mult=cfg['sae_multiplier'], k=cfg['sae_topk'], variant=cfg.get('sae_variant', 'topk'))
+    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae_epochs'], batch_size=4096, lr=1e-3, device=cfg['device'], lambda_sparsity=cfg.get('lambda_sparsity', 0.0))
 
     dec_w = sae.dec.weight.detach().cpu().numpy()
     dec_diag = decoder_metrics(dec_w)
