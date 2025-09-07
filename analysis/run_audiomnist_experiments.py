@@ -5,7 +5,7 @@ import argparse
 import itertools
 import numpy as np
 
-from experiment_core import run_pipeline
+from experiment_core import run_pipeline, run_three_stage_leace_pipeline
 _THIS_DIR = os.path.dirname(__file__)
 _SRC_DIR = os.path.abspath(os.path.join(_THIS_DIR, '..', 'src'))
 if _SRC_DIR not in sys.path:
@@ -42,6 +42,15 @@ def expand_grid(base_cfg, grid_cfg):
         yield cfg
 
 
+def run_three_stage_experiment(cfg):
+    entries = build_manifest_from_audiomnist(cfg['data_root'], cfg.get('embeddings_path'), dev_frac_per_digit=cfg['dev_frac_per_digit'], seed=cfg['seed'])
+    cfg2 = dict(cfg)
+    cfg2['label_key'] = 'digit'
+    if 'forget_digits' in cfg:
+        cfg2['forget_classes'] = cfg.get('forget_digits')
+    return run_three_stage_leace_pipeline(entries, cfg2, _DatasetAPI())
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, default="/data/veer/testing/new/datasets/audiomnist_data")
@@ -52,7 +61,7 @@ def main():
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--retain_frac", type=float, default=0.7)
     parser.add_argument("--dev_frac_per_digit", type=float, default=0.7)
-    parser.add_argument("--sae_hidden_mult", type=float, default=5.0)
+    parser.add_argument("--sae_multiplier", type=float, default=5.0)
     parser.add_argument("--sae_topk", type=int, default=128)
     parser.add_argument("--sae_epochs", type=int, default=150)
     parser.add_argument("--build_U_top", type=int, default=200)
@@ -65,6 +74,7 @@ def main():
     parser.add_argument("--hubert_model", type=str, default="facebook/hubert-base-ls960")
     parser.add_argument("--conformer_model", type=str, default="facebook/wav2vec2-conformer-rel-pos-large")
     parser.add_argument("--grid_config", type=str, default=None)
+    parser.add_argument("--three_stage", action="store_true", help="Run three-stage LEACE comparison experiment")
     args = parser.parse_args()
 
     base_cfg = vars(args)
@@ -73,9 +83,15 @@ def main():
         for i, cfg_i in enumerate(expand_grid(base_cfg, grid_cfg)):
             run_dir = os.path.join(args.save_dir, f"grid_{i}")
             cfg_i['save_dir'] = run_dir
-            run_single_experiment(cfg_i)
+            if args.three_stage:
+                run_three_stage_experiment(cfg_i)
+            else:
+                run_single_experiment(cfg_i)
     else:
-        run_single_experiment(base_cfg)
+        if args.three_stage:
+            run_three_stage_experiment(base_cfg)
+        else:
+            run_single_experiment(base_cfg)
 
 
 if __name__ == "__main__":

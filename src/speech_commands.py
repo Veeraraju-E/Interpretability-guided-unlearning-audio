@@ -97,7 +97,7 @@ def build_manifest(data_root: str, dev_frac_per_cmd: float = 0.75, seed: int = 1
 # -------------------- Orchestration --------------------
 def run_pipeline(
     data_root: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
-    retain_frac: float = 0.975, dev_frac_per_cmd: float = 0.75, sae_hidden_mult: float = 4.0,
+    retain_frac: float = 0.975, dev_frac_per_cmd: float = 0.75, sae_multiplier: float = 4.0,
     sae_topk: int = 128, sae_epochs: int = 30,
     build_U_top: int = 200, beta: float = 0.0, leace: bool = True, leace_ridge: float = 1e-6, 
     noise_sigma: float = 0.02, per_speaker_union: bool = False, forget_commands: Optional[List[str]] = None,
@@ -185,8 +185,8 @@ def run_pipeline(
     perm = np.random.permutation(Z_train.shape[0])
     cut = int(0.8 * len(perm))
     Z_sae_train, Z_sae_val = Z_train[perm[:cut]], Z_train[perm[cut:]]
-    sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=sae_hidden_mult, k=sae_topk)
-    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=4096, lr=1e-3, device=device)
+    sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=sae_multiplier, k=sae_topk)
+    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=64, lr=1e-3, device=device)
 
     # 5) SAE encodes for feature mining
     print("[5/12] Encoding SAE activations for train-retain and train-forget...")
@@ -248,8 +248,6 @@ def run_pipeline(
 
     results = {}
 
-    # Note: Extended validation checks and diagnostic plots are now handled by run_speechcommands_experiments.py
-
     # ================= Verification Steps =================
     # 10) Per-class EERs
     print("[10/12] Per-class verification EERs...")
@@ -304,8 +302,7 @@ def run_pipeline(
     X_cls_val = E_all_norm[M_ret_test | M_fgt_test]
     y_cls_val = [cmd2id[c] for i, c in enumerate(labels) if (M_ret_test | M_fgt_test)[i]]
 
-    clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(all_commands), 
-                          device=device, epochs=20, batch_size=512, lr=1e-3)
+    clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(all_commands), device=device, epochs=20, batch_size=512, lr=1e-3)
 
     # Evaluate retain/forget sets before and after
     E_ret_test = E_all_norm[M_ret_test]
@@ -336,6 +333,67 @@ def run_pipeline(
 
     print(f"\nPipeline finished in {human_time(time.time() - t0_all)}. Results saved to {stats_path}")
 
+    # --- Full validation and interpretability suite ---
+    from validation_checks import run_validation_checks, create_all_plots, build_feature_cards, polysemanticity_checks, causal_tests, activation_patching, top_neurons_analysis
+    validation_dir = os.path.join(save_dir, 'validation')
+    os.makedirs(validation_dir, exist_ok=True)
+    mask_dev = np.array([s.endswith(':dev') for s in sets], dtype=bool)
+    mask_test = M_ret_test | M_fgt_test
+    # Validation checks
+    run_validation_checks(
+        save_dir=validation_dir,
+        Z_all=Z_all, Z_edit=Z_edit,
+        E_all_norm=E_all_norm, E_edit_norm=E_edit_norm,
+        ZU_mean=(Z_all[mask_dev] @ U).mean(0, keepdims=True) if U.shape[1] > 0 else None,
+        U=U, P_r=P_r, mu_r=mu_r, dec_w=dec_w, sae=sae,
+        feat_idx=feat_idx, sets=sets, labels=labels,
+        mask_dev=mask_dev, mask_test=mask_test,
+        y_dev_bin=Y_dev if 'Y_dev' in locals() else None, leace_ridge=leace_ridge,
+        mu=mu, W=W, device=device
+    )
+    # All plots
+    Z_before = Z_all[mask_dev]
+    Z_after = Z_edit[mask_dev]
+    ZU_before = Z_before @ U if U.shape[1] > 0 else Z_before[:, :0]
+    ZU_after = Z_after @ U if U.shape[1] > 0 else Z_after[:, :0]
+    create_all_plots(
+        Z_before, Z_after, ZU_before, ZU_after,
+        labels=[labels[i] for i in np.where(mask_dev)[0]],
+        forget_classes=forget_commands,
+        decoder_weights=dec_w, feat_idx=feat_idx,
+        A_retain=A_ret, A_forget=A_fgt,
+        save_dir=validation_dir, random_state=seed
+    )
+    # Interpretability suite
+    interp_dir = os.path.join(validation_dir, 'interpretability')
+    os.makedirs(interp_dir, exist_ok=True)
+    label_binary = np.array([1 if c in forget_commands else 0 for c in labels])
+    A_all = sae_encode_batch(sae, Z_all, device=device, batch=8192)
+    try:
+        build_feature_cards(A_all, label_binary, dec_w, feat_idx, None, interp_dir)
+    except Exception as e:
+        print('feature card build failed', e)
+    try:
+        polysemanticity_checks(A_all, np.array(labels), feat_idx, interp_dir)
+    except Exception as e:
+        print('polysemanticity failed', e)
+    try:
+        test_trials, test_labels = build_verification_trials(labels, forget_commands, mask_test)
+        causal_tests(sae, Z_all, mu, W, test_trials, test_labels, feat_idx, interp_dir, device, max_feats=100)
+    except Exception as e:
+        print('causal tests failed', e)
+    try:
+        forget_indices = np.where(M_fgt_test)[0].tolist()
+        retain_indices = np.where(M_ret_test)[0].tolist()
+        test_trials, test_labels = build_verification_trials(labels, forget_commands, mask_test)
+        activation_patching(sae, Z_all, mu, W, test_trials, test_labels, forget_indices, retain_indices, interp_dir, device, topm=8)
+    except Exception as e:
+        print('patching failed', e)
+    try:
+        top_neurons_analysis(A_all, labels, manifest, interp_dir)
+    except Exception as e:
+        print('top neurons analysis failed', e)
+
 
 # -------------------- CLI --------------------
 if __name__ == "__main__":
@@ -346,7 +404,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--retain_frac", type=float, default=0.7)
     parser.add_argument("--dev_frac_per_cmd", type=float, default=0.7)
-    parser.add_argument("--sae_hidden_mult", type=float, default=10.0)
+    parser.add_argument("--sae_multiplier", type=float, default=10.0)
     parser.add_argument("--sae_topk", type=int, default=128)
     parser.add_argument("--sae_epochs", type=int, default=100)
     parser.add_argument("--build_U_top", type=int, default=200)
@@ -362,7 +420,7 @@ if __name__ == "__main__":
     run_pipeline(
         data_root=args.data_root, save_dir=args.save_dir, device=args.device, seed=args.seed,
         retain_frac=args.retain_frac, dev_frac_per_cmd=args.dev_frac_per_cmd,
-        sae_hidden_mult=args.sae_hidden_mult, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
+        sae_multiplier=args.sae_multiplier, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
         build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge, 
         noise_sigma=args.noise_sigma, forget_commands=args.forget_commands, encoder=args.encoder,
         wav2vec2_model=getattr(args, 'wav2vec2_model', "facebook/wav2vec2-base"),

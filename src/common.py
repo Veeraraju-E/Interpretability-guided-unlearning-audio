@@ -564,6 +564,91 @@ def safe_linear_probe(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split
         return float('nan'), float('nan')
 
 
+# -------------------- Monosemanticity Score (MS) --------------------
+def calculate_monosemanticity_score(activations: np.ndarray, inputs: np.ndarray, top_m: int = 20,  min_activations: int = 5) -> np.ndarray:
+    """
+    Calculate the Monosemanticity Score (MS) for a set of neuron activations.
+    
+    The MS measures how focused individual neurons are on single concepts by computing
+    the pairwise similarity of inputs that highly activate each neuron.
+    
+    Args:
+        activations: np.ndarray of shape (n_samples, n_neurons)
+            The activation values of neurons for each input sample.
+        inputs: np.ndarray of shape (n_samples, input_dim) 
+            The corresponding input samples (embeddings).
+        top_m: int, default=20
+            Number of top activating inputs to consider for each neuron.
+        min_activations: int, default=5
+            Minimum number of activating inputs required to compute MS.
+    
+    Returns:
+        ms_scores: np.ndarray of shape (n_neurons,)
+            The monosemanticity score for each neuron. Higher values indicate
+            more monosemantic (focused) neurons.
+    """
+    n_samples, n_neurons = activations.shape
+    ms_scores = np.zeros(n_neurons)
+    
+    # Normalize inputs for cosine similarity computation
+    inputs_norm = l2_normalize(inputs)
+    
+    for neuron_idx in range(n_neurons):
+        # Get the activations for the current neuron
+        neuron_activations = activations[:, neuron_idx]
+        
+        # Find top-m activating inputs
+        m = min(top_m, n_samples)
+        top_m_indices = np.argsort(neuron_activations)[-m:]
+        top_m_inputs = inputs_norm[top_m_indices]
+        
+        # Skip if we don't have enough activating inputs
+        if len(top_m_inputs) < min_activations:
+            ms_scores[neuron_idx] = 0.0
+            continue
+            
+        # Compute pairwise cosine similarities
+        # For efficiency, we can compute the mean of all pairwise similarities
+        # without computing the full similarity matrix
+        if len(top_m_inputs) == 1:
+            ms_scores[neuron_idx] = 1.0  # Single input has perfect similarity with itself
+        else:
+            # Compute mean pairwise cosine similarity
+            similarities = []
+            for i in range(len(top_m_inputs)):
+                for j in range(i + 1, len(top_m_inputs)):
+                    sim = np.dot(top_m_inputs[i], top_m_inputs[j])
+                    similarities.append(sim)
+            ms_scores[neuron_idx] = np.mean(similarities) if similarities else 0.0
+    
+    return ms_scores
+
+
+def compute_monosemanticity_statistics(ms_scores: np.ndarray) -> Dict[str, float]:
+    """
+    Compute summary statistics for monosemanticity scores.
+    
+    Args:
+        ms_scores: np.ndarray of shape (n_neurons,)
+            Monosemanticity scores for each neuron.
+    
+    Returns:
+        stats: Dict containing mean, std, min, max, and percentiles of MS scores.
+    """
+    if len(ms_scores) == 0:
+        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0}
+    
+    return {
+        "mean": float(np.mean(ms_scores)),
+        "std": float(np.std(ms_scores)),
+        "min": float(np.min(ms_scores)),
+        "max": float(np.max(ms_scores)),
+        "p25": float(np.percentile(ms_scores, 25)),
+        "p50": float(np.percentile(ms_scores, 50)),
+        "p75": float(np.percentile(ms_scores, 75))
+    }
+
+
 # -------------------- Evaluation and Verification Functions --------------------
 def linear_probe_U(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_mask: Dict[str, np.ndarray],  forget_classes: List[str], device: str = 'cuda') -> Tuple[float, float]:
     """

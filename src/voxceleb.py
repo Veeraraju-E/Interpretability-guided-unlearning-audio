@@ -10,7 +10,8 @@ from common import (
     prune_and_normalize_decoder, feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace, 
     compute_scores, eer_from_scores, build_verification_trials,
-    train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe
+    train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe,
+    calculate_monosemanticity_score, compute_monosemanticity_statistics
 )
 
 def read_voxceleb_manifest(manifest_path: str) -> List[Dict]:
@@ -71,7 +72,7 @@ def build_manifest(manifest_path: str, embeddings_path: str = None, dev_frac_per
 
 def run_pipeline(
     manifest_path: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337, 
-    retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_hidden_mult: float = 4.0,
+    retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_multiplier: float = 4.0,
     sae_topk: int = 128, sae_epochs: int = 30, build_U_top: int = 200, beta: float = 0.0, 
     leace: bool = True, leace_ridge: float = 1e-6, noise_sigma: float = 0.02,
     per_speaker_union: bool = False, forget_spks: Optional[List[str]] = None,
@@ -199,8 +200,8 @@ def run_pipeline(
     perm = np.random.permutation(Z_train.shape[0])
     cut = int(0.8 * len(perm))
     Z_sae_train, Z_sae_val = Z_train[perm[:cut]], Z_train[perm[cut:]]
-    sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=sae_hidden_mult, k=sae_topk)
-    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=4096, lr=1e-3, device=device)
+    sae = TopKSAE(input_dim=Z_all.shape[1], hidden_mult=sae_multiplier, k=sae_topk)
+    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=64, lr=1e-3, device=device)
 
     dec_w = sae.dec.weight.detach().cpu().numpy()
 
@@ -210,6 +211,22 @@ def run_pipeline(
     Z_fgt_dev = Z_all[M_fgt_dev]
     A_ret = sae_encode_batch(sae, Z_ret_dev, device=device, batch=8192)
     A_fgt = sae_encode_batch(sae, Z_fgt_dev, device=device, batch=8192)
+    
+    # Calculate Monosemanticity Score for original embeddings
+    print("[5.1/12] Computing Monosemanticity Score for original embeddings...")
+    E_all_norm = l2_normalize(E_all)
+    ms_original = calculate_monosemanticity_score(E_all_norm, E_all_norm, top_m=20, min_activations=5)
+    ms_original_stats = compute_monosemanticity_statistics(ms_original)
+    print(f"  Original embeddings MS: mean={ms_original_stats['mean']:.4f}, std={ms_original_stats['std']:.4f}, "
+          f"min={ms_original_stats['min']:.4f}, max={ms_original_stats['max']:.4f}")
+    
+    # Calculate Monosemanticity Score for SAE activations
+    print("[5.2/12] Computing Monosemanticity Score for SAE activations...")
+    A_all = sae_encode_batch(sae, Z_all, device=device, batch=8192)
+    ms_sae = calculate_monosemanticity_score(A_all, E_all_norm, top_m=20, min_activations=5)
+    ms_sae_stats = compute_monosemanticity_statistics(ms_sae)
+    print(f"  SAE activations MS: mean={ms_sae_stats['mean']:.4f}, std={ms_sae_stats['std']:.4f}, "
+          f"min={ms_sae_stats['min']:.4f}, max={ms_sae_stats['max']:.4f}")
 
     # 6) Feature stats & selection
     print("[6/12] Computing feature statistics and selecting features...")
@@ -266,6 +283,13 @@ def run_pipeline(
 
     E_edit = invert_whitener(Z_edit, mu, W)
     E_all_norm, E_edit_norm = l2_normalize(E_all), l2_normalize(E_edit)    
+    
+    # Calculate Monosemanticity Score for final edited embeddings
+    print("[9.1/12] Computing Monosemanticity Score for final edited embeddings...")
+    ms_final = calculate_monosemanticity_score(E_edit_norm, E_edit_norm, top_m=20, min_activations=5)
+    ms_final_stats = compute_monosemanticity_statistics(ms_final)
+    print(f"  Final edited embeddings MS: mean={ms_final_stats['mean']:.4f}, std={ms_final_stats['std']:.4f}, "
+          f"min={ms_final_stats['min']:.4f}, max={ms_final_stats['max']:.4f}")
 
     # 10) Per-class EERs
     results = {}
@@ -336,6 +360,22 @@ def run_pipeline(
         "resnet_acc_forget_before": acc_fgt_before,
         "resnet_acc_forget_after": acc_fgt_after,
     })
+    
+    # Add Monosemanticity Score results
+    results.update({
+        "ms_original_mean": ms_original_stats["mean"],
+        "ms_original_std": ms_original_stats["std"],
+        "ms_original_min": ms_original_stats["min"],
+        "ms_original_max": ms_original_stats["max"],
+        "ms_sae_mean": ms_sae_stats["mean"],
+        "ms_sae_std": ms_sae_stats["std"],
+        "ms_sae_min": ms_sae_stats["min"],
+        "ms_sae_max": ms_sae_stats["max"],
+        "ms_final_mean": ms_final_stats["mean"],
+        "ms_final_std": ms_final_stats["std"],
+        "ms_final_min": ms_final_stats["min"],
+        "ms_final_max": ms_final_stats["max"],
+    })
 
     stats_path = os.path.join(save_dir, "verification_eer_summary.json")
     with open(stats_path, "w") as fh: 
@@ -351,7 +391,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--retain_frac", type=float, default=0.7)
     parser.add_argument("--dev_frac_per_spk", type=float, default=0.7)
-    parser.add_argument("--sae_hidden_mult", type=float, default=5.0)
+    parser.add_argument("--sae_multiplier", type=float, default=5.0)
     parser.add_argument("--sae_topk", type=int, default=128)
     parser.add_argument("--sae_epochs", type=int, default=150)
     parser.add_argument("--build_U_top", type=int, default=200)
@@ -359,7 +399,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_leace", action="store_true")
     parser.add_argument("--leace_ridge", type=float, default=1e-6)
     parser.add_argument("--noise_sigma", type=float, default=0.02)
-    parser.add_argument("--forget_spks", nargs="*", default=None)
+    parser.add_argument("--forget_spks", nargs="*", default=["id00017"])
     parser.add_argument("--encoder", type=str, default="ecapa")
     parser.add_argument("--conformer_model", type=str, default="facebook/wav2vec2-conformer-rel-pos-large")
     parser.add_argument("--embeddings_path", type=str, default=None)
@@ -368,7 +408,7 @@ if __name__ == "__main__":
     run_pipeline(
         manifest_path=args.manifest_path, save_dir=args.save_dir, device=args.device, seed=args.seed,
         retain_frac=args.retain_frac, dev_frac_per_spk=args.dev_frac_per_spk,
-        sae_hidden_mult=args.sae_hidden_mult, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
+        sae_multiplier=args.sae_multiplier, sae_topk=args.sae_topk, sae_epochs=args.sae_epochs,
         build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge, 
         noise_sigma=args.noise_sigma, forget_spks=args.forget_spks,
         encoder=args.encoder, embeddings_path=args.embeddings_path,
