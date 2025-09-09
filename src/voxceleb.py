@@ -207,8 +207,7 @@ def run_pipeline(
     print("[5/12] Encoding SAE activations for train-retain and train-forget...")
     Z_ret_dev = Z_all[M_ret_dev]
     Z_fgt_dev = Z_all[M_fgt_dev]
-    A_ret = sae_encode_batch(sae, Z_ret_dev, device=device, batch=8192)
-    A_fgt = sae_encode_batch(sae, Z_fgt_dev, device=device, batch=8192)
+    A_ret, A_fgt = sae_encode_batch(sae, Z_ret_dev, device=device, batch=8192), sae_encode_batch(sae, Z_fgt_dev, device=device, batch=8192)
     
     # Calculate Monosemanticity Score for original embeddings
     print("[5.1/12] Computing Monosemanticity Score for original embeddings...")

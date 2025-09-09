@@ -253,7 +253,7 @@ def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 
             
             opt.zero_grad(); loss.backward(); opt.step()
             acc_loss += loss.item() * z_batch.size(0)
-            acc_l1_loss += l1_penalty.item() * z_batch.size(0)
+            acc_l1_loss += l1_penalty * z_batch.size(0)
             n += z_batch.size(0)
         train_loss = acc_loss / max(1, n)
         train_l1_loss = acc_l1_loss / max(1, n)
@@ -747,6 +747,7 @@ def build_verification_trials(labels: List[str], forget_classes: List[str], spli
     print(f"  Built {len(trials)} verification trials ({len(pos_pairs)} positive, {len(neg_pairs)} negative).")
     return list(trials), np.array(trial_labels)
 
+# In common.py, find the per_class_eers function and replace it with this corrected version.
 
 def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[str],  mask: np.ndarray, rng_seed: int = 1337) -> Dict[str, Tuple[float, float]]:
     """
@@ -795,18 +796,19 @@ def per_class_eers(emb_before: np.ndarray, emb_after: np.ndarray, labels: List[s
         
         # compute EER
         try:
-            eer_b, _ = eer_from_scores(scores_before, trial_labels)
+            # *** FIX IS HERE: Added return_threshold=True ***
+            eer_b, _ = eer_from_scores(scores_before, trial_labels, return_threshold=True)
         except Exception:
             eer_b = float('nan')
         try:
-            eer_a, _ = eer_from_scores(scores_after, trial_labels)
+            # *** FIX IS HERE: Added return_threshold=True ***
+            eer_a, _ = eer_from_scores(scores_after, trial_labels, return_threshold=True)
         except Exception:
             eer_a = float('nan')
         
         per_class[c] = (float(eer_b), float(eer_a))
     
     return per_class
-
 
 def compute_intra_class_cosine_similarities(embeddings: np.ndarray, labels: List[str],  mask: np.ndarray, rng_seed: int = 1337) -> Dict[str, float]:
     """
@@ -865,15 +867,21 @@ def compute_forget_inter_class_similarities(embeddings: np.ndarray, labels: List
     
     return inter_class_similarities
 
-
 def avg_eers(per_class_dict: Dict[str, Tuple[float, float]]) -> Tuple[float, float]:
     """
     Compute average EERs from per-class dictionary.
+    This version is robust to cases where no valid EERs were computed for a set of speakers.
     """
-    if len(per_class_dict) == 0:
+    if not per_class_dict:
         return float('nan'), float('nan')
     
+    # Filter out any NaN values that might have been returned for individual classes
     be = [v[0] for v in per_class_dict.values() if not np.isnan(v[0])]
     ae = [v[1] for v in per_class_dict.values() if not np.isnan(v[1])]
     
-    return float(np.mean(be)) if len(be) > 0 else float('nan'), float(np.mean(ae)) if len(ae) > 0 else float('nan')
+    # If the list of valid EERs is empty after filtering, return NaN.
+    # Otherwise, compute the mean.
+    avg_be = float(np.mean(be)) if len(be) > 0 else float('nan')
+    avg_ae = float(np.mean(ae)) if len(ae) > 0 else float('nan')
+    
+    return avg_be, avg_ae
