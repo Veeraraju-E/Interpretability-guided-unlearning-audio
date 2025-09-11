@@ -3,6 +3,7 @@ import os, time, json, random
 from typing import List, Dict, Optional
 import argparse
 import numpy as np
+import torch
 
 from common import (
     seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener,
@@ -377,6 +378,26 @@ def run_pipeline(
     stats_path = os.path.join(save_dir, "verification_eer_summary.json")
     with open(stats_path, "w") as fh: 
         json.dump(results, fh, indent=2)
+
+    print("Saving consolidated data for interpretability analysis...")
+    np.savez_compressed(
+        os.path.join(save_dir, "interpretability_data.npz"),
+        E_all=E_all,
+        E_edit=E_edit,
+        Z_all=Z_all,
+        Z_edit=Z_edit,
+        U=U,
+        labels=np.array(labels), # Save as numpy array for easier indexing
+        sets=np.array(sets),
+        manifest=np.array(manifest), # Save manifest as array
+        forget_spks=np.array(forget_spks)
+    )
+    torch.save(sae.state_dict(), os.path.join(save_dir, "sae_state_dict.pt"))
+    np.savez_compressed(
+        os.path.join(save_dir, "whitener.npz"),
+        mu=mu,
+        W=W
+    )
 
     print(f"\nPipeline finished in {human_time(time.time() - t0_all)}. Results saved to {stats_path}")
 

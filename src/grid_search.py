@@ -9,7 +9,6 @@ import torch
 from typing import List, Dict, Any
 from collections import Counter
 
-# Import necessary functions from your existing files
 from common import (
     seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener,
     invert_whitener, l2_normalize, SAE, train_sae, sae_encode_batch,
@@ -23,18 +22,16 @@ from common import (
 from voxceleb import build_manifest
 
 # --- 1. CONFIGURATION ---
-# Define the paths and base parameters
 MANIFEST_PATH = "/data/veer/testing/new/datasets/voxceleb2/manifest.csv"
 SAVE_DIR = "./grid_search_runs"
 CACHE_DIR = os.path.join(SAVE_DIR, "cache")
 RESULTS_CSV_PATH = os.path.join(SAVE_DIR, "grid_search_results.csv")
 DEVICE = "cuda"
 SEED = 1337
-FORGET_SPKS = ["id00017"] # Fixed for all runs as requested
-RETAIN_FRAC = 0.7 # Fixed for all runs
+FORGET_SPKS = ["id00017"]
+RETAIN_FRAC = 0.7
 
 # --- 2. HYPERPARAMETER GRID ---
-# Define the values to search over for each hyperparameter.
 HPARAM_GRID = {
     'encoder': ['ecapa', 'wav2vec2', 'hubert', 'conformer'],
     'dev_frac_per_spk': [0.7],
