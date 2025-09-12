@@ -865,9 +865,6 @@ def correlate_with_acoustic_features(sorted_features: pd.DataFrame, A_all: np.nd
     print("  -> Acoustic correlation plotting complete (see saved figures).")
 
 
-# =============================================================================
-# Main Orchestration (keeps most original logic but calls optimized functions)
-# =============================================================================
 
 def main(run_dir: str, device: str):
     """Main function to load data and orchestrate the  analysis pipeline."""
@@ -918,26 +915,15 @@ def main(run_dir: str, device: str):
     run_causal_interventions(sae, Z_all, mu, W, sets, labels, forget_spks, sorted_features, out_root, device=device)
     correlate_with_acoustic_features(sorted_features, A_all, manifest, sets, out_root)
 
-    print(f"\n" + "=" * 60)
-    print("ANALYSIS COMPLETE!")
-    print(f"All  visualizations saved in: {out_root}")
-    print("=" * 60)
-
     # Generate summary report
     summary_path = os.path.join(out_root, "analysis_summary.txt")
     with open(summary_path, 'w') as f:
-        f.write(" Interpretability Analysis Summary\n")
-        f.write("=" * 50 + "\n\n")
-        f.write(f"Run Directory: {run_dir}\n")
-        f.write(f"Output Directory: {out_root}\n")
         f.write(f"Analysis Date: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         f.write(f"Dataset Statistics:\n")
-        f.write(f"  - Total embeddings: {Z_all.shape[0]}\n")
         f.write(f"  - Embedding dimension: {Z_all.shape[1]}\n")
         f.write(f"  - SAE features: {A_all.shape[1]}\n")
         f.write(f"  - Forget speakers: {len(forget_spks)}\n")
         f.write(f"  - Total speakers: {len(np.unique(labels))}\n\n")
-        f.write("Generated Figures:\n")
         f.write(f"  - Check folder: {out_root}\n")
 
 if __name__ == "__main__":

@@ -529,6 +529,7 @@ def evaluate_classifier(model: ResNetClassifier, X: np.ndarray, y: list[int], de
     model.eval().to(device)
     with torch.no_grad():
         preds = model(torch.from_numpy(X).float().to(device)).argmax(1).cpu().numpy()
+    # print(preds)
     acc = accuracy_score(y, preds)
     return acc
 
