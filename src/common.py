@@ -533,7 +533,6 @@ def evaluate_classifier(model: ResNetClassifier, X: np.ndarray, y: list[int], de
     acc = accuracy_score(y, preds)
     return acc
 
-
 # -------------------- Effective rank & participation  --------------------
 def effective_rank(svals: np.ndarray, threshold: float = 0.01) -> int:
     svals = np.array(svals)
