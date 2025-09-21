@@ -9,6 +9,7 @@ from typing import List, Dict, Optional
 import argparse
 import numpy as np
 import torch
+import copy
 
 from common import (
     seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener,
@@ -80,9 +81,9 @@ def build_manifest(manifest_path: str, embeddings_path: str = None, dev_frac_per
     return manifest
 
 
-# ----------------------------
+
 # Precompute / shared steps
-# ----------------------------
+
 def precompute_embeddings_and_whitener(manifest_path: str, embeddings_path: Optional[str], dev_frac_per_spk: float,
                                        manifest_seed: int, encoder: str, device: str,
                                        wav2vec2_model: str, hubert_model: str, conformer_model: str):
@@ -171,9 +172,8 @@ def precompute_embeddings_and_whitener(manifest_path: str, embeddings_path: Opti
     return precomp
 
 
-# ----------------------------
+
 # Train SAE (once per seed)
-# ----------------------------
 def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: str, sae_topk: int,
                        lambda_sparsity: float, sae_epochs: int, device: str):
     """
@@ -186,6 +186,10 @@ def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: s
 
     print(f"[SAE] Training SAE for seed {seed} on all dev samples (once per seed)...")
     Z_train = Z_all[mask_dev]
+    
+    if Z_train.shape[0] == 0:
+        raise ValueError("Cannot train SAE with zero dev samples.")
+
     perm = np.random.permutation(Z_train.shape[0])
     cut = int(0.8 * len(perm)) if len(perm) > 1 else int(0.5 * len(perm))
     if cut <= 0:  # fallback
@@ -209,9 +213,7 @@ def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: s
     return sae, sae_training_time, A_all, dec_w
 
 
-# ----------------------------
 # Per-speaker run (uses precomputed and trained SAE)
-# ----------------------------
 def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: str, sae_params: Dict, edit_params: Dict, compute_ms: bool = True, save_artifacts: bool = True, save_dir: Optional[str] = None):
     """
     Run the per-forget speaker steps (feature stats, select features, build U, LEACE,
@@ -227,14 +229,20 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     W = precomp["W"]
     mask_dev_global = precomp["mask_dev"]
     mask_test_global = precomp["mask_test"]
-
+    
     # Build per-run sets (forget vs retain)
+    # Note: In continual setting, labels/manifest are already filtered, so this works correctly.
     sets = [f"{'forget' if m['speaker'] == forget_spk else 'retain'}:{m['split']}" for m in manifest]
 
     M_ret_dev = np.array([s == 'retain:dev' for s in sets], dtype=bool)
     M_fgt_dev = np.array([s == 'forget:dev' for s in sets], dtype=bool)
     M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
     M_fgt_test = np.array([s == 'forget:test' for s in sets], dtype=bool)
+    
+    if np.sum(M_fgt_dev) == 0:
+        print(f"Warning: No dev samples found for forget speaker {forget_spk}. Skipping feature mining for this speaker.")
+        # Create an empty results dict to avoid crashing
+        return {}, 0.0
 
     # Feature mining (depends on forget speaker)
     Z_ret_dev = Z_all[M_ret_dev]
@@ -271,9 +279,7 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     mu_r = None
     if edit_params.get("leace", True):
         print("[LEACE] Computing LEACE projector (per-forget-run)...")
-        # Note: we use split==dev indices for Y vector positions (dev split independent of set)
         dev_indices = np.where(mask_dev_global)[0]
-        # Build Y_dev in order of dev_indices
         Y_dev = np.array([1 if manifest[i]['speaker'] == forget_spk else 0 for i in dev_indices], dtype=int).reshape(-1, 1)
         try:
             P_r, mu_r = leace_projector_in_U(Z_all[mask_dev_global], U, Y_dev, ridge=edit_params.get("leace_ridge", 1e-6))
@@ -297,7 +303,7 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     noise_sigma = edit_params.get("noise_sigma", 0.0)
     if noise_sigma and noise_sigma > 0:
         Z_edit = inject_noise_in_subspace(Z_edit, U, sigma=noise_sigma)
-    E_edit = invert_whitener(Z_edit, precomp_mu := mu, precomp_W := W)
+    E_edit = invert_whitener(Z_edit, mu, W)
     E_all_norm = l2_normalize(E_all)
     E_edit_norm = l2_normalize(E_edit)
     t_edit_end = time.time()
@@ -307,10 +313,16 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     print("[EVAL] Computing EERs and per-class metrics for this forget speaker...")
     test_mask_for_trials = M_ret_test | M_fgt_test
     test_trials, test_labels = build_verification_trials(labels, [forget_spk], test_mask_for_trials)
-    scores_test_before = compute_scores(E_all_norm, test_trials)
-    scores_test_after = compute_scores(E_edit_norm, test_trials)
-    eer_before = eer_from_scores(scores_test_before, test_labels)
-    eer_after = eer_from_scores(scores_test_after, test_labels)
+    
+    # Check if there are any positive or negative pairs for EER calculation
+    if not (1 in test_labels and 0 in test_labels):
+        print("Warning: Cannot compute EER, not enough positive/negative pairs.")
+        eer_before, eer_after = -1.0, -1.0
+    else:
+        scores_test_before = compute_scores(E_all_norm, test_trials)
+        scores_test_after = compute_scores(E_edit_norm, test_trials)
+        eer_before = eer_from_scores(scores_test_before, test_labels)
+        eer_after = eer_from_scores(scores_test_after, test_labels)
 
     per_class_test = per_class_eers(E_all_norm, E_edit_norm, labels, mask=test_mask_for_trials, rng_seed=seed)
     per_class_ret = {c: vals for c, vals in per_class_test.items() if c != forget_spk}
@@ -324,9 +336,13 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     spk2id = {s: i for i, s in enumerate(all_spks)}
     # Build test indices for classifier evaluation
     E_ret_test = E_all_norm[M_ret_test]
-    L_ret_test = [spk2id[d] for d in np.array(labels)[M_ret_test]]
+    L_ret_test_str = np.array(labels)[M_ret_test]
+    L_ret_test = [spk2id[d] for d in L_ret_test_str] if len(L_ret_test_str) > 0 else []
+
     E_fgt_test = E_all_norm[M_fgt_test]
-    L_fgt_test = [spk2id[d] for d in np.array(labels)[M_fgt_test]]
+    L_fgt_test_str = np.array(labels)[M_fgt_test]
+    L_fgt_test = [spk2id[d] for d in L_fgt_test_str] if len(L_fgt_test_str) > 0 else []
+
     E_ret_test_edit = E_edit_norm[M_ret_test]
     E_fgt_test_edit = E_edit_norm[M_fgt_test]
 
@@ -335,17 +351,43 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     acc_ret_after = evaluate_classifier(clf, E_ret_test_edit, L_ret_test, device=sae_params.get("device", "cuda"))
     acc_fgt_after = evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=sae_params.get("device", "cuda"))
 
+    # Linear Probe AUC evaluation
+    print("[EVAL] Computing Linear Probe AUC...")
+    
+    # *** FIX: Corrected the calls to safe_linear_probe to match the signature in common.py ***
+    split_mask_dict = {'dev': mask_dev_global, 'test': mask_test_global}
+
+    # safe_linear_probe returns (accuracy, auc), we only need the auc
+    _, auc_before = safe_linear_probe(
+        Z_all,              # All WHITENED embeddings before editing
+        labels,             # All corresponding labels
+        U,                  # The subspace matrix
+        split_mask_dict,    # The dev/test masks for training/testing the probe
+        [forget_spk]        # The class(es) to treat as positive
+    )
+
+    _, auc_after = safe_linear_probe(
+        Z_edit,             # All WHITENED embeddings after editing
+        labels,             # All corresponding labels
+        U,                  # The subspace matrix
+        split_mask_dict,    # The dev/test masks for training/testing the probe
+        [forget_spk]        # The class(es) to treat as positive
+    )
+
     results = {
         # requested metrics: forget & retain accuracy before/after (classifier)
-        "resnet_acc_forget_before": acc_fgt_before,
-        "resnet_acc_forget_after": acc_fgt_after,
-        "resnet_acc_retain_before": acc_ret_before,
-        "resnet_acc_retain_after": acc_ret_after,
+        "FA_before": acc_fgt_before,
+        "FA_after": acc_fgt_after,
+        "RA_before": acc_ret_before,
+        "RA_after": acc_ret_after,
         # requested metrics: forget and mean retain EER (before/after)
-        "forget_EER_before_avg": forget_avg_before,
-        "forget_EER_after_avg": forget_avg_after,
-        "retain_EER_before_avg": retain_avg_before,
-        "retain_EER_after_avg": retain_avg_after,
+        "forget_EER_before": forget_avg_before,
+        "forget_EER_after": forget_avg_after,
+        "retain_EER_before": retain_avg_before,
+        "retain_EER_after": retain_avg_after,
+        # requested metrics: linear probe AUC
+        "linear_probe_auc_before": auc_before,
+        "linear_probe_auc_after": auc_after,
         # global EERs (kept for reference if desired)
         "EER_before_raw": eer_before,
         "EER_after_raw": eer_after
@@ -367,9 +409,8 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     return results, editing_time
 
 
-# ----------------------------
+
 # Multi-run orchestration
-# ----------------------------
 def run_all_forget_speakers(args):
     """
     Orchestrates multi-run optimized execution:
@@ -403,10 +444,10 @@ def run_all_forget_speakers(args):
     csv_path = os.path.join(base_save_dir, "multi_run_results.csv")
     fieldnames = [
         "seed", "forget_spk",
-        "resnet_acc_forget_before", "resnet_acc_forget_after",
-        "resnet_acc_retain_before", "resnet_acc_retain_after",
-        "forget_EER_before_avg", "forget_EER_after_avg",
-        "retain_EER_before_avg", "retain_EER_after_avg",
+        "FA_before", "FA_after", "RA_before", "RA_after",
+        "forget_EER_before", "forget_EER_after",
+        "retain_EER_before", "retain_EER_after",
+        "linear_probe_auc_before", "linear_probe_auc_after",
         "sae_training_time_seconds", "editing_time_seconds", "total_sae_edit_time_seconds", "error"
     ]
     write_header = not os.path.exists(csv_path)
@@ -468,14 +509,16 @@ def run_all_forget_speakers(args):
                         row = {
                             "seed": seed,
                             "forget_spk": spk,
-                            "resnet_acc_forget_before": results.get("resnet_acc_forget_before", ""),
-                            "resnet_acc_forget_after": results.get("resnet_acc_forget_after", ""),
-                            "resnet_acc_retain_before": results.get("resnet_acc_retain_before", ""),
-                            "resnet_acc_retain_after": results.get("resnet_acc_retain_after", ""),
-                            "forget_EER_before_avg": results.get("forget_EER_before_avg", ""),
-                            "forget_EER_after_avg": results.get("forget_EER_after_avg", ""),
-                            "retain_EER_before_avg": results.get("retain_EER_before_avg", ""),
-                            "retain_EER_after_avg": results.get("retain_EER_after_avg", ""),
+                            "FA_before": results.get("FA_before", ""),
+                            "FA_after": results.get("FA_after", ""),
+                            "RA_before": results.get("RA_before", ""),
+                            "RA_after": results.get("RA_after", ""),
+                            "forget_EER_before": results.get("forget_EER_before", ""),
+                            "forget_EER_after": results.get("forget_EER_after", ""),
+                            "retain_EER_before": results.get("retain_EER_before", ""),
+                            "retain_EER_after": results.get("retain_EER_after", ""),
+                            "linear_probe_auc_before": results.get("linear_probe_auc_before", ""),
+                            "linear_probe_auc_after": results.get("linear_probe_auc_after", ""),
                             "sae_training_time_seconds": float(sae_train_time),
                             "editing_time_seconds": float(editing_time),
                             "total_sae_edit_time_seconds": float(total_time),
@@ -505,9 +548,167 @@ def run_all_forget_speakers(args):
     print(f"\n[MULTI] finished. consolidated CSV: {csv_path}")
 
 
-# ----------------------------
+# Continual Unlearning Orchestration
+
+def run_continual_unlearning(args):
+    """
+    Orchestrates sequential, continual unlearning.
+    A fixed set of speakers is unlearned one by one. After each unlearning step,
+    the unlearned speaker is removed from the dataset for all subsequent steps.
+    The SAE and classifier are retrained at each step on the shrinking dataset.
+    """
+    base_save_dir = args.save_dir
+    os.makedirs(base_save_dir, exist_ok=True)
+    seed = args.seed
+    manifest_seed = args.split_seed
+
+    # Fixed list of speakers for continual unlearning
+    speakers_to_forget_continually = ["id03041", 'id03127','id03178', 'id03347', 'id03382', 'id03524', 'id03677', 'id03789', 'id03839', 'id03862', 'id03969', 'id03978', 'id03980',"id03981"]
+    
+    print("[CONTINUAL] Starting continual unlearning process.")
+    print(f"[CONTINUAL] Speakers to forget sequentially: {speakers_to_forget_continually}")
+
+    # 1) Precompute embeddings & whitener once on the FULL dataset
+    initial_precomp = precompute_embeddings_and_whitener(
+        manifest_path=args.manifest_path,
+        embeddings_path=args.embeddings_path,
+        dev_frac_per_spk=args.dev_frac_per_spk,
+        manifest_seed=manifest_seed,
+        encoder=args.encoder,
+        device=args.device,
+        wav2vec2_model=args.wav2vec2_model,
+        hubert_model=args.hubert_model,
+        conformer_model=args.conformer_model
+    )
+
+    csv_path = os.path.join(base_save_dir, f"continual_unlearning_results_seed{seed}.csv")
+    fieldnames = [
+        "step", "forgotten_speaker", "num_active_speakers", "num_active_samples",
+        "FA_before", "FA_after", "RA_before", "RA_after",
+        "forget_EER_before", "forget_EER_after",
+        "retain_EER_before", "retain_EER_after",
+        "linear_probe_auc_before", "linear_probe_auc_after",
+        "sae_training_time_seconds", "editing_time_seconds", "total_time_seconds", "error"
+    ]
+    
+    with open(csv_path, "w", newline='') as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+
+        previously_forgotten_speakers = []
+        
+        for i, speaker_to_forget in enumerate(speakers_to_forget_continually):
+            step = i + 1
+            print(f"\n{'='*20} CONTINUAL STEP {step}/{len(speakers_to_forget_continually)} {'='*20}")
+            print(f"[CONTINUAL] Forgetting speaker: {speaker_to_forget}")
+            print(f"[CONTINUAL] Previously forgotten: {previously_forgotten_speakers}")
+            
+            try:
+                # A. Create the current view of the data by filtering out previously forgotten speakers
+                if previously_forgotten_speakers:
+                    active_mask = np.array([l not in previously_forgotten_speakers for l in initial_precomp['labels']], dtype=bool)
+                    
+                    current_precomp = {
+                        "manifest": [m for m in initial_precomp['manifest'] if m['speaker'] not in previously_forgotten_speakers],
+                        "labels": list(np.array(initial_precomp['labels'])[active_mask]),
+                        "speakers": sorted(list(set(np.array(initial_precomp['labels'])[active_mask]))),
+                        "E_all": initial_precomp['E_all'][active_mask],
+                        "Z_all": initial_precomp['Z_all'][active_mask],
+                        "mask_dev": initial_precomp['mask_dev'][active_mask],
+                        "mask_test": initial_precomp['mask_test'][active_mask],
+                        # Whitener (mu, W) is from the original full dataset, which is standard practice
+                        "mu": initial_precomp['mu'],
+                        "W": initial_precomp['W']
+                    }
+                else: # First step, use the full dataset
+                    current_precomp = copy.deepcopy(initial_precomp)
+
+                num_active_speakers = len(current_precomp['speakers'])
+                num_active_samples = len(current_precomp['labels'])
+                print(f"[CONTINUAL] Active dataset size: {num_active_speakers} speakers, {num_active_samples} samples.")
+
+                if speaker_to_forget not in current_precomp['speakers']:
+                    print(f"Warning: Speaker {speaker_to_forget} not in the current active set. Skipping.")
+                    previously_forgotten_speakers.append(speaker_to_forget)
+                    continue
+
+                # B. Train SAE on the current active dev set
+                print(f"[CONTINUAL] Training SAE for step {step}...")
+                sae, sae_train_time, A_all, dec_w = train_sae_for_seed(
+                    current_precomp, seed, args.sae_multiplier, args.sae_variant, args.sae_topk,
+                    args.lambda_sparsity, args.sae_epochs, args.device
+                )
+
+                # C. Train Classifier on the current active dev set
+                print(f"[CONTINUAL] Training classifier for step {step}...")
+                E_all_norm_current = l2_normalize(current_precomp['E_all'])
+                all_spks_current = current_precomp['speakers']
+                spk2id_current = {s: i for i, s in enumerate(all_spks_current)}
+                
+                mask_dev_current = current_precomp['mask_dev']
+                mask_test_current = current_precomp['mask_test']
+
+                X_cls_train = E_all_norm_current[mask_dev_current]
+                y_cls_train = [spk2id_current[s] for s in np.array(current_precomp['labels'])[mask_dev_current]]
+                X_cls_val = E_all_norm_current[mask_test_current]
+                y_cls_val = [spk2id_current[s] for s in np.array(current_precomp['labels'])[mask_test_current]]
+
+                clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val,
+                                        num_classes=len(all_spks_current), device=args.device, epochs=args.classifier_epochs,
+                                        batch_size=512, lr=1e-3)
+                
+                # D. Perform unlearning and get metrics
+                print(f"[CONTINUAL] Performing unlearning for step {step} on speaker {speaker_to_forget}...")
+                results, editing_time = single_forget_run(
+                    precomp=current_precomp, sae=sae, dec_w=dec_w, A_all=A_all, clf=clf,
+                    seed=seed, forget_spk=speaker_to_forget,
+                    sae_params={"device": args.device, "build_U_top": args.build_U_top},
+                    edit_params={"beta": args.beta, "leace": not args.no_leace, "leace_ridge": args.leace_ridge, "noise_sigma": args.noise_sigma},
+                    compute_ms=False, save_artifacts=False
+                )
+                
+                # E. Log results for this step
+                row = {
+                    "step": step,
+                    "forgotten_speaker": speaker_to_forget,
+                    "num_active_speakers": num_active_speakers,
+                    "num_active_samples": num_active_samples,
+                    "FA_before": results.get("FA_before", ""),
+                    "FA_after": results.get("FA_after", ""),
+                    "RA_before": results.get("RA_before", ""),
+                    "RA_after": results.get("RA_after", ""),
+                    "forget_EER_before": results.get("forget_EER_before", ""),
+                    "forget_EER_after": results.get("forget_EER_after", ""),
+                    "retain_EER_before": results.get("retain_EER_before", ""),
+                    "retain_EER_after": results.get("retain_EER_after", ""),
+                    "linear_probe_auc_before": results.get("linear_probe_auc_before", ""),
+                    "linear_probe_auc_after": results.get("linear_probe_auc_after", ""),
+                    "sae_training_time_seconds": sae_train_time,
+                    "editing_time_seconds": editing_time,
+                    "total_time_seconds": sae_train_time + editing_time,
+                    "error": ""
+                }
+                writer.writerow(row)
+                fh.flush()
+
+                # F. Update state for the next iteration
+                previously_forgotten_speakers.append(speaker_to_forget)
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"[ERROR] Continual unlearning failed at step {step} for speaker {speaker_to_forget}: {e}\n{tb}")
+                err_row = {k: "" for k in fieldnames}
+                err_row.update({"step": step, "forgotten_speaker": speaker_to_forget, "error": str(e)})
+                writer.writerow(err_row)
+                fh.flush()
+                # Even on error, we mark speaker as processed to continue the sequence
+                previously_forgotten_speakers.append(speaker_to_forget)
+
+    print(f"\n[CONTINUAL] Continual unlearning finished. Results saved to: {csv_path}")
+
+
 # Backwards-compatible single-run (keeps original semantics)
-# ----------------------------
+
 def run_pipeline(
     manifest_path: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
     retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_multiplier: float = 4.0,
@@ -618,18 +819,23 @@ if __name__ == "__main__":
     parser.add_argument("--forget_spks", nargs="*", default=["id00017"])
     parser.add_argument("--encoder", type=str, default="ecapa")
     parser.add_argument("--conformer_model", type=str, default="facebook/wav2vec2-conformer-rel-pos-large")
+    parser.add_argument("--hubert_model", type=str, default="facebook/hubert-base-ls960")
+    parser.add_argument("--wav2vec2_model", type=str, default="facebook/wav2vec2-base")
     parser.add_argument("--embeddings_path", type=str, default=None)
     # Multi-run flags
     parser.add_argument("--run_all", action="store_true", help="Run for all speakers (one-forget-per-run) across seeds; optimized to reuse extractor/SAE per-seed")
     parser.add_argument("--seeds", nargs="+", type=int, default=[1337, 1338, 1339], help="Seeds to use for multi-run (space separated)")
     parser.add_argument("--classifier_epochs", type=int, default=20, help="Epochs to train classifier (used in multi-run per-seed classifier training)")
-
+    # Continual unlearning flag
+    parser.add_argument("--continual_unlearning", action="store_true", help="Run the continual unlearning experiment on a fixed sequence of speakers.")
     args = parser.parse_args()
 
     if args.run_all:
         run_all_forget_speakers(args)
+    elif args.continual_unlearning:
+        run_continual_unlearning(args)
     else:
-        # Single-run (backwards-compatible)
+        # Single-run
         run_pipeline(
             manifest_path=args.manifest_path, save_dir=args.save_dir, device=args.device, seed=args.seed,
             retain_frac=args.retain_frac, dev_frac_per_spk=args.dev_frac_per_spk,
@@ -637,7 +843,5 @@ if __name__ == "__main__":
             build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge,
             noise_sigma=args.noise_sigma, forget_spks=args.forget_spks,
             encoder=args.encoder, embeddings_path=args.embeddings_path,
-            wav2vec2_model=args.wav2vec2_model if hasattr(args, 'wav2vec2_model') else "facebook/wav2vec2-base",
-            hubert_model=args.hubert_model if hasattr(args, 'hubert_model') else "facebook/hubert-base-ls960",
-            conformer_model=args.conformer_model
+            wav2vec2_model=args.wav2vec2_model, hubert_model=args.hubert_model, conformer_model=args.conformer_model
         )

@@ -598,7 +598,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--split_seed", type=int, default=1337, help="Seed for dev/test split")
-    parser.add_argument("--dev_frac_per_spk", type=float, default=0.7)
+    parser.add_argument("--dev_frac_per_spk", type=float, default=0.8)
     parser.add_argument("--sae_multiplier", type=float, default=10.0)
     parser.add_argument("--sae_variant", type=str, default="topk", choices=["topk", "standard"])
     parser.add_argument("--sae_topk", type=int, default=128)
