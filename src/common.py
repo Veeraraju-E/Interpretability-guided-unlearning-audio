@@ -1,47 +1,32 @@
-from __future__ import annotations
 import math
 import random
 import os
-# Limit threading to avoid OpenMP/MKL conflicts with PyTorch
+from itertools import combinations
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
+
 from sklearn.metrics import roc_auc_score, accuracy_score
-from itertools import combinations
 from sklearn.linear_model import LogisticRegression
 from sklearn.covariance import LedoitWolf
 from statsmodels.stats.multitest import multipletests as _multipletests
 multipletests = _multipletests
+
 import torchaudio
 from speechbrain.pretrained import EncoderClassifier
 from typing import List, Dict, Optional, Tuple
 from transformers import AutoFeatureExtractor, AutoModel
-
-# -------------------- Utilities --------------------
-
-def seed_all(seed: int = 1337):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def human_time(s: float) -> str:
-    m, s = divmod(int(s), 60)
-    h, m = divmod(m, 60)
-    return f"{h:d}:{m:02d}:{s:02d}"
-
+import matplotlib.pyplot as plt
 
 # -------------------- Audio helpers --------------------
-
 def _to_mono_and_resample(wav: torch.Tensor, sr: int, target_sr: int, device: str):
     if wav.ndim == 2 and wav.size(0) > 1:
         wav = wav.mean(dim=0, keepdim=True)
@@ -51,9 +36,7 @@ def _to_mono_and_resample(wav: torch.Tensor, sr: int, target_sr: int, device: st
         wav = torchaudio.functional.resample(wav, sr, target_sr)
     return wav.to(device)
 
-
 # -------------------- ECAPA embedding extraction --------------------
-
 def extract_ecapa_embeddings(entries, device='cuda', label_key='speaker'):
     if EncoderClassifier is None:
         raise RuntimeError("speechbrain not installed or EncoderClassifier unavailable")
@@ -65,10 +48,8 @@ def extract_ecapa_embeddings(entries, device='cuda', label_key='speaker'):
             wav = wav.mean(dim=0, keepdim=True)
         wav = wav.to(device)
         with torch.no_grad():
-            try:
-                emb = encoder.encode_batch(wav).squeeze().cpu().numpy().reshape(-1)
-            except Exception:
-                emb = encoder.encode_batch(wav[:1]).squeeze().cpu().numpy().reshape(-1)
+            try: emb = encoder.encode_batch(wav).squeeze().cpu().numpy().reshape(-1)
+            except Exception: emb = encoder.encode_batch(wav[:1]).squeeze().cpu().numpy().reshape(-1)
         E.append(emb)
         labels.append(e.get(label_key, "NA"))
         paths.append(e['path'])
@@ -76,7 +57,6 @@ def extract_ecapa_embeddings(entries, device='cuda', label_key='speaker'):
     norms = np.linalg.norm(E, axis=1, keepdims=True) + 1e-12
     E = E / norms
     return E, labels, paths
-
 
 # -------------------- HF wav2vec2 / hubert extraction --------------------
 @torch.no_grad()
@@ -91,8 +71,7 @@ def _extract_hf_embeddings(entries: list, model_name: str, device: str = 'cuda',
         inp = processor(wav.squeeze().cpu().numpy(), sampling_rate=target_sr, return_tensors="pt")
         input_values = inp["input_values"].to(device)
         out = model(input_values)
-        # Take mean pooling of last hidden states
-        last = out.last_hidden_state
+        last = out.last_hidden_state    # Take mean pooling of last hidden states
         emb = last.mean(dim=1).squeeze(0).detach().cpu().numpy()
         E.append(emb)
         labels.append(e.get(label_key, 'NA'))
@@ -128,10 +107,8 @@ def fit_whitener(X: np.ndarray, eps: float = 1e-8, use_shrinkage: bool = True, s
     Returns (mu, W) where W is the whitening matrix such that (X - mu) @ W is whitened.
     """
     X = np.array(X)
-    if X.ndim > 2:
-        X = X.reshape(X.shape[0], -1)
-    if X.shape[0] < 2:
-        raise ValueError("Need at least 2 samples to fit whitener")
+    if X.ndim > 2: X = X.reshape(X.shape[0], -1)
+    if X.shape[0] < 2: raise ValueError("Need at least 2 samples to fit whitener")
     mu = X.mean(axis=0, keepdims=True)
     Xc = X - mu
     N = Xc.shape[0]
@@ -163,7 +140,6 @@ def invert_whitener(Z: np.ndarray, mu: np.ndarray, W: np.ndarray) -> np.ndarray:
 def l2_normalize(X: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
     return X / n
-
 
 # -------------------- SAE (Top-K and Standard variants) --------------------
 class SAE(nn.Module):
@@ -201,7 +177,6 @@ class SAE(nn.Module):
             mask = (a >= kth).float()
             a = a * mask
         # For standard variant, just return ReLU activations without top-k
-        
         return a
 
     def decode(self, a: torch.Tensor) -> torch.Tensor:
@@ -215,29 +190,39 @@ class SAE(nn.Module):
         z_hat = self.decode(a)
         return z_hat, a
 
-
-# Backward compatibility alias
-TopKSAE = SAE
-
-
 # -------------------- Training SAE --------------------
-def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 30, batch_size: int = 4096, lr: float = 1e-3, device: str = 'cuda', lambda_sparsity: float = 0.0) -> SAE:
+def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 30, batch_size: int = 4096, lr: float = 1e-3, device: str = 'cuda', lambda_sparsity: float = 0.0, return_loss_history: bool = False) -> SAE | Tuple[SAE, Dict]:
+    """
+    Train SAE and optionally return validation loss history for plotting.
+    Args:
+        return_loss_history: If True, returns (model, loss_history) where loss_history contains 'train_loss', 'val_loss', 'epochs' lists
+    """
     Z_train = np.asarray(Z_train)
     Z_val = np.asarray(Z_val)
-    if Z_train.ndim > 2:
-        Z_train = Z_train.reshape(Z_train.shape[0], -1)
-    if Z_val.ndim > 2:
-        Z_val = Z_val.reshape(Z_val.shape[0], -1)
-    if Z_train.shape[1] != model.input_dim:
-        raise RuntimeError(f"SAE input dim mismatch: model.input_dim={model.input_dim} but Z_train has dim={Z_train.shape[1]}")
+    if Z_train.ndim > 2: Z_train = Z_train.reshape(Z_train.shape[0], -1)
+    if Z_val.ndim > 2: Z_val = Z_val.reshape(Z_val.shape[0], -1)
+    if Z_train.shape[1] != model.input_dim: raise RuntimeError(f"SAE input dim mismatch: model.input_dim={model.input_dim} but Z_train has dim={Z_train.shape[1]}")
+    
     model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-6)
     ds = TensorDataset(torch.from_numpy(Z_train).float())
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
     ds_val = TensorDataset(torch.from_numpy(Z_val).float())
     dl_val = DataLoader(ds_val, batch_size=batch_size, shuffle=False)
+    
     best_val = float('inf'); best_state = None
-    for ep in range(1, epochs+1):
+    
+    # Track loss history
+    loss_history = {
+        'epochs': [],
+        'train_loss': [],
+        'val_loss': [],
+        'train_l1_loss': [],
+        'val_l1_loss': [],
+        'dead_latent_fraction': []
+    } if return_loss_history else None
+    
+    for epoch in range(1, epochs+1):
         model.train()
         acc_loss, acc_l1_loss, n = 0.0, 0.0, 0
         for (z_batch,) in dl:
@@ -245,7 +230,7 @@ def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 
             z_hat, a = model(z_batch)
             loss = F.mse_loss(z_hat, z_batch)
             
-            # Add L1 sparsity penalty for standard SAE variant
+            # If standard SAE, add L1 loss
             l1_penalty = 0.0
             if model.variant == "standard" and lambda_sparsity > 0:
                 l1_penalty = lambda_sparsity * torch.mean(torch.abs(a))
@@ -258,8 +243,8 @@ def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 
         train_loss = acc_loss / max(1, n)
         train_l1_loss = acc_l1_loss / max(1, n)
 
-        model.eval(); acc_val, acc_val_l1, nv = 0.0, 0.0, 0
-        all_a = []
+        model.eval(); acc_val, acc_val_l1, num_val = 0.0, 0.0, 0
+        all_activations = []
         with torch.no_grad():
             for (z_batch,) in dl_val:
                 z_batch = z_batch.to(device)
@@ -274,35 +259,46 @@ def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 
                 
                 acc_val += val_loss_batch * z_batch.size(0)
                 acc_val_l1 += val_l1_penalty * z_batch.size(0)
-                nv += z_batch.size(0)
-                all_a.append(a.cpu())
-        val_loss = acc_val / max(1, nv)
-        val_l1_loss = acc_val_l1 / max(1, nv)
+                num_val += z_batch.size(0)
+                all_activations.append(a.cpu())
+        val_loss = acc_val / max(1, num_val)
+        val_l1_loss = acc_val_l1 / max(1, num_val)
 
-        A = torch.cat(all_a, dim=0)  # shape: [N_val, latent_dim]
+        A = torch.cat(all_activations, dim=0)  # [num_val, latent_dim]
         mean_abs_per_latent = A.abs().mean(dim=0)  # [latent_dim]
-        dead_mask = (mean_abs_per_latent < 1e-3)
+        dead_mask = (mean_abs_per_latent < 1e-5)
         dead_frac = dead_mask.float().mean().item()
         avg_dead_latents = int(dead_mask.sum().item())
+        
+        # Store loss history if requested
+        if return_loss_history:
+            loss_history['epochs'].append(epoch)
+            loss_history['train_loss'].append(train_loss)
+            loss_history['val_loss'].append(val_loss)
+            loss_history['train_l1_loss'].append(train_l1_loss)
+            loss_history['val_l1_loss'].append(val_l1_loss)
+            loss_history['dead_latent_fraction'].append(dead_frac)
 
         if val_loss < best_val:
             best_val = val_loss
             best_state = {k: v.cpu() for k, v in model.state_dict().items()}
 
-        if model.variant == "standard" and lambda_sparsity > 0:
-            print(f"[SAE] ep {ep}/{epochs}, train {train_loss:.6f} (L1: {train_l1_loss:.6f}) val {val_loss:.6f} (L1: {val_l1_loss:.6f}), dead_latents {avg_dead_latents}/{A.size(1)}, ({100*dead_frac:.1f}%)")
+        if model.variant == "standard" and lambda_sparsity > 0 and epoch % 10 == 0:
+            print(f"[SAE] epoch {epoch}/{epochs}, train {train_loss:.6f} (L1: {train_l1_loss:.6f}) val {val_loss:.6f} (L1: {val_l1_loss:.6f}), dead_latents {avg_dead_latents}/{A.size(1)}, ({100*dead_frac:.1f}%)")
         else:
-            print(f"[SAE] ep {ep}/{epochs}, train {train_loss:.6f} val {val_loss:.6f}, dead_latents {avg_dead_latents}/{A.size(1)}, ({100*dead_frac:.1f}%)")
+            print(f"[SAE] epoch {epoch}/{epochs}, train {train_loss:.6f} val {val_loss:.6f}, dead_latents {avg_dead_latents}/{A.size(1)}, ({100*dead_frac:.1f}%)")
+    
     if best_state is not None: model.load_state_dict(best_state)
-    return model
+    
+    if return_loss_history: return model, loss_history
+    else: return model
 
 
 @torch.no_grad()
 def sae_encode_batch(model: SAE, Z: np.ndarray, device: str = 'cuda', batch: int = 8192) -> np.ndarray:
     model = model.to(device).eval()
     Z = np.asarray(Z)
-    if Z.ndim > 2:
-        Z = Z.reshape(Z.shape[0], -1)
+    if Z.ndim > 2: Z = Z.reshape(Z.shape[0], -1)
     A = []
     for i in tqdm(range(0, Z.shape[0], batch), desc="SAE encode"):
         z = torch.from_numpy(Z[i:i+batch]).float().to(device)
@@ -310,14 +306,141 @@ def sae_encode_batch(model: SAE, Z: np.ndarray, device: str = 'cuda', batch: int
         A.append(a.cpu().numpy())
     return np.vstack(A)
 
+# -------------------- SAE Hyperparameter Sweep --------------------
+def setup_publication_plots():
+    """Setup matplotlib for publication-quality plots."""
+    plt.style.use('default')
+    
+    # Set publication parameters
+    plt.rcParams.update({
+        'font.size': 12,
+        'font.family': 'serif',
+        'axes.labelsize': 14,
+        'axes.titlesize': 16,
+        'xtick.labelsize': 12,
+        'ytick.labelsize': 12,
+        'legend.fontsize': 10,
+        'figure.titlesize': 18,
+        'lines.linewidth': 2,
+        'grid.alpha': 0.3,
+        'axes.grid': True,
+        'figure.dpi': 300,
+        'savefig.dpi': 300,
+        'savefig.bbox': 'tight',
+        'savefig.transparent': False
+    })
 
-# -------------------- Decoder pruning & normalization --------------------
+def run_sae_hyperparameter_sweep(Z_train: np.ndarray, Z_val: np.ndarray, input_dim: int, device: str = 'cuda',
+                                sae_multiplier_values: List[float] = [2.0, 4.0, 8.0, 16.0, 32.0], sae_topk_values: List[int] = [32, 64, 128, 256, 512],
+                                epochs: int = 50, seed: int = 42) -> Dict:
+    """
+    Run comprehensive SAE hyperparameter sweep testing all combinations of multipliers and top-k values.
+    Returns:
+        results: Dict containing loss histories for all hyperparameter combinations
+    """
+    sae_multiplier_values.sort()
+    sae_topk_values.sort()
+    seed_all(seed)
+    results = {
+        'sweep_results': {},  # (multiplier, topk) for loss_history
+        'config': {
+            'input_dim': input_dim,
+            'epochs': epochs,
+            'sae_multiplier_values': sae_multiplier_values,
+            'sae_topk_values': sae_topk_values
+        }
+    }
+    
+    print(f"[SWEEP] Starting comprehensive SAE hyperparameter sweep...")
+    print(f"[SWEEP] Multiplier values: {sae_multiplier_values}")
+    print(f"[SWEEP] Top-K values: {sae_topk_values}")
+    print(f"[SWEEP] Total combinations: {len(sae_multiplier_values) * len(sae_topk_values)}")
+    
+    # Test all combinations of multipliers and top-k values
+    total_combos = len(sae_multiplier_values) * len(sae_topk_values)
+    combo_idx = 0
+    
+    for mult in sae_multiplier_values:
+        for topk in sae_topk_values:
+            combo_idx += 1
+            print(f"[SWEEP] Training SAE {combo_idx}/{total_combos}: multiplier={mult}, topk={topk}")
+            seed_all(seed)
+            
+            sae = SAE(input_dim=input_dim, hidden_mult=mult, k=topk, variant="topk")
+            sae, loss_history = train_sae(sae, Z_train, Z_val, epochs=epochs, device=device, return_loss_history=True)
+            
+            results['sweep_results'][(mult, topk)] = loss_history
+            final_val_loss = loss_history['val_loss'][-1]
+            print(f"[SWEEP] Completed mult={mult}, topk={topk}, final val loss: {final_val_loss:.6f}")
+
+    sorted_sweep_results = dict(sorted(results['sweep_results'].items(), key=lambda item: item[0][0]))
+    results['sweep_results'] = sorted_sweep_results
+    return results
+
+
+def plot_sae_validation_curves(results: Dict, save_dir: str):
+    """
+    Generate a single publication-quality plot showing validation MSE curves for all
+    combinations of SAE multiplier and Top-K values.
+    """
+    setup_publication_plots()
+    os.makedirs(save_dir, exist_ok=True)
+    
+    _, ax = plt.subplots(1, 1, figsize=(12, 8))
+    
+    sweep_results = results['sweep_results']
+    # Sort values
+    multipliers = sorted(list(set([k[0] for k in sweep_results.keys()])))
+    topks = sorted(list(set([k[1] for k in sweep_results.keys()])))
+    
+    # color map and line styles
+    colors = plt.cm.tab10(np.linspace(0, 1, len(multipliers)))
+    base_line_styles = ['-', '--', '-.', ':', (0, (3, 1, 1, 1)), (0, (5, 1))]
+    base_markers = ['o', 's', '^', 'D', 'v', 'P']
+    
+    # Ensure we have enough styles and markers for the number of top-k values
+    line_styles = (base_line_styles * (len(topks) // len(base_line_styles) + 1))[:len(topks)]
+    markers = (base_markers * (len(topks) // len(base_markers) + 1))[:len(topks)]
+
+    # Plot all combinations without individual labels
+    for i, mult in enumerate(multipliers):
+        for j, topk in enumerate(topks):
+            if (mult, topk) not in sweep_results: continue
+                
+            history = sweep_results[(mult, topk)]
+            epochs = history['epochs']
+            val_loss = history['val_loss']
+            
+            ax.plot(epochs, val_loss, color=colors[i], linestyle=line_styles[j], marker=markers[j], markersize=4, markevery=max(1, len(epochs)//10), alpha=0.8, linewidth=2)
+            
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Validation MSE Loss')
+    ax.set_title('SAE Hyperparameter Analysis')
+    ax.grid(True, alpha=0.3)
+    ax.set_yscale('log')
+    
+    # legend
+    multiplier_handles = [plt.Line2D([], [], color=color, linewidth=3, label=f'Multiplier = {mult}') for mult, color in zip(multipliers, colors)]
+
+    topk_handles = [plt.Line2D([], [], color='gray', linestyle=style, marker=marker, markersize=6, linewidth=2, label=f'Top-K = {topk}')
+                    for topk, style, marker in zip(topks, line_styles, markers)]
+    
+    all_handles = multiplier_handles + topk_handles
+    ax.legend(handles=all_handles, loc='lower left', fontsize='small', ncol=2, title="Hyperparameters", title_fontsize='small')    
+    plt.tight_layout()
+    
+    # Save
+    plot_path = os.path.join(save_dir, 'sae_comprehensive_validation_curves.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    
+    print(f"[PLOT] Saved comprehensive validation curve plot to {plot_path}")
+
 def prune_and_normalize_decoder(dec_weight: np.ndarray, prune_threshold: float = 1e-6) -> np.ndarray:
     cols = dec_weight.T  # [m, d]
     norms = np.linalg.norm(cols, axis=1)
     keep = norms > prune_threshold
-    if keep.sum() < 1:
-        keep = norms.argsort()[::-1][:max(1, int(len(norms)*0.1))]
+    if keep.sum() < 1: keep = norms.argsort()[::-1][:max(1, int(len(norms)*0.1))]
     cols_kept = cols[keep]
     cols_kept = cols_kept / (np.linalg.norm(cols_kept, axis=1, keepdims=True) + 1e-12)
     return cols_kept.T  # [d, r]
@@ -348,34 +471,22 @@ def mann_whitney_u_p(x_pos: np.ndarray, x_neg: np.ndarray) -> tuple[float,float]
     p = 2*(1 - 0.5*(1+erf(abs(z)/sqrt(2))))
     return auc, p
 
-
-def kl_gaussian_1d(p: np.ndarray, q: np.ndarray) -> float:
-    mp, sp = p.mean(), p.var(ddof=1)
-    mq, sq = q.mean(), q.var(ddof=1)
-    sp = max(sp, 1e-9); sq = max(sq, 1e-9)
-    return 0.5 * (math.log(sq/sp) + (sp + (mp-mq)**2)/sq - 1.0)
-
-
 def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray):
     m = A_pos.shape[1]
-    stats = {"cohens_d": np.zeros(m), "auc": np.zeros(m), "pval": np.ones(m), "kl": np.zeros(m)}
+    stats = {"cohens_d": np.zeros(m), "auc": np.zeros(m), "pval": np.ones(m)}
     for j in range(m):
         x_pos = A_pos[:, j]; x_neg = A_neg[:, j]
         stats["cohens_d"][j] = cohens_d(x_pos, x_neg)
-        try:
-            stats["auc"][j] = float(roc_auc_score(np.concatenate([np.ones(len(x_pos)), np.zeros(len(x_neg))]),np.concatenate([x_pos, x_neg])))
-        except Exception:
-            stats["auc"][j] = 0.5
+        try: stats["auc"][j] = float(roc_auc_score(np.concatenate([np.ones(len(x_pos)), np.zeros(len(x_neg))]),np.concatenate([x_pos, x_neg])))
+        except Exception: stats["auc"][j] = 0.5
         auc, p = mann_whitney_u_p(x_pos, x_neg)
         stats["pval"][j] = p
-        stats["kl"][j] = kl_gaussian_1d(x_pos, x_neg)
     return stats
-
 
 def select_features_from_stats(stats: dict, top_k: int = 200, fdr: float = 0.05):
     pvals = stats["pval"]
     if multipletests is not None:
-        rej, p_corr, _, _ = multipletests(pvals, alpha=fdr, method='fdr_bh')
+        rej, _, _, _ = multipletests(pvals, alpha=fdr, method='fdr_bh')
         idx = np.where(rej)[0]
         if len(idx) == 0:
             print(f'Using pvals fallback to |AUC - 0.5| scores')
@@ -394,43 +505,38 @@ def select_features_from_stats(stats: dict, top_k: int = 200, fdr: float = 0.05)
 def build_U_from_decoder(dec_weight: np.ndarray, feat_idx: list[int]) -> np.ndarray:
     if len(feat_idx) == 0:
         return np.zeros((dec_weight.shape[0], 0))
-    D = dec_weight.copy()                              # [d, m]
-    norms = np.linalg.norm(D, axis=0, keepdims=True)   # [1, m]
+    D = dec_weight.copy()   # [d, m]
+    norms = np.linalg.norm(D, axis=0, keepdims=True)    # [1, m]
     D = D / (norms + 1e-12)
-    D_S = D[:, feat_idx]                               # [d, r]
+    D_S = D[:, feat_idx]    # [d, r]
     # SVD and return orthonormal basis of actual rank
     Uu, svals, Vt = np.linalg.svd(D_S, full_matrices=False)
     rank = (svals > 1e-12).sum()
-    if rank == 0:
-        return np.zeros((D_S.shape[0], 0))
+    if rank == 0: return np.zeros((D_S.shape[0], 0))
     return Uu[:, :rank]
 
 
-# -------------------- LEACE in U --------------------
+# -------------------- LEACE Edits --------------------
 def leace_projector_in_U(Z: np.ndarray, U: np.ndarray, Y: np.ndarray, ridge: float = 1e-6):
-    if U.shape[1] == 0:
-        return np.eye(0), np.zeros((1, 0))
+    if U.shape[1] == 0: return np.eye(0), np.zeros((1, 0))
     ZU = Z @ U                       # [N, r]
     mu_r = ZU.mean(axis=0, keepdims=True)
     ZUc = ZU - mu_r
     Yc  = Y - Y.mean(axis=0, keepdims=True)
     N = ZU.shape[0]
-    Sig = (ZUc.T @ ZUc) / max(1, N - 1)           # [r, r]
-    Sig_ZY = (ZUc.T @ Yc) / max(1, N - 1)         # [r, k]
+    Sig = (ZUc.T @ ZUc) / max(1, N - 1)     # [r, r]
+    Sig_ZY = (ZUc.T @ Yc) / max(1, N - 1)   # [r, k]
     evals, evecs = np.linalg.eigh(Sig + ridge * np.eye(Sig.shape[0]))
     evals = np.clip(evals, 1e-12, None)
-    W_r     = evecs @ np.diag(1.0 / np.sqrt(evals)) @ evecs.T   # Σ^{-1/2}
-    W_r_pinv = evecs @ np.diag(np.sqrt(evals)) @ evecs.T        # Σ^{+1/2}
+    W_r = evecs @ np.diag(1.0 / np.sqrt(evals)) @ evecs.T
+    W_r_pinv = evecs @ np.diag(np.sqrt(evals)) @ evecs.T    # pinverse
     M = W_r @ Sig_ZY
-    # Projection onto column-space of M via SVD
+    # Project onto col(M) via SVD
     U_M, _, _ = np.linalg.svd(M, full_matrices=False)
-    if U_M.size == 0:
-        P = np.zeros((Sig.shape[0], Sig.shape[0]))
-    else:
-        P = U_M @ U_M.T
+    if U_M.size == 0:P = np.zeros((Sig.shape[0], Sig.shape[0]))
+    else: P = U_M @ U_M.T
     P_r = np.eye(U.shape[1]) - (W_r_pinv @ P @ W_r)
     return P_r, mu_r
-
 
 def apply_subspace_leace(Z: np.ndarray, U: np.ndarray, P_r: np.ndarray, mu_r: np.ndarray | None = None) -> np.ndarray:
     if U.shape[1] == 0: return Z
@@ -439,6 +545,12 @@ def apply_subspace_leace(Z: np.ndarray, U: np.ndarray, P_r: np.ndarray, mu_r: np
     ZU_prime = (ZU - mu_r) @ P_r.T + mu_r
     Z_prime  = Z - (ZU @ U.T) + (ZU_prime @ U.T)
     return Z_prime
+
+def inject_noise_in_subspace(Z: np.ndarray, U: np.ndarray, sigma: float = 0.02, rng=None) -> np.ndarray:
+    rng = np.random if rng is None else rng
+    ZU = Z @ U  # [N, r]
+    noise = rng.randn(*ZU.shape) * sigma
+    return Z + (noise @ U.T)
 
 
 # -------------------- SAUCE gating --------------------
@@ -456,14 +568,18 @@ def apply_sauce_gating(sae_model: SAE, Z: np.ndarray, feat_idx: list[int], beta:
         Z_out.append(z_hat.cpu().numpy())
     return np.vstack(Z_out)
 
+# -------------------- Utilities --------------------
+def seed_all(seed: int = 1337):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-# -------------------- Noise injection --------------------
-def inject_noise_in_subspace(Z: np.ndarray, U: np.ndarray, sigma: float = 0.02, rng=None) -> np.ndarray:
-    rng = np.random if rng is None else rng
-    ZU = Z @ U  # [N, r]
-    noise = rng.randn(*ZU.shape) * sigma
-    return Z + (noise @ U.T)
-
+def human_time(s: float) -> str:
+    m, s = divmod(int(s), 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}:{m:02d}:{s:02d}"
 
 def compute_scores(embeddings, trials):
     scores = []
@@ -488,7 +604,6 @@ def eer_from_scores(scores: np.ndarray, labels: np.ndarray, return_threshold: bo
     thr = thresholds[idx]
     return (eer, thr) if return_threshold else eer
 
-
 # -------------------- Speaker classifier --------------------
 class ResNetClassifier(nn.Module):
     def __init__(self, emb_dim: int, num_classes: int):
@@ -498,8 +613,10 @@ class ResNetClassifier(nn.Module):
         self.relu = nn.ReLU()
         self.out = nn.Linear(512, num_classes)
     def forward(self, x):
-        o = self.layer1(x); r = self.res(o); o = self.relu(o + r); return self.out(o)
-
+        o = self.layer1(x)
+        r = self.res(o)
+        o = self.relu(o + r)
+        return self.out(o)
 
 def train_classifier(X_train: np.ndarray, y_train: list[int], X_val: np.ndarray, y_val: list[int], num_classes: int, device: str = 'cuda', epochs: int = 20, batch_size: int = 512, lr: float = 1e-3):
     model = ResNetClassifier(X_train.shape[1], num_classes).to(device)
@@ -508,7 +625,7 @@ def train_classifier(X_train: np.ndarray, y_train: list[int], X_val: np.ndarray,
     ds = TensorDataset(torch.from_numpy(X_train).float(), torch.tensor(y_train).long())
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
     best_acc = 0.0; best_state = None
-    for ep in range(1, epochs+1):
+    for epoch in range(1, epochs+1):
         model.train()
         for xb, yb in dl:
             xb, yb = xb.to(device), yb.to(device)
@@ -518,17 +635,14 @@ def train_classifier(X_train: np.ndarray, y_train: list[int], X_val: np.ndarray,
         with torch.no_grad():
             preds = model(torch.from_numpy(X_val).float().to(device)).argmax(1).cpu().numpy()
         acc = accuracy_score(y_val, preds)
-        print(f"[Classifier] ep {ep} val acc {acc*100:.2f}%")
-        if acc > best_acc:
-            best_acc = acc; best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+        print(f"[Classifier] epoch {epoch} val acc {acc*100:.2f}%")
+        if acc > best_acc: best_acc = acc; best_state = {k: v.cpu() for k, v in model.state_dict().items()}
     if best_state is not None: model.load_state_dict(best_state)
     return model
 
-
 def evaluate_classifier(model: ResNetClassifier, X: np.ndarray, y: list[int], device: str = 'cuda'):
     model.eval().to(device)
-    with torch.no_grad():
-        preds = model(torch.from_numpy(X).float().to(device)).argmax(1).cpu().numpy()
+    with torch.no_grad(): preds = model(torch.from_numpy(X).float().to(device)).argmax(1).cpu().numpy()
     # print(preds)
     acc = accuracy_score(y, preds)
     return acc
@@ -541,12 +655,10 @@ def effective_rank(svals: np.ndarray, threshold: float = 0.01) -> int:
     mx = svals.max()
     return int((svals > (threshold * mx)).sum())
 
-
 def participation_ratio(energy: np.ndarray) -> float:
     num = (np.sum(energy) ** 2)
     den = np.sum(energy ** 2) + 1e-12
     return float(num / den)
-
 
 # -------------------- Jacobian sensitivity estimate --------------------
 def estimate_jacobian_alignment(sae: SAE, Z_samples: np.ndarray, deltas: np.ndarray, eps: float = 1e-4, device: str = 'cpu') -> np.ndarray:
@@ -574,7 +686,6 @@ def _prepare_probe_data(Z_all: np.ndarray, labels: List[str], U: np.ndarray, spl
     y_test  = np.array([int(l in forget_classes) for i,l in enumerate(labels) if test_mask[i]])
     X_train = Zu[train_mask]
     X_test  = Zu[test_mask]
-    # Ensure safe dtype/contiguity
     X_train = np.ascontiguousarray(X_train, dtype=np.float64)
     X_test  = np.ascontiguousarray(X_test, dtype=np.float64)
     return X_train, y_train, X_test, y_test
@@ -582,8 +693,7 @@ def _prepare_probe_data(Z_all: np.ndarray, labels: List[str], U: np.ndarray, spl
 
 def safe_linear_probe(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_mask: Dict[str, np.ndarray], forget_classes: List[str]) -> Tuple[float, float]:
     try:
-        if U is None or U.shape[1] == 0:
-            return float('nan'), float('nan')
+        if U is None or U.shape[1] == 0: return float('nan'), float('nan')
         X_train, y_train, X_test, y_test = _prepare_probe_data(Z_all, labels, U, split_mask, forget_classes)
         if (len(X_train) == 0 or len(X_test) == 0 or 
             len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2 or
@@ -598,14 +708,11 @@ def safe_linear_probe(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split
     except Exception:
         return float('nan'), float('nan')
 
-
 # -------------------- Monosemanticity Score (MS) --------------------
 def calculate_monosemanticity_score(activations: np.ndarray, inputs: np.ndarray, top_m: int = 20,  min_activations: int = 5) -> np.ndarray:
     """
     Calculate the Monosemanticity Score (MS) for a set of neuron activations.
-    
-    The MS measures how focused individual neurons are on single concepts by computing
-    the pairwise similarity of inputs that highly activate each neuron.
+    The MS measures how focused individual neurons are on single concepts by computing the pairwise similarity of inputs that highly activate each neuron.
     
     Args:
         activations: np.ndarray of shape (n_samples, n_neurons)
@@ -619,34 +726,25 @@ def calculate_monosemanticity_score(activations: np.ndarray, inputs: np.ndarray,
     
     Returns:
         ms_scores: np.ndarray of shape (n_neurons,)
-            The monosemanticity score for each neuron. Higher values indicate
-            more monosemantic (focused) neurons.
+            The monosemanticity score for each neuron.
     """
     n_samples, n_neurons = activations.shape
     ms_scores = np.zeros(n_neurons)
-    
-    # Normalize inputs for cosine similarity computation
     inputs_norm = l2_normalize(inputs)
     
     for neuron_idx in range(n_neurons):
-        # Get the activations for the current neuron
-        neuron_activations = activations[:, neuron_idx]
-        
+        neuron_activations = activations[:, neuron_idx]        
         # Find top-m activating inputs
         m = min(top_m, n_samples)
         top_m_indices = np.argsort(neuron_activations)[-m:]
         top_m_inputs = inputs_norm[top_m_indices]
         
-        # Skip if we don't have enough activating inputs
         if len(top_m_inputs) < min_activations:
             ms_scores[neuron_idx] = 0.0
             continue
             
-        # Compute pairwise cosine similarities
-        # For efficiency, we can compute the mean of all pairwise similarities
-        # without computing the full similarity matrix
         if len(top_m_inputs) == 1:
-            ms_scores[neuron_idx] = 1.0  # Single input has perfect similarity with itself
+            ms_scores[neuron_idx] = 1.0
         else:
             # Compute mean pairwise cosine similarity
             similarities = []
@@ -657,7 +755,6 @@ def calculate_monosemanticity_score(activations: np.ndarray, inputs: np.ndarray,
             ms_scores[neuron_idx] = np.mean(similarities) if similarities else 0.0
     
     return ms_scores
-
 
 def compute_monosemanticity_statistics(ms_scores: np.ndarray) -> Dict[str, float]:
     """
@@ -670,8 +767,7 @@ def compute_monosemanticity_statistics(ms_scores: np.ndarray) -> Dict[str, float
     Returns:
         stats: Dict containing mean, std, min, max, and percentiles of MS scores.
     """
-    if len(ms_scores) == 0:
-        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0}
+    if len(ms_scores) == 0: return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0}
     
     return {
         "mean": float(np.mean(ms_scores)),
@@ -682,7 +778,6 @@ def compute_monosemanticity_statistics(ms_scores: np.ndarray) -> Dict[str, float
         "p50": float(np.percentile(ms_scores, 50)),
         "p75": float(np.percentile(ms_scores, 75))
     }
-
 
 # -------------------- Evaluation and Verification Functions --------------------
 def linear_probe_U(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_mask: Dict[str, np.ndarray],  forget_classes: List[str], device: str = 'cuda') -> Tuple[float, float]:

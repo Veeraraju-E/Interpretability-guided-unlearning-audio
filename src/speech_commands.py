@@ -25,8 +25,7 @@ from common import (
 
 
 # -------------------- Manifest --------------------
-def build_manifest(data_root: str, dev_frac_per_cmd: float = 0.75, seed: int = 1337,
-                   allowed_exts: List[str] = [".wav"]) -> List[Dict]:
+def build_manifest(data_root: str, dev_frac_per_cmd: float = 0.75, seed: int = 1337, allowed_exts: List[str] = [".wav"]) -> List[Dict]:
     """
     Build manifest entries for Speech Commands dataset folder.
     Expects directory structure:
@@ -104,9 +103,7 @@ def build_manifest(data_root: str, dev_frac_per_cmd: float = 0.75, seed: int = 1
     return manifest
 
 
-# ----------------------------
 # Precompute / shared steps (mirrors voxceleb.py semantics)
-# ----------------------------
 def precompute_embeddings_and_whitener(manifest_path: str, embeddings_path: Optional[str], dev_frac_per_cmd: float,
                                        manifest_seed: int, encoder: str, device: str,
                                        wav2vec2_model: str, hubert_model: str, conformer_model: str):
@@ -202,9 +199,9 @@ def precompute_embeddings_and_whitener(manifest_path: str, embeddings_path: Opti
     return precomp
 
 
-# ----------------------------
+
 # Train SAE (once per seed) - same as voxceleb.py
-# ----------------------------
+
 def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: str, sae_topk: int,
                        lambda_sparsity: float, sae_epochs: int, device: str):
     """
@@ -240,9 +237,9 @@ def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: s
     return sae, sae_training_time, A_all, dec_w
 
 
-# ----------------------------
+
 # Per-class run (uses precomputed and trained SAE) - mirrors single_forget_run in voxceleb.py
-# ----------------------------
+
 def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: str, sae_params: Dict, edit_params: Dict, compute_ms: bool = True, save_artifacts: bool = True, save_dir: Optional[str] = None):
     """
     Run the per-forget-class steps (feature stats, select features, build U, LEACE,
@@ -391,9 +388,9 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     return results, editing_time
 
 
-# ----------------------------
+
 # Multi-run orchestration (mirrors voxceleb.run_all_forget_speakers)
-# ----------------------------
+
 def run_all_forget_speakers(args):
     """
     Orchestrates multi-run optimized execution:
@@ -528,9 +525,9 @@ def run_all_forget_speakers(args):
     print(f"\n[MULTI] finished. consolidated CSV: {csv_path}")
 
 
-# ----------------------------
+
 # Backwards-compatible single-run (keeps original semantics but reuses new helpers)
-# ----------------------------
+
 def run_pipeline(
     data_root: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
     retain_frac: float = 0.975, dev_frac_per_cmd: float = 0.75, sae_multiplier: float = 4.0,

@@ -48,8 +48,7 @@ def read_librispeech_raw_entries(data_root: str) -> List[Dict]:
     return raw_entries
 
 
-def build_manifest(manifest_source: str, embeddings_path: Optional[str] = None,
-                   dev_frac_per_spk: float = 0.75, seed: int = 1337) -> List[Dict]:
+def build_manifest(manifest_source: str, embeddings_path: Optional[str] = None, dev_frac_per_spk: float = 0.75, seed: int = 1337) -> List[Dict]:
     """
     Build a manifest with 'split' keys (dev/test) and entries:
       {'path': ..., 'speaker': ..., 'segment_id': optional, 'split': 'dev'|'test'}

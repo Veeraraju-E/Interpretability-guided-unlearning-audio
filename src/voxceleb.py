@@ -12,14 +12,14 @@ import torch
 import copy
 
 from common import (
-    seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener,
-    invert_whitener, l2_normalize, SAE, train_sae, sae_encode_batch,
+    seed_all, extract_embeddings, fit_whitener, invert_whitener, l2_normalize, 
+    SAE, train_sae, sae_encode_batch,
     prune_and_normalize_decoder, feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace,
     compute_scores, eer_from_scores, build_verification_trials,
     train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe,
-    # monosemanticity functions left available for single-run usage
-    calculate_monosemanticity_score, compute_monosemanticity_statistics
+    calculate_monosemanticity_score, compute_monosemanticity_statistics,
+    run_sae_hyperparameter_sweep, plot_sae_validation_curves
 )
 
 
@@ -154,7 +154,7 @@ def precompute_embeddings_and_whitener(manifest_path: str, embeddings_path: Opti
     if E_dev.shape[0] < 2:
         raise RuntimeError("Not enough dev samples to fit whitener")
     mu, W = fit_whitener(E_dev)
-    Z_all = apply_whitener(E_all, mu, W)
+    Z_all = (E_all - mu) @ W    # aply whitener
 
     precomp = {
         "entries": entries,
@@ -172,13 +172,117 @@ def precompute_embeddings_and_whitener(manifest_path: str, embeddings_path: Opti
     return precomp
 
 
+# NEW: SAE Hyperparameter Sweep Function
+def run_sae_hyperparameter_analysis(args):
+    """
+    Run SAE hyperparameter sweep to generate publication-quality validation loss curves.
+    This generates exactly 2 plots:
+    1. Validation MSE vs epochs for different SAE multiplier values
+    2. Validation MSE vs epochs for different Top-K values
+    """
+    print("[SAE-SWEEP] Starting SAE hyperparameter analysis...")
+    
+    # 1) Precompute embeddings & whitener once
+    precomp = precompute_embeddings_and_whitener(
+        manifest_path=args.manifest_path,
+        embeddings_path=args.embeddings_path,
+        dev_frac_per_spk=args.dev_frac_per_spk,
+        manifest_seed=args.split_seed if hasattr(args, "split_seed") else args.seed,
+        encoder=args.encoder,
+        device=args.device,
+        wav2vec2_model=args.wav2vec2_model if hasattr(args, "wav2vec2_model") else "facebook/wav2vec2-base",
+        hubert_model=args.hubert_model if hasattr(args, "hubert_model") else "facebook/hubert-base-ls960",
+        conformer_model=args.conformer_model if hasattr(args, "conformer_model") else "facebook/wav2vec2-conformer-rel-pos-large"
+    )
+    
+    Z_all = precomp["Z_all"]
+    mask_dev = precomp["mask_dev"]
+    input_dim = Z_all.shape[1]
+    
+    # Split dev data into train/val for SAE training
+    Z_dev = Z_all[mask_dev]
+    print(f"[SAE-SWEEP] Dev set size: {Z_dev.shape[0]} samples, dimension: {input_dim}")
+    
+    # Create train/val split for SAE training (80/20 split of dev data)
+    seed_all(args.seed)
+    perm = np.random.permutation(Z_dev.shape[0])
+    cut = int(0.8 * len(perm)) if len(perm) > 1 else int(0.5 * len(perm))
+    if cut <= 0:
+        Z_train, Z_val = Z_dev, Z_dev
+    else:
+        Z_train, Z_val = Z_dev[perm[:cut]], Z_dev[perm[cut:]]
+    
+    print(f"[SAE-SWEEP] SAE Train set: {Z_train.shape[0]} samples")
+    print(f"[SAE-SWEEP] SAE Val set: {Z_val.shape[0]} samples")
+    
+    # Define hyperparameter ranges
+    sae_multiplier_values = args.sweep_multipliers if hasattr(args, 'sweep_multipliers') else [2.0, 4.0, 8.0, 16.0, 32.0]
+    sae_topk_values = args.sweep_topks if hasattr(args, 'sweep_topks') else [32, 64, 128, 256, 512]
+    sweep_epochs = args.sweep_epochs if hasattr(args, 'sweep_epochs') else 100
+    
+    print(f"[SAE-SWEEP] Multiplier sweep: {sae_multiplier_values}")
+    print(f"[SAE-SWEEP] Top-K sweep: {sae_topk_values}")
+    print(f"[SAE-SWEEP] Sweep epochs: {sweep_epochs}")
+    
+    # 2) Run hyperparameter sweep
+    results = run_sae_hyperparameter_sweep(
+        Z_train=Z_train,
+        Z_val=Z_val,
+        input_dim=input_dim,
+        device=args.device,
+        sae_multiplier_values=sae_multiplier_values,
+        sae_topk_values=sae_topk_values,
+        epochs=sweep_epochs,
+        seed=args.seed
+    )
+    
+    # 3) Generate publication-quality plots
+    save_dir = args.save_dir
+    os.makedirs(save_dir, exist_ok=True)
+    
+    plot_sae_validation_curves(results, save_dir)
+    
+    # 4) Save raw results for further analysis if needed
+    results_path = os.path.join(save_dir, 'sae_hyperparameter_sweep_results.json')
+    
+    # Convert numpy arrays to lists for JSON serialization
+    json_results = {
+        'multiplier_sweep': {},
+        'topk_sweep': {},
+        'config': results['config']
+    }
+    
+    for mult, history in results['multiplier_sweep'].items():
+        json_results['multiplier_sweep'][str(mult)] = {
+            'epochs': history['epochs'],
+            'val_loss': history['val_loss'],
+            'train_loss': history['train_loss'],
+            'dead_latent_fraction': history['dead_latent_fraction']
+        }
+    
+    for topk, history in results['topk_sweep'].items():
+        json_results['topk_sweep'][str(topk)] = {
+            'epochs': history['epochs'],
+            'val_loss': history['val_loss'],
+            'train_loss': history['train_loss'],
+            'dead_latent_fraction': history['dead_latent_fraction']
+        }
+    
+    with open(results_path, 'w') as f:
+        json.dump(json_results, f, indent=2)
+    
+    print(f"[SAE-SWEEP] Analysis complete!")
+    print(f"[SAE-SWEEP] Plots saved to: {save_dir}")
+    print(f"[SAE-SWEEP] Raw results saved to: {results_path}")
+    
+    return results
 
-# Train SAE (once per seed)
-def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: str, sae_topk: int,
-                       lambda_sparsity: float, sae_epochs: int, device: str):
+
+# Train SAE (once per seed) - MODIFIED to support loss tracking
+def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: str, sae_topk: int, lambda_sparsity: float, sae_epochs: int, device: str, track_loss_history: bool = False):
     """
     Train SAE on Z_train (dev union) for the given seed. Returns trained SAE, training_time_seconds,
-    and A_all (activations) computed on Z_all.
+    and A_all (activations) computed on Z_all. Optionally tracks loss history.
     """
     seed_all(seed)
     Z_all = precomp["Z_all"]
@@ -199,7 +303,14 @@ def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: s
 
     sae = SAE(input_dim=Z_all.shape[1], hidden_mult=sae_multiplier, k=sae_topk, variant=sae_variant)
     t_sae_start = time.time()
-    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=64, lr=1e-3, device=device, lambda_sparsity=lambda_sparsity)
+    
+    # Use the modified train_sae function with optional loss history tracking
+    if track_loss_history:
+        sae, loss_history = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=64, lr=1e-3,  device=device, lambda_sparsity=lambda_sparsity, return_loss_history=True)
+    else:
+        sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=64, lr=1e-3, device=device, lambda_sparsity=lambda_sparsity, return_loss_history=False)
+        loss_history = None
+    
     t_sae_end = time.time()
     sae_training_time = float(t_sae_end - t_sae_start)
 
@@ -210,7 +321,10 @@ def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: s
     # get decoder weights for U building later
     dec_w = sae.dec.weight.detach().cpu().numpy()
 
-    return sae, sae_training_time, A_all, dec_w
+    if track_loss_history:
+        return sae, sae_training_time, A_all, dec_w, loss_history
+    else:
+        return sae, sae_training_time, A_all, dec_w
 
 
 # Per-speaker run (uses precomputed and trained SAE)
@@ -467,7 +581,8 @@ def run_all_forget_speakers(args):
                     sae_topk=args.sae_topk,
                     lambda_sparsity=args.lambda_sparsity,
                     sae_epochs=args.sae_epochs,
-                    device=args.device
+                    device=args.device,
+                    track_loss_history=False  # No need to track loss in multi-run
                 )
 
                 # Precompute normalized embeddings and train classifier once per seed (train on dev, validate on test)
@@ -636,7 +751,7 @@ def run_continual_unlearning(args):
                 print(f"[CONTINUAL] Training SAE for step {step}...")
                 sae, sae_train_time, A_all, dec_w = train_sae_for_seed(
                     current_precomp, seed, args.sae_multiplier, args.sae_variant, args.sae_topk,
-                    args.lambda_sparsity, args.sae_epochs, args.device
+                    args.lambda_sparsity, args.sae_epochs, args.device, track_loss_history=False
                 )
 
                 # C. Train Classifier on the current active dev set
@@ -709,6 +824,8 @@ def run_continual_unlearning(args):
 
 # Backwards-compatible single-run (keeps original semantics)
 
+# Backwards-compatible single-run (keeps original semantics)
+
 def run_pipeline(
     manifest_path: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
     retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_multiplier: float = 4.0,
@@ -752,7 +869,8 @@ def run_pipeline(
         sae_topk=sae_topk,
         lambda_sparsity=lambda_sparsity,
         sae_epochs=sae_epochs,
-        device=device
+        device=device,
+        track_loss_history=False
     )
 
     # Train classifier once for this seed (dev->test)
@@ -828,9 +946,17 @@ if __name__ == "__main__":
     parser.add_argument("--classifier_epochs", type=int, default=20, help="Epochs to train classifier (used in multi-run per-seed classifier training)")
     # Continual unlearning flag
     parser.add_argument("--continual_unlearning", action="store_true", help="Run the continual unlearning experiment on a fixed sequence of speakers.")
+    # Hyperparameter Sweep flag
+    parser.add_argument("--sae_hyperparameter_sweep", action="store_true", help="Run SAE hyperparameter sweep to generate validation loss curves for publication")
+    parser.add_argument("--sweep_multipliers", nargs="+", type=float, default=[1.0, 4.0, 8.0, 16.0, 32.0], help="SAE multiplier values to sweep over")
+    parser.add_argument("--sweep_topks", nargs="+", type=int, default=[4, 16, 32, 64, 128, 256], help="SAE top-K values to sweep over")
+    parser.add_argument("--sweep_epochs", type=int, default=200, help="Number of epochs for hyperparameter sweep training")
+    
     args = parser.parse_args()
 
-    if args.run_all:
+    if args.sae_hyperparameter_sweep:
+        run_sae_hyperparameter_analysis(args)
+    elif args.run_all:
         run_all_forget_speakers(args)
     elif args.continual_unlearning:
         run_continual_unlearning(args)
