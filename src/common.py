@@ -420,9 +420,9 @@ def plot_sae_validation_curves(results: Dict, save_dir: str):
     ax.set_yscale('log')
     
     # legend
-    multiplier_handles = [plt.Line2D([], [], color=color, linewidth=3, label=f'Multiplier = {mult}') for mult, color in zip(multipliers, colors)]
+    multiplier_handles = [plt.Line2D([], [], color=color, linewidth=3, label=f'alpha = {mult}') for mult, color in zip(multipliers, colors)]
 
-    topk_handles = [plt.Line2D([], [], color='gray', linestyle=style, marker=marker, markersize=6, linewidth=2, label=f'Top-K = {topk}')
+    topk_handles = [plt.Line2D([], [], color='gray', linestyle=style, marker=marker, markersize=6, linewidth=2, label=f'k = {topk}')
                     for topk, style, marker in zip(topks, line_styles, markers)]
     
     all_handles = multiplier_handles + topk_handles
@@ -792,8 +792,7 @@ def train_mia_classifier(mia_features: np.ndarray, membership_labels: np.ndarray
     return mia_clf
 
 
-def compute_mia_score(embeddings: np.ndarray, labels: List[str], target_speaker: str,
-                     mask: np.ndarray, num_shadow_models: int = 5, device: str = 'cuda', seed: int = 42) -> float:
+def compute_mia_score(embeddings: np.ndarray, labels: List[str], target_speaker: str, mask: np.ndarray, num_shadow_models: int = 5, device: str = 'cuda', seed: int = 42) -> float:
     """
     Compute MIA vulnerability score for a target speaker.
     

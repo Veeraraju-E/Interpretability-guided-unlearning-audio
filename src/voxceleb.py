@@ -402,6 +402,7 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
 
     print("[MIA] Computing MIA scores before editing...")
     test_mask_for_mia = M_ret_test | M_fgt_test
+    E_all_norm = l2_normalize(E_all)
     mia_score_before = compute_mia_score(
         embeddings=E_all_norm,
         labels=labels,
@@ -680,7 +681,6 @@ def run_all_forget_speakers(args):
                 fh.flush()
 
     print(f"\n[MULTI] finished. consolidated CSV: {csv_path}")
-
 
 # Continual Unlearning Orchestration
 def run_continual_unlearning(args):
@@ -965,8 +965,8 @@ if __name__ == "__main__":
     parser.add_argument("--continual_unlearning", action="store_true", help="Run the continual unlearning experiment on a fixed sequence of speakers.")
     # Hyperparameter Sweep flag
     parser.add_argument("--sae_hyperparameter_sweep", action="store_true", help="Run SAE hyperparameter sweep to generate validation loss curves for publication")
-    parser.add_argument("--sweep_multipliers", nargs="+", type=float, default=[1.0, 4.0, 8.0, 16.0, 32.0], help="SAE multiplier values to sweep over")
-    parser.add_argument("--sweep_topks", nargs="+", type=int, default=[4, 16, 32, 64, 128, 256], help="SAE top-K values to sweep over")
+    parser.add_argument("--sweep_multipliers", nargs="+", type=float, default=[1.0, 4.0, 8.0, 16.0], help="SAE multiplier values to sweep over")
+    parser.add_argument("--sweep_topks", nargs="+", type=int, default=[1, 4, 8, 16, 32, 64, 128, 256], help="SAE top-K values to sweep over")
     parser.add_argument("--sweep_epochs", type=int, default=200, help="Number of epochs for hyperparameter sweep training")
     
     args = parser.parse_args()
