@@ -21,7 +21,7 @@ from statsmodels.stats.multitest import multipletests as _multipletests
 multipletests = _multipletests
 
 import torchaudio
-from speechbrain.pretrained import EncoderClassifier
+from speechbrain.pretrained import EncoderClassifier  # pyright: ignore[reportMissingImports]
 from typing import List, Dict, Optional, Tuple
 from transformers import AutoFeatureExtractor, AutoModel
 import matplotlib.pyplot as plt
@@ -647,6 +647,204 @@ def evaluate_classifier(model: ResNetClassifier, X: np.ndarray, y: list[int], de
     acc = accuracy_score(y, preds)
     return acc
 
+# -------------------- Membership Inference Attack (MIA) Functions --------------------
+def train_shadow_models(X_all: np.ndarray, labels: List[str], target_speaker: str, 
+                       num_shadow_models: int = 5, shadow_train_ratio: float = 0.7, 
+                       device: str = 'cuda', epochs: int = 15, seed: int = 42) -> List[ResNetClassifier]:
+    """
+    Train shadow models for MIA. Each shadow model is trained on a different subset 
+    of speakers (excluding the target speaker) to learn membership patterns.
+    
+    Args:
+        X_all: All embeddings
+        labels: All speaker labels  
+        target_speaker: Speaker to exclude from shadow training
+        num_shadow_models: Number of shadow models to train
+        shadow_train_ratio: Fraction of non-target speakers to use per shadow model
+        device: Computing device
+        epochs: Training epochs per shadow model
+        seed: Random seed
+        
+    Returns:
+        List of trained shadow models
+    """
+    rng = np.random.RandomState(seed)
+    
+    # Get all speakers except target
+    all_speakers = list(set(labels))
+    non_target_speakers = [s for s in all_speakers if s != target_speaker]
+    
+    if len(non_target_speakers) < 2:
+        print(f"Warning: Not enough non-target speakers for shadow training. Found {len(non_target_speakers)}")
+        return []
+    
+    shadow_models = []
+    
+    for i in range(num_shadow_models):
+        print(f"  Training shadow model {i+1}/{num_shadow_models}...")
+        
+        # Sample subset of non-target speakers for this shadow model
+        num_shadow_speakers = max(2, int(len(non_target_speakers) * shadow_train_ratio))
+        shadow_speakers = rng.choice(non_target_speakers, size=num_shadow_speakers, replace=False)
+        
+        # Get indices for shadow speakers
+        shadow_indices = [j for j, label in enumerate(labels) if label in shadow_speakers]
+        
+        if len(shadow_indices) < 10:  # Need minimum samples
+            continue
+            
+        # Extract data for this shadow model
+        X_shadow = X_all[shadow_indices]
+        y_shadow_str = [labels[j] for j in shadow_indices]
+        
+        # Create speaker-to-id mapping for this shadow model
+        shadow_speaker_to_id = {spk: idx for idx, spk in enumerate(sorted(set(y_shadow_str)))}
+        y_shadow = [shadow_speaker_to_id[spk] for spk in y_shadow_str]
+        
+        # Split into train/val for shadow model
+        perm = rng.permutation(len(X_shadow))
+        split_idx = int(0.8 * len(perm))
+        train_idx, val_idx = perm[:split_idx], perm[split_idx:]
+        
+        X_train_shadow = X_shadow[train_idx]
+        y_train_shadow = [y_shadow[j] for j in train_idx]
+        X_val_shadow = X_shadow[val_idx] 
+        y_val_shadow = [y_shadow[j] for j in val_idx]
+        
+        # Train shadow model
+        try:
+            shadow_model = train_classifier(
+                X_train_shadow, y_train_shadow, X_val_shadow, y_val_shadow,
+                num_classes=len(shadow_speaker_to_id), device=device, 
+                epochs=epochs, batch_size=256, lr=1e-3
+            )
+            shadow_models.append(shadow_model)
+        except Exception as e:
+            print(f"    Warning: Shadow model {i+1} training failed: {e}")
+            continue
+    
+    print(f"  Successfully trained {len(shadow_models)} shadow models")
+    return shadow_models
+
+
+def extract_mia_features(embeddings: np.ndarray, labels: List[str], target_speaker: str, shadow_models: List[ResNetClassifier], device: str = 'cuda') -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extract MIA features (confidence scores, loss values) using shadow models.
+    
+    Args:
+        embeddings: Input embeddings
+        labels: Corresponding labels
+        target_speaker: Target speaker for MIA
+        shadow_models: Trained shadow models
+        device: Computing device
+        
+    Returns:
+        Tuple of (features, membership_labels) where:
+        - features: [N, num_features] array of MIA features
+        - membership_labels: [N] binary array (1 if target_speaker, 0 otherwise)
+    """
+    if len(shadow_models) == 0: return np.array([]), np.array([])
+    
+    N = embeddings.shape[0]
+    num_features = len(shadow_models) * 2  # confidence + loss per shadow model
+    features = np.zeros((N, num_features))
+    membership_labels = np.array([1 if label == target_speaker else 0 for label in labels])
+    
+    X_tensor = torch.from_numpy(embeddings).float().to(device)
+    
+    for i, shadow_model in enumerate(shadow_models):
+        shadow_model.eval().to(device)
+        
+        with torch.no_grad():
+            logits = shadow_model(X_tensor)
+            probs = F.softmax(logits, dim=1)
+            
+            # Feature 1: Max confidence (highest probability)
+            max_confidence = probs.max(dim=1)[0].cpu().numpy()
+            features[:, i*2] = max_confidence
+            
+            # Feature 2: Entropy-based uncertainty
+            entropy = -torch.sum(probs * torch.log(probs + 1e-12), dim=1).cpu().numpy()
+            features[:, i*2 + 1] = entropy
+    
+    return features, membership_labels
+
+
+def train_mia_classifier(mia_features: np.ndarray, membership_labels: np.ndarray, test_size: float = 0.3, seed: int = 42) -> LogisticRegression:
+    """
+    Train a binary classifier to perform membership inference.
+    
+    Args:
+        mia_features: MIA features extracted from shadow models
+        membership_labels: Binary membership labels (1=member, 0=non-member)
+        test_size: Fraction of data to use for testing
+        seed: Random seed
+        
+    Returns:
+        Trained MIA classifier
+    """
+    if len(mia_features) == 0 or len(set(membership_labels)) < 2: return None
+    from sklearn.model_selection import train_test_split
+    X_train, X_test, y_train, y_test = train_test_split(mia_features, membership_labels, test_size=test_size, random_state=seed, stratify=membership_labels)
+    mia_clf = LogisticRegression(max_iter=1000, random_state=seed)
+    mia_clf.fit(X_train, y_train)
+    
+    return mia_clf
+
+
+def compute_mia_score(embeddings: np.ndarray, labels: List[str], target_speaker: str,
+                     mask: np.ndarray, num_shadow_models: int = 5, device: str = 'cuda', seed: int = 42) -> float:
+    """
+    Compute MIA vulnerability score for a target speaker.
+    
+    Args:
+        embeddings: Normalized embeddings
+        labels: Speaker labels
+        target_speaker: Speaker to attack
+        mask: Boolean mask for samples to consider
+        num_shadow_models: Number of shadow models to train
+        device: Computing device
+        seed: Random seed
+        
+    Returns:
+        MIA score (AUC): Higher values indicate higher vulnerability
+    """
+    try:
+        # Filter data using mask
+        X_masked = embeddings[mask]
+        labels_masked = [labels[i] for i in range(len(labels)) if mask[i]]
+        if len(X_masked) == 0: return float('nan')
+        # Check if target speaker exists in masked data
+        if target_speaker not in labels_masked: return float('nan')
+        
+        # Train shadow models
+        shadow_models = train_shadow_models(
+            X_masked, labels_masked, target_speaker, 
+            num_shadow_models=num_shadow_models, device=device, 
+            epochs=10, seed=seed
+        )
+        
+        if len(shadow_models) == 0: return float('nan')
+        
+        # Extract MIA features
+        mia_features, membership_labels = extract_mia_features(X_masked, labels_masked, target_speaker, shadow_models, device=device)
+        
+        if len(mia_features) == 0 or len(set(membership_labels)) < 2: return float('nan')
+        
+        mia_clf = train_mia_classifier(mia_features, membership_labels, seed=seed)
+        
+        if mia_clf is None: return float('nan')
+        
+        # Compute MIA score as AUC
+        mia_probs = mia_clf.predict_proba(mia_features)[:, 1]  # Probability of being member
+        mia_auc = roc_auc_score(membership_labels, mia_probs)
+        
+        return float(mia_auc)
+        
+    except Exception as e:
+        print(f"  Warning: MIA computation failed: {e}")
+        return float('nan')
+
 # -------------------- Effective rank & participation  --------------------
 def effective_rank(svals: np.ndarray, threshold: float = 0.01) -> int:
     svals = np.array(svals)
@@ -785,8 +983,7 @@ def linear_probe_U(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split_ma
     Train/test a linear probe **in the reduced frame**: X = ZU.
     Returns (accuracy, AUC) on the test split.
     """
-    if U.shape[1] == 0:
-        return float('nan'), float('nan')
+    if U.shape[1] == 0: return float('nan'), float('nan')
     X_train, y_train, X_test, y_test = _prepare_probe_data(Z_all, labels, U, split_mask, forget_classes)
     if len(X_train) == 0 or len(X_test) == 0 or len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
         return float('nan'), float('nan')

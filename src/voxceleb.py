@@ -19,7 +19,7 @@ from common import (
     compute_scores, eer_from_scores, build_verification_trials,
     train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe,
     calculate_monosemanticity_score, compute_monosemanticity_statistics,
-    run_sae_hyperparameter_sweep, plot_sae_validation_curves
+    run_sae_hyperparameter_sweep, plot_sae_validation_curves, compute_mia_score
 )
 
 
@@ -80,10 +80,7 @@ def build_manifest(manifest_path: str, embeddings_path: str = None, dev_frac_per
         raise RuntimeError("No entries found in manifest")
     return manifest
 
-
-
 # Precompute / shared steps
-
 def precompute_embeddings_and_whitener(manifest_path: str, embeddings_path: Optional[str], dev_frac_per_spk: float,
                                        manifest_seed: int, encoder: str, device: str,
                                        wav2vec2_model: str, hubert_model: str, conformer_model: str):
@@ -370,11 +367,9 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
         print("[MS] Computing Monosemanticity scores (optional, single-run mode)...")
         E_all_norm = l2_normalize(E_all)
         ms_original = calculate_monosemanticity_score(E_all_norm, E_all_norm, top_m=20, min_activations=5)
-        ms_original_stats = compute_monosemanticity_statistics(ms_original)
         A_all_local = A_all
         ms_sae = calculate_monosemanticity_score(A_all_local, E_all_norm, top_m=20, min_activations=5)
-        ms_sae_stats = compute_monosemanticity_statistics(ms_sae)
-
+        
     print("[FEATURE] Computing feature stats and selecting features for this forget speaker...")
     stats = feature_stats(A_fgt, A_ret)
     feat_idx_global = select_features_from_stats(stats, top_k=sae_params.get("build_U_top", 200), fdr=0.05)
@@ -405,6 +400,17 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
         P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
         mu_r = np.zeros((1, U.shape[1]))
 
+    print("[MIA] Computing MIA scores before editing...")
+    test_mask_for_mia = M_ret_test | M_fgt_test
+    mia_score_before = compute_mia_score(
+        embeddings=E_all_norm,
+        labels=labels,
+        target_speaker=forget_spk,
+        mask=test_mask_for_mia,
+        num_shadow_models=5,
+        device=sae_params.get("device", "cuda"),
+        seed=seed
+    )
     # Editing: SAUCE gating + LEACE + noise injection + invert/normalize
     t_edit_start = time.time()
     Z_edit = Z_all.copy()
@@ -422,6 +428,18 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     E_edit_norm = l2_normalize(E_edit)
     t_edit_end = time.time()
     editing_time = float(t_edit_end - t_edit_start)
+
+    # MIA Score Computation AFTER editing
+    print("[MIA] Computing MIA scores after editing...")
+    mia_score_after = compute_mia_score(
+        embeddings=E_edit_norm,
+        labels=labels,
+        target_speaker=forget_spk,
+        mask=test_mask_for_mia,
+        num_shadow_models=5,
+        device=sae_params.get("device", "cuda"),
+        seed=seed
+    )
 
     # Evaluation: EERs
     print("[EVAL] Computing EERs and per-class metrics for this forget speaker...")
@@ -489,22 +507,20 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     )
 
     results = {
-        # requested metrics: forget & retain accuracy before/after (classifier)
         "FA_before": acc_fgt_before,
         "FA_after": acc_fgt_after,
         "RA_before": acc_ret_before,
         "RA_after": acc_ret_after,
-        # requested metrics: forget and mean retain EER (before/after)
         "forget_EER_before": forget_avg_before,
         "forget_EER_after": forget_avg_after,
         "retain_EER_before": retain_avg_before,
         "retain_EER_after": retain_avg_after,
-        # requested metrics: linear probe AUC
         "linear_probe_auc_before": auc_before,
         "linear_probe_auc_after": auc_after,
-        # global EERs (kept for reference if desired)
         "EER_before_raw": eer_before,
-        "EER_after_raw": eer_after
+        "EER_after_raw": eer_after,
+        "mia_score_before": mia_score_before,
+        "mia_score_after": mia_score_after,
     }
 
     # Save optional artifacts only when requested (single-run or debugging). For --run_all we set save_artifacts=False.
@@ -562,6 +578,7 @@ def run_all_forget_speakers(args):
         "forget_EER_before", "forget_EER_after",
         "retain_EER_before", "retain_EER_after",
         "linear_probe_auc_before", "linear_probe_auc_after",
+        "mia_score_before", "mia_score_after",
         "sae_training_time_seconds", "editing_time_seconds", "total_sae_edit_time_seconds", "error"
     ]
     write_header = not os.path.exists(csv_path)
@@ -614,8 +631,8 @@ def run_all_forget_speakers(args):
                             seed=seed, forget_spk=spk,
                             sae_params={"device": args.device, "build_U_top": args.build_U_top},
                             edit_params={"beta": args.beta, "leace": not args.no_leace, "leace_ridge": args.leace_ridge, "noise_sigma": args.noise_sigma},
-                            compute_ms=False,  # skip MS in multi-run to save time
-                            save_artifacts=False,  # do not write per-run artifacts
+                            compute_ms=False,
+                            save_artifacts=False,
                             save_dir=None
                         )
 
@@ -634,6 +651,8 @@ def run_all_forget_speakers(args):
                             "retain_EER_after": results.get("retain_EER_after", ""),
                             "linear_probe_auc_before": results.get("linear_probe_auc_before", ""),
                             "linear_probe_auc_after": results.get("linear_probe_auc_after", ""),
+                            "mia_score_before": results.get("mia_score_before", ""),
+                            "mia_score_after": results.get("mia_score_after", ""),                            
                             "sae_training_time_seconds": float(sae_train_time),
                             "editing_time_seconds": float(editing_time),
                             "total_sae_edit_time_seconds": float(total_time),
@@ -664,7 +683,6 @@ def run_all_forget_speakers(args):
 
 
 # Continual Unlearning Orchestration
-
 def run_continual_unlearning(args):
     """
     Orchestrates sequential, continual unlearning.
@@ -703,6 +721,7 @@ def run_continual_unlearning(args):
         "forget_EER_before", "forget_EER_after",
         "retain_EER_before", "retain_EER_after",
         "linear_probe_auc_before", "linear_probe_auc_after",
+        "mia_score_before", "mia_score_after",
         "sae_training_time_seconds", "editing_time_seconds", "total_time_seconds", "error"
     ]
     
@@ -798,6 +817,8 @@ def run_continual_unlearning(args):
                     "retain_EER_after": results.get("retain_EER_after", ""),
                     "linear_probe_auc_before": results.get("linear_probe_auc_before", ""),
                     "linear_probe_auc_after": results.get("linear_probe_auc_after", ""),
+                    "mia_score_before": results.get("mia_score_before", ""),
+                    "mia_score_after": results.get("mia_score_after", ""),                    
                     "sae_training_time_seconds": sae_train_time,
                     "editing_time_seconds": editing_time,
                     "total_time_seconds": sae_train_time + editing_time,
@@ -822,16 +843,12 @@ def run_continual_unlearning(args):
     print(f"\n[CONTINUAL] Continual unlearning finished. Results saved to: {csv_path}")
 
 
-# Backwards-compatible single-run (keeps original semantics)
-
-# Backwards-compatible single-run (keeps original semantics)
-
 def run_pipeline(
     manifest_path: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
     retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_multiplier: float = 4.0,
     sae_variant: str = "topk", sae_topk: int = 128, lambda_sparsity: float = 0.0, sae_epochs: int = 30,
     build_U_top: int = 200, beta: float = 0.0, leace: bool = True, leace_ridge: float = 1e-6,
-    noise_sigma: float = 0.02, per_speaker_union: bool = False, forget_spks: Optional[List[str]] = None,
+    noise_sigma: float = 0.02, forget_spks: Optional[List[str]] = None,
     encoder: str = "ecapa", embeddings_path: str = None,
     wav2vec2_model: str = "facebook/wav2vec2-base",
     hubert_model: str = "facebook/hubert-base-ls960",
