@@ -309,7 +309,7 @@ def sae_encode_batch(model: SAE, Z: np.ndarray, device: str = 'cuda', batch: int
 # -------------------- SAE Hyperparameter Sweep --------------------
 def setup_publication_plots():
     """Setup matplotlib for publication-quality plots."""
-    plt.style.use('default')
+    plt.style.use('seaborn-v0_8-pastel')
     
     # Set publication parameters
     plt.rcParams.update({
@@ -324,8 +324,8 @@ def setup_publication_plots():
         'lines.linewidth': 2,
         'grid.alpha': 0.3,
         'axes.grid': True,
-        'figure.dpi': 300,
-        'savefig.dpi': 300,
+        'figure.dpi': 600,
+        'savefig.dpi': 600,
         'savefig.bbox': 'tight',
         'savefig.transparent': False
     })
@@ -395,8 +395,8 @@ def plot_sae_validation_curves(results: Dict, save_dir: str):
     
     # color map and line styles
     colors = plt.cm.tab10(np.linspace(0, 1, len(multipliers)))
-    base_line_styles = ['-', '--', '-.', ':', (0, (3, 1, 1, 1)), (0, (5, 1))]
-    base_markers = ['o', 's', '^', 'D', 'v', 'P']
+    base_line_styles = ['--']
+    base_markers = ['o', 's', '^', 'D', 'v', 'P', '*', 'X']
     
     # Ensure we have enough styles and markers for the number of top-k values
     line_styles = (base_line_styles * (len(topks) // len(base_line_styles) + 1))[:len(topks)]
@@ -411,13 +411,14 @@ def plot_sae_validation_curves(results: Dict, save_dir: str):
             epochs = history['epochs']
             val_loss = history['val_loss']
             
-            ax.plot(epochs, val_loss, color=colors[i], linestyle=line_styles[j], marker=markers[j], markersize=4, markevery=max(1, len(epochs)//10), alpha=0.8, linewidth=2)
+            ax.plot(epochs, val_loss, color=colors[i], linestyle=line_styles[j], marker=markers[j], markersize=8, markevery=max(1, len(epochs)//10), alpha=0.8, linewidth=2)
             
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Validation MSE Loss')
     ax.set_title('SAE Hyperparameter Analysis')
     ax.grid(True, alpha=0.3)
     ax.set_yscale('log')
+    # ax.set_xscale('log')
     
     # legend
     multiplier_handles = [plt.Line2D([], [], color=color, linewidth=3, label=f'alpha = {mult}') for mult, color in zip(multipliers, colors)]
@@ -431,7 +432,7 @@ def plot_sae_validation_curves(results: Dict, save_dir: str):
     
     # Save
     plot_path = os.path.join(save_dir, 'sae_comprehensive_validation_curves.png')
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(plot_path, dpi=600, bbox_inches='tight', facecolor='white')
     plt.close()
     
     print(f"[PLOT] Saved comprehensive validation curve plot to {plot_path}")

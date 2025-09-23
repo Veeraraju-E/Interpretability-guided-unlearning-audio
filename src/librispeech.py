@@ -14,20 +14,17 @@ import numpy as np
 import torch
 
 from common import (
-    seed_all, extract_embeddings, fit_whitener, apply_whitener,
-    invert_whitener, l2_normalize, SAE, train_sae, sae_encode_batch,
+    seed_all, extract_embeddings, fit_whitener, invert_whitener, l2_normalize, 
+    SAE, train_sae, sae_encode_batch,
     prune_and_normalize_decoder, feature_stats, select_features_from_stats, build_U_from_decoder,
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace,
     compute_scores, eer_from_scores, build_verification_trials,
-    train_classifier, evaluate_classifier, per_class_eers, avg_eers,
-    # light monosemanticity helpers retained (like voxceleb)
-    calculate_monosemanticity_score, compute_monosemanticity_statistics
+    train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe, apply_whitener,
+    run_sae_hyperparameter_sweep, plot_sae_validation_curves, compute_mia_score
 )
 
 
-# --------------------
 # LibriSpeech manifest helpers (dataset-specific)
-# --------------------
 def read_librispeech_raw_entries(data_root: str) -> List[Dict]:
     """
     Scan LibriSpeech 'dev-clean' and 'dev-other' for .flac files and return raw entries list:
@@ -103,9 +100,9 @@ def build_manifest(manifest_source: str, embeddings_path: Optional[str] = None, 
     return manifest
 
 
-# ----------------------------
+
 # Precompute / shared steps (dataset-specific manifest)
-# ----------------------------
+
 def precompute_embeddings_and_whitener(data_root: str, embeddings_path: Optional[str], dev_frac_per_spk: float,
                                        manifest_seed: int, encoder: str, device: str,
                                        wav2vec2_model: str, hubert_model: str, conformer_model: str):
@@ -192,9 +189,9 @@ def precompute_embeddings_and_whitener(data_root: str, embeddings_path: Optional
     return precomp
 
 
-# ----------------------------
+
 # Train SAE (per seed)
-# ----------------------------
+
 def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: str, sae_topk: int,
                        lambda_sparsity: float, sae_epochs: int, device: str):
     """
@@ -226,9 +223,9 @@ def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: s
     return sae, sae_training_time, A_all, dec_w
 
 
-# ----------------------------
+
 # Per-speaker run (uses precomputed and trained SAE)
-# ----------------------------
+
 def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: str,
                       sae_params: Dict, edit_params: Dict, compute_ms: bool = True,
                       save_artifacts: bool = True, save_dir: Optional[str] = None):
@@ -256,18 +253,6 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     A_ret = A_all[M_ret_dev]
     A_fgt = A_all[M_fgt_dev]
 
-    # Optional monosemanticity (light, mirrors voxceleb)
-    if compute_ms:
-        try:
-            E_all_norm = l2_normalize(E_all)
-            ms_original = calculate_monosemanticity_score(E_all_norm, E_all_norm, top_m=20, min_activations=5)
-            _ = compute_monosemanticity_statistics(ms_original)
-            ms_sae = calculate_monosemanticity_score(A_all, E_all_norm, top_m=20, min_activations=5)
-            _ = compute_monosemanticity_statistics(ms_sae)
-        except Exception:
-            # best-effort only; don't fail the run on ms computation
-            pass
-
     # Feature selection
     stats = feature_stats(A_fgt, A_ret)
     feat_idx = select_features_from_stats(stats, top_k=sae_params.get("build_U_top", 200), fdr=0.05)
@@ -275,8 +260,7 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     # Build U subspace from decoder according to selected features
     dec_pruned = prune_and_normalize_decoder(dec_w, prune_threshold=1e-6)
     U = build_U_from_decoder(dec_w, feat_idx)
-    if U is None:
-        U = np.zeros((dec_w.shape[1], 0))
+    if U is None: U = np.zeros((dec_w.shape[1], 0))
 
     # LEACE projector per-forget-run
     P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
@@ -358,7 +342,6 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
         stats_path = os.path.join(save_dir, "verification_eer_summary.json")
         with open(stats_path, "w") as fh:
             json.dump(results, fh, indent=2)
-        # Minimal dumps (no heavy validation)
         np.savez_compressed(os.path.join(save_dir, "interpretability_data.npz"),
                             E_all=E_all, E_edit=E_edit, Z_all=Z_all, Z_edit=Z_edit, U=U,
                             labels=np.array(labels), sets=np.array(sets), forget_spk=np.array([forget_spk]))
@@ -368,9 +351,8 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     return results, editing_time
 
 
-# ----------------------------
+
 # Multi-run orchestration (voxceleb-like)
-# ----------------------------
 def run_all_forget_speakers(args):
     """
     Optimized orchestration for running one-forget-per-run across many speakers and seeds:
@@ -504,9 +486,9 @@ def run_all_forget_speakers(args):
     print(f"\n[MULTI] finished. consolidated CSV: {csv_path}")
 
 
-# ----------------------------
+
 # Backwards-compatible single-run wrapper (keeps original semantics)
-# ----------------------------
+
 def run_pipeline(
     data_root: str, save_dir: str = "./runs/exp", device: str = "cuda", seed: int = 1337,
     retain_frac: float = 0.975, dev_frac_per_spk: float = 0.75, sae_multiplier: float = 4.0,

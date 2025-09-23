@@ -30,7 +30,7 @@ df['FA_after_percent'] = df['FA_after'] * 100
 df['cumulative_mean'] = df['FA_after_percent'].expanding().mean()
 
 # --- Plotting ---
-plt.style.use('seaborn-v0_8-whitegrid')
+plt.style.use('seaborn-v0_8-pastel')
 plt.rcParams['font.family'] = 'serif'
 
 # Create a compact figure

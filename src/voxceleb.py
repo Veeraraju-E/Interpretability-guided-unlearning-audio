@@ -18,7 +18,6 @@ from common import (
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace,
     compute_scores, eer_from_scores, build_verification_trials,
     train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe,
-    calculate_monosemanticity_score, compute_monosemanticity_statistics,
     run_sae_hyperparameter_sweep, plot_sae_validation_curves, compute_mia_score
 )
 
@@ -139,7 +138,7 @@ def precompute_embeddings_and_whitener(manifest_path: str, embeddings_path: Opti
                                                  conformer_model=conformer_model, label_key='speaker')
 
     labels = L_all
-    sets = [f"?:{m['split']}" for m in manifest_ordered]  # placeholder sets; specific forget assignment is per-run
+    # sets = [f"?:{m['split']}" for m in manifest_ordered]  # placeholder sets; specific forget assignment is per-run
 
     # dev/test masks by split only (independent of forget speaker)
     mask_dev = np.array([m['split'] == 'dev' for m in manifest_ordered], dtype=bool)
@@ -148,10 +147,9 @@ def precompute_embeddings_and_whitener(manifest_path: str, embeddings_path: Opti
     # Fit whitener on dev samples (dev union)
     print("[PRECOMP] Fitting whitener on DEV (all dev samples)...")
     E_dev = E_all[mask_dev]
-    if E_dev.shape[0] < 2:
-        raise RuntimeError("Not enough dev samples to fit whitener")
+    if E_dev.shape[0] < 2: raise RuntimeError("Not enough dev samples to fit whitener")
     mu, W = fit_whitener(E_dev)
-    Z_all = (E_all - mu) @ W    # aply whitener
+    Z_all = (E_all - mu) @ W    # apply whitener
 
     precomp = {
         "entries": entries,
@@ -169,7 +167,7 @@ def precompute_embeddings_and_whitener(manifest_path: str, embeddings_path: Opti
     return precomp
 
 
-# NEW: SAE Hyperparameter Sweep Function
+# SAE Hyperparameter Sweep Function
 def run_sae_hyperparameter_analysis(args):
     """
     Run SAE hyperparameter sweep to generate publication-quality validation loss curves.
@@ -351,24 +349,11 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     M_fgt_test = np.array([s == 'forget:test' for s in sets], dtype=bool)
     
     if np.sum(M_fgt_dev) == 0:
-        print(f"Warning: No dev samples found for forget speaker {forget_spk}. Skipping feature mining for this speaker.")
-        # Create an empty results dict to avoid crashing
-        return {}, 0.0
+        return f"ERROR: No dev samples found for forget speaker {forget_spk}. Skipping feature mining for this speaker."
 
     # Feature mining (depends on forget speaker)
-    Z_ret_dev = Z_all[M_ret_dev]
-    Z_fgt_dev = Z_all[M_fgt_dev]
     A_ret = A_all[M_ret_dev]
     A_fgt = A_all[M_fgt_dev]
-
-    # optionally compute Monosemanticity scores (skip for --run_all to save time)
-    ms_original_stats, ms_sae_stats, ms_final_stats = None, None, None
-    if compute_ms:
-        print("[MS] Computing Monosemanticity scores (optional, single-run mode)...")
-        E_all_norm = l2_normalize(E_all)
-        ms_original = calculate_monosemanticity_score(E_all_norm, E_all_norm, top_m=20, min_activations=5)
-        A_all_local = A_all
-        ms_sae = calculate_monosemanticity_score(A_all_local, E_all_norm, top_m=20, min_activations=5)
         
     print("[FEATURE] Computing feature stats and selecting features for this forget speaker...")
     stats = feature_stats(A_fgt, A_ret)
@@ -380,8 +365,7 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     dec_pruned = prune_and_normalize_decoder(dec_w, prune_threshold=1e-6)
     U = build_U_from_decoder(dec_w, feat_idx)
     # fallback
-    if U is None:
-        U = np.zeros((dec_w.shape[1], 0))
+    if U is None: U = np.zeros((dec_w.shape[1], 0))
 
     # LEACE projector (depends on forget speaker)
     P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
@@ -485,26 +469,24 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
     acc_fgt_after = evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=sae_params.get("device", "cuda"))
 
     # Linear Probe AUC evaluation
-    print("[EVAL] Computing Linear Probe AUC...")
-    
-    # *** FIX: Corrected the calls to safe_linear_probe to match the signature in common.py ***
+    print("[EVAL] Computing Linear Probe AUC...")    
     split_mask_dict = {'dev': mask_dev_global, 'test': mask_test_global}
 
     # safe_linear_probe returns (accuracy, auc), we only need the auc
     _, auc_before = safe_linear_probe(
-        Z_all,              # All WHITENED embeddings before editing
-        labels,             # All corresponding labels
-        U,                  # The subspace matrix
-        split_mask_dict,    # The dev/test masks for training/testing the probe
-        [forget_spk]        # The class(es) to treat as positive
+        Z_all,
+        labels,
+        U,        
+        split_mask_dict,
+        [forget_spk]
     )
 
     _, auc_after = safe_linear_probe(
-        Z_edit,             # All WHITENED embeddings after editing
-        labels,             # All corresponding labels
-        U,                  # The subspace matrix
-        split_mask_dict,    # The dev/test masks for training/testing the probe
-        [forget_spk]        # The class(es) to treat as positive
+        Z_edit,
+        labels,
+        U,
+        split_mask_dict,
+        [forget_spk]
     )
 
     results = {
@@ -524,13 +506,12 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
         "mia_score_after": mia_score_after,
     }
 
-    # Save optional artifacts only when requested (single-run or debugging). For --run_all we set save_artifacts=False.
+    # Save artifacts. For --run_all we set save_artifacts=False.
     if save_artifacts and save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
         stats_path = os.path.join(save_dir, "verification_eer_summary.json")
         with open(stats_path, "w") as fh:
             json.dump(results, fh, indent=2)
-        # minimal interpretability dump if requested
         np.savez_compressed(os.path.join(save_dir, "interpretability_data.npz"),
                             E_all=E_all, E_edit=E_edit, Z_all=Z_all, Z_edit=Z_edit, U=U,
                             labels=np.array(labels), sets=np.array(sets), manifest=np.array(manifest), forget_spks=np.array([forget_spk]))
@@ -538,8 +519,6 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_spk: st
         np.savez_compressed(os.path.join(save_dir, "whitener.npz"), mu=mu, W=W)
 
     return results, editing_time
-
-
 
 # Multi-run orchestration
 def run_all_forget_speakers(args):
@@ -618,10 +597,7 @@ def run_all_forget_speakers(args):
                 y_cls_train = [spk2id[s] for i, s in enumerate(labels) if mask_dev[i]]
                 X_cls_val = E_all_norm[mask_test]
                 y_cls_val = [spk2id[s] for i, s in enumerate(labels) if mask_test[i]]
-                # reuse existing classifier training function
-                clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val,
-                                       num_classes=len(all_spks), device=args.device, epochs=args.classifier_epochs if hasattr(args, "classifier_epochs") else 20,
-                                       batch_size=512, lr=1e-3)
+                clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val,  num_classes=len(all_spks), device=args.device, epochs=args.classifier_epochs if args.classifier_epochs else 20, batch_size=512, lr=1e-3)
 
                 # now iterate speakers (no per-run saving)
                 for spk in speakers:
@@ -966,7 +942,7 @@ if __name__ == "__main__":
     # Hyperparameter Sweep flag
     parser.add_argument("--sae_hyperparameter_sweep", action="store_true", help="Run SAE hyperparameter sweep to generate validation loss curves for publication")
     parser.add_argument("--sweep_multipliers", nargs="+", type=float, default=[1.0, 4.0, 8.0, 16.0], help="SAE multiplier values to sweep over")
-    parser.add_argument("--sweep_topks", nargs="+", type=int, default=[1, 4, 8, 16, 32, 64, 128, 256], help="SAE top-K values to sweep over")
+    parser.add_argument("--sweep_topks", nargs="+", type=int, default=[1, 4, 8, 16, 32, 64, 128], help="SAE top-K values to sweep over")
     parser.add_argument("--sweep_epochs", type=int, default=200, help="Number of epochs for hyperparameter sweep training")
     
     args = parser.parse_args()
