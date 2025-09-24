@@ -20,12 +20,8 @@ from common import (
     leace_projector_in_U, apply_subspace_leace, apply_sauce_gating, inject_noise_in_subspace,
     compute_scores, eer_from_scores, build_verification_trials,
     train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe,
-    # monosemanticity helpers
-    calculate_monosemanticity_score, compute_monosemanticity_statistics,
-    # New functions from voxceleb integration
     run_sae_hyperparameter_sweep, plot_sae_validation_curves, compute_mia_score
 )
-
 
 # -------------------- Manifest --------------------
 def build_manifest(data_root: str, dev_frac_per_cmd: float = 0.75, seed: int = 1337, allowed_exts: List[str] = [".wav"]) -> List[Dict]:
@@ -355,7 +351,7 @@ def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: s
         return sae, sae_training_time, A_all, dec_w
 
 
-# Per-command run (uses precomputed and trained SAE) - mirrors single_forget_run in voxceleb.py
+# Per-command run (uses precomputed and trained SAE)
 def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_cmd: str, sae_params: Dict, edit_params: Dict, compute_ms: bool = True, save_artifacts: bool = True, save_dir: Optional[str] = None):
     """
     Run the per-forget-command steps (feature stats, select features, build U, LEACE,
@@ -553,7 +549,7 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_cmd: st
     return results, editing_time
 
 
-# Multi-run orchestration (mirrors voxceleb.run_all_forget_speakers)
+# Multi-run orchestration
 def run_all_forget_commands(args):
     """
     Orchestrates multi-run optimized execution:
@@ -869,8 +865,7 @@ def run_pipeline(
     save_artifacts: bool = True
 ):
     """
-    Single-run pipeline (backwards compatible). Behaves similarly to old speech_commands.run_pipeline
-    but reuses precompute/train_sae/single_forget_run structure for parity with voxceleb.py.
+    Single-run pipeline.
     """
     # Precompute embeddings & whitener
     precomp = precompute_embeddings_and_whitener(
@@ -970,7 +965,7 @@ if __name__ == "__main__":
     parser.add_argument("--hubert_model", type=str, default="facebook/hubert-base-ls960")
     parser.add_argument("--wav2vec2_model", type=str, default="facebook/wav2vec2-base")
     parser.add_argument("--embeddings_path", type=str, default=None)
-    # Multi-run flags (same style as voxceleb)
+    # Multi-run flags
     parser.add_argument("--run_all", action="store_true", help="Run for all commands (one-forget-per-run) across seeds; optimized to reuse extractor/SAE per-seed")
     parser.add_argument("--seeds", nargs="+", type=int, default=[1337, 1338, 1339], help="Seeds to use for multi-run (space separated)")
     parser.add_argument("--classifier_epochs", type=int, default=20, help="Epochs to train classifier (used in multi-run per-seed classifier training)")
@@ -987,12 +982,12 @@ if __name__ == "__main__":
     if args.sae_hyperparameter_sweep:
         run_sae_hyperparameter_analysis(args)
     elif args.run_all:
-        # run optimized multi-run over all commands in dataset
+        # multi-run over all commands
         run_all_forget_commands(args)
     elif args.continual_unlearning:
         run_continual_unlearning(args)
     else:
-        # Single-run (backwards-compatible)
+        # Single-run
         run_pipeline(
             data_root=args.data_root, save_dir=args.save_dir, device=args.device, seed=args.seed,
             retain_frac=args.retain_frac, dev_frac_per_cmd=args.dev_frac_per_cmd,

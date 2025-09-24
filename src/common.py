@@ -21,7 +21,7 @@ from statsmodels.stats.multitest import multipletests as _multipletests
 multipletests = _multipletests
 
 import torchaudio
-from speechbrain.pretrained import EncoderClassifier  # pyright: ignore[reportMissingImports]
+from speechbrain.pretrained import EncoderClassifier
 from typing import List, Dict, Optional, Tuple
 from transformers import AutoFeatureExtractor, AutoModel
 import matplotlib.pyplot as plt

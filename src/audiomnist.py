@@ -10,6 +10,7 @@ from typing import List, Dict, Optional
 import argparse
 import numpy as np
 import torch
+import copy
 
 from common import (
     seed_all, human_time, extract_embeddings, fit_whitener, apply_whitener,
@@ -19,7 +20,8 @@ from common import (
     compute_scores, eer_from_scores, build_verification_trials,
     train_classifier, evaluate_classifier, per_class_eers, avg_eers, safe_linear_probe,
     # monosemanticity functions left available for single-run usage
-    calculate_monosemanticity_score, compute_monosemanticity_statistics
+    calculate_monosemanticity_score, compute_monosemanticity_statistics,
+    run_sae_hyperparameter_sweep, plot_sae_validation_curves, compute_mia_score
 )
 
 
@@ -148,7 +150,6 @@ def precompute_embeddings_and_whitener(data_root: str, embeddings_path: Optional
                                                  conformer_model=conformer_model, label_key='digit')
 
     labels = L_all
-    sets = [f"?:{m['split']}" for m in manifest_ordered]  # placeholder sets; specific forget assignment is per-run
 
     # dev/test masks by split only (independent of forget digit)
     mask_dev = np.array([m['split'] == 'dev' for m in manifest_ordered], dtype=bool)
@@ -178,14 +179,120 @@ def precompute_embeddings_and_whitener(data_root: str, embeddings_path: Optional
     return precomp
 
 
+# SAE Hyperparameter Sweep Function
+def run_sae_hyperparameter_analysis(args):
+    """
+    Run SAE hyperparameter sweep to generate publication-quality validation loss curves.
+    This generates exactly 2 plots:
+    1. Validation MSE vs epochs for different SAE multiplier values
+    2. Validation MSE vs epochs for different Top-K values
+    """
+    print("[SAE-SWEEP] Starting SAE hyperparameter analysis...")
+    
+    # 1) Precompute embeddings & whitener once
+    precomp = precompute_embeddings_and_whitener(
+        data_root=args.data_root,
+        embeddings_path=args.embeddings_path,
+        dev_frac_per_digit=args.dev_frac_per_digit,
+        manifest_seed=args.split_seed if hasattr(args, "split_seed") else args.seed,
+        encoder=args.encoder,
+        device=args.device,
+        wav2vec2_model=args.wav2vec2_model if hasattr(args, "wav2vec2_model") else "facebook/wav2vec2-base",
+        hubert_model=args.hubert_model if hasattr(args, "hubert_model") else "facebook/hubert-base-ls960",
+        conformer_model=args.conformer_model if hasattr(args, "conformer_model") else "facebook/wav2vec2-conformer-rel-pos-large"
+    )
+    
+    Z_all = precomp["Z_all"]
+    mask_dev = precomp["mask_dev"]
+    input_dim = Z_all.shape[1]
+    
+    # Split dev data into train/val for SAE training
+    Z_dev = Z_all[mask_dev]
+    print(f"[SAE-SWEEP] Dev set size: {Z_dev.shape[0]} samples, dimension: {input_dim}")
+    
+    # Create train/val split for SAE training (80/20 split of dev data)
+    seed_all(args.seed)
+    perm = np.random.permutation(Z_dev.shape[0])
+    cut = int(0.8 * len(perm)) if len(perm) > 1 else int(0.5 * len(perm))
+    if cut <= 0:
+        Z_train, Z_val = Z_dev, Z_dev
+    else:
+        Z_train, Z_val = Z_dev[perm[:cut]], Z_dev[perm[cut:]]
+    
+    print(f"[SAE-SWEEP] SAE Train set: {Z_train.shape[0]} samples")
+    print(f"[SAE-SWEEP] SAE Val set: {Z_val.shape[0]} samples")
+    
+    # Define hyperparameter ranges
+    sae_multiplier_values = args.sweep_multipliers if hasattr(args, 'sweep_multipliers') else [2.0, 4.0, 8.0, 16.0, 32.0]
+    sae_topk_values = args.sweep_topks if hasattr(args, 'sweep_topks') else [32, 64, 128, 256, 512]
+    sweep_epochs = args.sweep_epochs if hasattr(args, 'sweep_epochs') else 100
+    
+    print(f"[SAE-SWEEP] Multiplier sweep: {sae_multiplier_values}")
+    print(f"[SAE-SWEEP] Top-K sweep: {sae_topk_values}")
+    print(f"[SAE-SWEEP] Sweep epochs: {sweep_epochs}")
+    
+    # 2) Run hyperparameter sweep
+    results = run_sae_hyperparameter_sweep(
+        Z_train=Z_train,
+        Z_val=Z_val,
+        input_dim=input_dim,
+        device=args.device,
+        sae_multiplier_values=sae_multiplier_values,
+        sae_topk_values=sae_topk_values,
+        epochs=sweep_epochs,
+        seed=args.seed
+    )
+    
+    # 3) Generate publication-quality plots
+    save_dir = args.save_dir
+    os.makedirs(save_dir, exist_ok=True)
+    
+    plot_sae_validation_curves(results, save_dir)
+    
+    # 4) Save raw results for further analysis if needed
+    results_path = os.path.join(save_dir, 'sae_hyperparameter_sweep_results.json')
+    
+    # Convert numpy arrays to lists for JSON serialization
+    json_results = {
+        'multiplier_sweep': {},
+        'topk_sweep': {},
+        'config': results['config']
+    }
+    
+    for mult, history in results['multiplier_sweep'].items():
+        json_results['multiplier_sweep'][str(mult)] = {
+            'epochs': history['epochs'],
+            'val_loss': history['val_loss'],
+            'train_loss': history['train_loss'],
+            'dead_latent_fraction': history['dead_latent_fraction']
+        }
+    
+    for topk, history in results['topk_sweep'].items():
+        json_results['topk_sweep'][str(topk)] = {
+            'epochs': history['epochs'],
+            'val_loss': history['val_loss'],
+            'train_loss': history['train_loss'],
+            'dead_latent_fraction': history['dead_latent_fraction']
+        }
+    
+    with open(results_path, 'w') as f:
+        json.dump(json_results, f, indent=2)
+    
+    print(f"[SAE-SWEEP] Analysis complete!")
+    print(f"[SAE-SWEEP] Plots saved to: {save_dir}")
+    print(f"[SAE-SWEEP] Raw results saved to: {results_path}")
+    
+    return results
+
+
 # ----------------------------
-# Train SAE (once per seed)
+# Train SAE (once per seed) - MODIFIED to support loss tracking
 # ----------------------------
 def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: str, sae_topk: int,
-                       lambda_sparsity: float, sae_epochs: int, device: str):
+                       lambda_sparsity: float, sae_epochs: int, device: str, track_loss_history: bool = False):
     """
     Train SAE on Z_train (dev union) for the given seed. Returns trained SAE, training_time_seconds,
-    and A_all (activations) computed on Z_all.
+    and A_all (activations) computed on Z_all. Optionally tracks loss history.
     """
     seed_all(seed)
     Z_all = precomp["Z_all"]
@@ -193,6 +300,10 @@ def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: s
 
     print(f"[SAE] Training SAE for seed {seed} on all dev samples (once per seed)...")
     Z_train = Z_all[mask_dev]
+    
+    if Z_train.shape[0] == 0:
+        raise ValueError("Cannot train SAE with zero dev samples.")
+    
     perm = np.random.permutation(Z_train.shape[0])
     cut = int(0.8 * len(perm)) if len(perm) > 1 else int(0.5 * len(perm))
     if cut <= 0:  # fallback
@@ -202,7 +313,16 @@ def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: s
 
     sae = SAE(input_dim=Z_all.shape[1], hidden_mult=sae_multiplier, k=sae_topk, variant=sae_variant)
     t_sae_start = time.time()
-    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=64, lr=1e-3, device=device, lambda_sparsity=lambda_sparsity)
+    
+    # Use the modified train_sae function with optional loss history tracking
+    if track_loss_history:
+        sae, loss_history = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=64, lr=1e-3, 
+                                     device=device, lambda_sparsity=lambda_sparsity, return_loss_history=True)
+    else:
+        sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sae_epochs, batch_size=64, lr=1e-3, 
+                       device=device, lambda_sparsity=lambda_sparsity, return_loss_history=False)
+        loss_history = None
+    
     t_sae_end = time.time()
     sae_training_time = float(t_sae_end - t_sae_start)
 
@@ -213,7 +333,10 @@ def train_sae_for_seed(precomp, seed: int, sae_multiplier: float, sae_variant: s
     # get decoder weights for U building later
     dec_w = sae.dec.weight.detach().cpu().numpy()
 
-    return sae, sae_training_time, A_all, dec_w
+    if track_loss_history:
+        return sae, sae_training_time, A_all, dec_w, loss_history
+    else:
+        return sae, sae_training_time, A_all, dec_w
 
 
 # ----------------------------
@@ -241,6 +364,9 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_digit: 
     M_fgt_dev = np.array([s == 'forget:dev' for s in sets], dtype=bool)
     M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
     M_fgt_test = np.array([s == 'forget:test' for s in sets], dtype=bool)
+
+    if np.sum(M_fgt_dev) == 0:
+        return f"ERROR: No dev samples found for forget digit {forget_digit}. Skipping feature mining for this digit."
 
     # Feature mining (depends on forget digit)
     Z_ret_dev = Z_all[M_ret_dev]
@@ -291,6 +417,19 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_digit: 
         P_r = np.eye(U.shape[1]) if U.shape[1] > 0 else np.eye(0)
         mu_r = np.zeros((1, U.shape[1]))
 
+    print("[MIA] Computing MIA scores before editing...")
+    test_mask_for_mia = M_ret_test | M_fgt_test
+    E_all_norm = l2_normalize(E_all)
+    mia_score_before = compute_mia_score(
+        embeddings=E_all_norm,
+        labels=labels,
+        target_speaker=forget_digit,  # target_digit in this case
+        mask=test_mask_for_mia,
+        num_shadow_models=5,
+        device=sae_params.get("device", "cuda"),
+        seed=seed
+    )
+
     # Editing: SAUCE gating + LEACE + noise injection + invert/normalize
     t_edit_start = time.time()
     Z_edit = Z_all.copy()
@@ -303,20 +442,38 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_digit: 
     noise_sigma = edit_params.get("noise_sigma", 0.0)
     if noise_sigma and noise_sigma > 0:
         Z_edit = inject_noise_in_subspace(Z_edit, U, sigma=noise_sigma)
-    E_edit = invert_whitener(Z_edit, precomp_mu := mu, precomp_W := W)
+    E_edit = invert_whitener(Z_edit, mu, W)
     E_all_norm = l2_normalize(E_all)
     E_edit_norm = l2_normalize(E_edit)
     t_edit_end = time.time()
     editing_time = float(t_edit_end - t_edit_start)
 
+    # MIA Score Computation AFTER editing
+    print("[MIA] Computing MIA scores after editing...")
+    mia_score_after = compute_mia_score(
+        embeddings=E_edit_norm,
+        labels=labels,
+        target_speaker=forget_digit,  # target_digit in this case
+        mask=test_mask_for_mia,
+        num_shadow_models=5,
+        device=sae_params.get("device", "cuda"),
+        seed=seed
+    )
+
     # Evaluation: EERs
     print("[EVAL] Computing EERs and per-class metrics for this forget digit...")
     test_mask_for_trials = M_ret_test | M_fgt_test
     test_trials, test_labels = build_verification_trials(labels, [forget_digit], test_mask_for_trials)
-    scores_test_before = compute_scores(E_all_norm, test_trials)
-    scores_test_after = compute_scores(E_edit_norm, test_trials)
-    eer_before = eer_from_scores(scores_test_before, test_labels)
-    eer_after = eer_from_scores(scores_test_after, test_labels)
+    
+    # Check if there are any positive or negative pairs for EER calculation
+    if not (1 in test_labels and 0 in test_labels):
+        print("Warning: Cannot compute EER, not enough positive/negative pairs.")
+        eer_before, eer_after = -1.0, -1.0
+    else:
+        scores_test_before = compute_scores(E_all_norm, test_trials)
+        scores_test_after = compute_scores(E_edit_norm, test_trials)
+        eer_before = eer_from_scores(scores_test_before, test_labels)
+        eer_after = eer_from_scores(scores_test_after, test_labels)
 
     per_class_test = per_class_eers(E_all_norm, E_edit_norm, labels, mask=test_mask_for_trials, rng_seed=seed)
     per_class_ret = {c: vals for c, vals in per_class_test.items() if c != forget_digit}
@@ -330,9 +487,13 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_digit: 
     digit2id = {d: i for i, d in enumerate(all_digits)}
     # Build test indices for classifier evaluation
     E_ret_test = E_all_norm[M_ret_test]
-    L_ret_test = [digit2id[d] for d in np.array(labels)[M_ret_test]]
+    L_ret_test_str = np.array(labels)[M_ret_test]
+    L_ret_test = [digit2id[d] for d in L_ret_test_str] if len(L_ret_test_str) > 0 else []
+
     E_fgt_test = E_all_norm[M_fgt_test]
-    L_fgt_test = [digit2id[d] for d in np.array(labels)[M_fgt_test]]
+    L_fgt_test_str = np.array(labels)[M_fgt_test]
+    L_fgt_test = [digit2id[d] for d in L_fgt_test_str] if len(L_fgt_test_str) > 0 else []
+
     E_ret_test_edit = E_edit_norm[M_ret_test]
     E_fgt_test_edit = E_edit_norm[M_fgt_test]
 
@@ -341,20 +502,47 @@ def single_forget_run(precomp, sae, dec_w, A_all, clf, seed: int, forget_digit: 
     acc_ret_after = evaluate_classifier(clf, E_ret_test_edit, L_ret_test, device=sae_params.get("device", "cuda"))
     acc_fgt_after = evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=sae_params.get("device", "cuda"))
 
+    # Linear Probe AUC evaluation
+    print("[EVAL] Computing Linear Probe AUC...")    
+    split_mask_dict = {'dev': mask_dev_global, 'test': mask_test_global}
+
+    # safe_linear_probe returns (accuracy, auc), we only need the auc
+    _, auc_before = safe_linear_probe(
+        Z_all,
+        labels,
+        U,        
+        split_mask_dict,
+        [forget_digit]
+    )
+
+    _, auc_after = safe_linear_probe(
+        Z_edit,
+        labels,
+        U,
+        split_mask_dict,
+        [forget_digit]
+    )
+
     results = {
         # requested metrics: forget & retain accuracy before/after (classifier)
-        "resnet_acc_forget_before": acc_fgt_before,
-        "resnet_acc_forget_after": acc_fgt_after,
-        "resnet_acc_retain_before": acc_ret_before,
-        "resnet_acc_retain_after": acc_ret_after,
+        "FA_before": acc_fgt_before,
+        "FA_after": acc_fgt_after,
+        "RA_before": acc_ret_before,
+        "RA_after": acc_ret_after,
         # requested metrics: forget and mean retain EER (before/after)
-        "forget_EER_before_avg": forget_avg_before,
-        "forget_EER_after_avg": forget_avg_after,
-        "retain_EER_before_avg": retain_avg_before,
-        "retain_EER_after_avg": retain_avg_after,
+        "forget_EER_before": forget_avg_before,
+        "forget_EER_after": forget_avg_after,
+        "retain_EER_before": retain_avg_before,
+        "retain_EER_after": retain_avg_after,
+        # Linear probe AUC
+        "linear_probe_auc_before": auc_before,
+        "linear_probe_auc_after": auc_after,
         # global EERs (kept for reference if desired)
         "EER_before_raw": eer_before,
-        "EER_after_raw": eer_after
+        "EER_after_raw": eer_after,
+        # MIA scores
+        "mia_score_before": mia_score_before,
+        "mia_score_after": mia_score_after
     }
 
     # Save optional artifacts only when requested (single-run or debugging). For --run_all we set save_artifacts=False.
@@ -409,10 +597,11 @@ def run_all_forget_digits(args):
     csv_path = os.path.join(base_save_dir, "multi_run_results.csv")
     fieldnames = [
         "seed", "forget_digit",
-        "resnet_acc_forget_before", "resnet_acc_forget_after",
-        "resnet_acc_retain_before", "resnet_acc_retain_after",
-        "forget_EER_before_avg", "forget_EER_after_avg",
-        "retain_EER_before_avg", "retain_EER_after_avg",
+        "FA_before", "FA_after", "RA_before", "RA_after",
+        "forget_EER_before", "forget_EER_after",
+        "retain_EER_before", "retain_EER_after",
+        "linear_probe_auc_before", "linear_probe_auc_after",
+        "mia_score_before", "mia_score_after",
         "sae_training_time_seconds", "editing_time_seconds", "total_sae_edit_time_seconds", "error"
     ]
     write_header = not os.path.exists(csv_path)
@@ -432,7 +621,8 @@ def run_all_forget_digits(args):
                     sae_topk=args.sae_topk,
                     lambda_sparsity=args.lambda_sparsity,
                     sae_epochs=args.sae_epochs,
-                    device=args.device
+                    device=args.device,
+                    track_loss_history=False  # No need to track loss in multi-run
                 )
 
                 # Precompute normalized embeddings and train classifier once per seed (train on dev, validate on test)
@@ -474,14 +664,18 @@ def run_all_forget_digits(args):
                         row = {
                             "seed": seed,
                             "forget_digit": digit,
-                            "resnet_acc_forget_before": results.get("resnet_acc_forget_before", ""),
-                            "resnet_acc_forget_after": results.get("resnet_acc_forget_after", ""),
-                            "resnet_acc_retain_before": results.get("resnet_acc_retain_before", ""),
-                            "resnet_acc_retain_after": results.get("resnet_acc_retain_after", ""),
-                            "forget_EER_before_avg": results.get("forget_EER_before_avg", ""),
-                            "forget_EER_after_avg": results.get("forget_EER_after_avg", ""),
-                            "retain_EER_before_avg": results.get("retain_EER_before_avg", ""),
-                            "retain_EER_after_avg": results.get("retain_EER_after_avg", ""),
+                            "FA_before": results.get("FA_before", ""),
+                            "FA_after": results.get("FA_after", ""),
+                            "RA_before": results.get("RA_before", ""),
+                            "RA_after": results.get("RA_after", ""),
+                            "forget_EER_before": results.get("forget_EER_before", ""),
+                            "forget_EER_after": results.get("forget_EER_after", ""),
+                            "retain_EER_before": results.get("retain_EER_before", ""),
+                            "retain_EER_after": results.get("retain_EER_after", ""),
+                            "linear_probe_auc_before": results.get("linear_probe_auc_before", ""),
+                            "linear_probe_auc_after": results.get("linear_probe_auc_after", ""),
+                            "mia_score_before": results.get("mia_score_before", ""),
+                            "mia_score_after": results.get("mia_score_after", ""),
                             "sae_training_time_seconds": float(sae_train_time),
                             "editing_time_seconds": float(editing_time),
                             "total_sae_edit_time_seconds": float(total_time),
@@ -509,6 +703,167 @@ def run_all_forget_digits(args):
                 fh.flush()
 
     print(f"\n[MULTI] finished. consolidated CSV: {csv_path}")
+
+
+# Continual Unlearning Orchestration
+def run_continual_unlearning(args):
+    """
+    Orchestrates sequential, continual unlearning.
+    A fixed set of digits is unlearned one by one. After each unlearning step,
+    the unlearned digit is removed from the dataset for all subsequent steps.
+    The SAE and classifier are retrained at each step on the shrinking dataset.
+    """
+    base_save_dir = args.save_dir
+    os.makedirs(base_save_dir, exist_ok=True)
+    seed = args.seed
+    manifest_seed = args.split_seed
+
+    # Fixed list of digits for continual unlearning
+    digits_to_forget_continually = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    
+    print("[CONTINUAL] Starting continual unlearning process.")
+    print(f"[CONTINUAL] Digits to forget sequentially: {digits_to_forget_continually}")
+
+    # 1) Precompute embeddings & whitener once on the FULL dataset
+    initial_precomp = precompute_embeddings_and_whitener(
+        data_root=args.data_root,
+        embeddings_path=args.embeddings_path,
+        dev_frac_per_digit=args.dev_frac_per_digit,
+        manifest_seed=manifest_seed,
+        encoder=args.encoder,
+        device=args.device,
+        wav2vec2_model=args.wav2vec2_model,
+        hubert_model=args.hubert_model,
+        conformer_model=args.conformer_model
+    )
+
+    csv_path = os.path.join(base_save_dir, f"continual_unlearning_results_seed{seed}.csv")
+    fieldnames = [
+        "step", "forgotten_digit", "num_active_digits", "num_active_samples",
+        "FA_before", "FA_after", "RA_before", "RA_after",
+        "forget_EER_before", "forget_EER_after",
+        "retain_EER_before", "retain_EER_after",
+        "linear_probe_auc_before", "linear_probe_auc_after",
+        "mia_score_before", "mia_score_after",
+        "sae_training_time_seconds", "editing_time_seconds", "total_time_seconds", "error"
+    ]
+    
+    with open(csv_path, "w", newline='') as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+
+        previously_forgotten_digits = []
+        
+        for i, digit_to_forget in enumerate(digits_to_forget_continually):
+            step = i + 1
+            print(f"\n{'='*20} CONTINUAL STEP {step}/{len(digits_to_forget_continually)} {'='*20}")
+            print(f"[CONTINUAL] Forgetting digit: {digit_to_forget}")
+            print(f"[CONTINUAL] Previously forgotten: {previously_forgotten_digits}")
+            
+            try:
+                # A. Create the current view of the data by filtering out previously forgotten digits
+                if previously_forgotten_digits:
+                    active_mask = np.array([l not in previously_forgotten_digits for l in initial_precomp['labels']], dtype=bool)
+                    
+                    current_precomp = {
+                        "manifest": [m for m in initial_precomp['manifest'] if m['digit'] not in previously_forgotten_digits],
+                        "labels": list(np.array(initial_precomp['labels'])[active_mask]),
+                        "digits": sorted(list(set(np.array(initial_precomp['labels'])[active_mask]))),
+                        "E_all": initial_precomp['E_all'][active_mask],
+                        "Z_all": initial_precomp['Z_all'][active_mask],
+                        "mask_dev": initial_precomp['mask_dev'][active_mask],
+                        "mask_test": initial_precomp['mask_test'][active_mask],
+                        # Whitener (mu, W) is from the original full dataset, which is standard practice
+                        "mu": initial_precomp['mu'],
+                        "W": initial_precomp['W']
+                    }
+                else: # First step, use the full dataset
+                    current_precomp = copy.deepcopy(initial_precomp)
+
+                num_active_digits = len(current_precomp['digits'])
+                num_active_samples = len(current_precomp['labels'])
+                print(f"[CONTINUAL] Active dataset size: {num_active_digits} digits, {num_active_samples} samples.")
+
+                if digit_to_forget not in current_precomp['digits']:
+                    print(f"Warning: Digit {digit_to_forget} not in the current active set. Skipping.")
+                    previously_forgotten_digits.append(digit_to_forget)
+                    continue
+
+                # B. Train SAE on the current active dev set
+                print(f"[CONTINUAL] Training SAE for step {step}...")
+                sae, sae_train_time, A_all, dec_w = train_sae_for_seed(
+                    current_precomp, seed, args.sae_multiplier, args.sae_variant, args.sae_topk,
+                    args.lambda_sparsity, args.sae_epochs, args.device, track_loss_history=False
+                )
+
+                # C. Train Classifier on the current active dev set
+                print(f"[CONTINUAL] Training classifier for step {step}...")
+                E_all_norm_current = l2_normalize(current_precomp['E_all'])
+                all_digits_current = current_precomp['digits']
+                digit2id_current = {d: i for i, d in enumerate(all_digits_current)}
+                
+                mask_dev_current = current_precomp['mask_dev']
+                mask_test_current = current_precomp['mask_test']
+
+                X_cls_train = E_all_norm_current[mask_dev_current]
+                y_cls_train = [digit2id_current[d] for d in np.array(current_precomp['labels'])[mask_dev_current]]
+                X_cls_val = E_all_norm_current[mask_test_current]
+                y_cls_val = [digit2id_current[d] for d in np.array(current_precomp['labels'])[mask_test_current]]
+
+                clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val,
+                                        num_classes=len(all_digits_current), device=args.device, epochs=args.classifier_epochs,
+                                        batch_size=512, lr=1e-3)
+                
+                # D. Perform unlearning and get metrics
+                print(f"[CONTINUAL] Performing unlearning for step {step} on digit {digit_to_forget}...")
+                results, editing_time = single_forget_run(
+                    precomp=current_precomp, sae=sae, dec_w=dec_w, A_all=A_all, clf=clf,
+                    seed=seed, forget_digit=digit_to_forget,
+                    sae_params={"device": args.device, "build_U_top": args.build_U_top},
+                    edit_params={"beta": args.beta, "leace": not args.no_leace, "leace_ridge": args.leace_ridge, "noise_sigma": args.noise_sigma},
+                    compute_ms=False, save_artifacts=False
+                )
+                
+                # E. Log results for this step
+                row = {
+                    "step": step,
+                    "forgotten_digit": digit_to_forget,
+                    "num_active_digits": num_active_digits,
+                    "num_active_samples": num_active_samples,
+                    "FA_before": results.get("FA_before", ""),
+                    "FA_after": results.get("FA_after", ""),
+                    "RA_before": results.get("RA_before", ""),
+                    "RA_after": results.get("RA_after", ""),
+                    "forget_EER_before": results.get("forget_EER_before", ""),
+                    "forget_EER_after": results.get("forget_EER_after", ""),
+                    "retain_EER_before": results.get("retain_EER_before", ""),
+                    "retain_EER_after": results.get("retain_EER_after", ""),
+                    "linear_probe_auc_before": results.get("linear_probe_auc_before", ""),
+                    "linear_probe_auc_after": results.get("linear_probe_auc_after", ""),
+                    "mia_score_before": results.get("mia_score_before", ""),
+                    "mia_score_after": results.get("mia_score_after", ""),                    
+                    "sae_training_time_seconds": sae_train_time,
+                    "editing_time_seconds": editing_time,
+                    "total_time_seconds": sae_train_time + editing_time,
+                    "error": ""
+                }
+                writer.writerow(row)
+                fh.flush()
+
+                # F. Update state for the next iteration
+                previously_forgotten_digits.append(digit_to_forget)
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"[ERROR] Continual unlearning failed at step {step} for digit {digit_to_forget}: {e}\n{tb}")
+                err_row = {k: "" for k in fieldnames}
+                err_row.update({"step": step, "forgotten_digit": digit_to_forget, "error": str(e)})
+                writer.writerow(err_row)
+                fh.flush()
+                # Even on error, we mark digit as processed to continue the sequence
+                previously_forgotten_digits.append(digit_to_forget)
+
+    print(f"\n[CONTINUAL] Continual unlearning finished. Results saved to: {csv_path}")
 
 
 # ----------------------------
@@ -556,7 +911,8 @@ def run_pipeline(
         sae_topk=sae_topk,
         lambda_sparsity=lambda_sparsity,
         sae_epochs=sae_epochs,
-        device=device
+        device=device,
+        track_loss_history=False
     )
 
     # Train classifier once for this seed (dev->test)
@@ -622,16 +978,29 @@ if __name__ == "__main__":
     parser.add_argument("--forget_digits", nargs="*", default=["0"])
     parser.add_argument("--encoder", type=str, default="ecapa")
     parser.add_argument("--conformer_model", type=str, default="facebook/wav2vec2-conformer-rel-pos-large")
+    parser.add_argument("--hubert_model", type=str, default="facebook/hubert-base-ls960")
+    parser.add_argument("--wav2vec2_model", type=str, default="facebook/wav2vec2-base")
     parser.add_argument("--embeddings_path", type=str, default=None)
     # Multi-run flags
     parser.add_argument("--run_all", action="store_true", help="Run for all digits (one-forget-per-run) across seeds; optimized to reuse extractor/SAE per-seed")
     parser.add_argument("--seeds", nargs="+", type=int, default=[1337, 1338, 1339], help="Seeds to use for multi-run (space separated)")
     parser.add_argument("--classifier_epochs", type=int, default=20, help="Epochs to train classifier (used in multi-run per-seed classifier training)")
+    # Continual unlearning flag
+    parser.add_argument("--continual_unlearning", action="store_true", help="Run the continual unlearning experiment on a fixed sequence of digits.")
+    # Hyperparameter Sweep flag
+    parser.add_argument("--sae_hyperparameter_sweep", action="store_true", help="Run SAE hyperparameter sweep to generate validation loss curves for publication")
+    parser.add_argument("--sweep_multipliers", nargs="+", type=float, default=[1.0, 4.0, 8.0, 16.0], help="SAE multiplier values to sweep over")
+    parser.add_argument("--sweep_topks", nargs="+", type=int, default=[1, 4, 8, 16, 32, 64, 128, 256], help="SAE top-K values to sweep over")
+    parser.add_argument("--sweep_epochs", type=int, default=200, help="Number of epochs for hyperparameter sweep training")
 
     args = parser.parse_args()
 
-    if args.run_all:
+    if args.sae_hyperparameter_sweep:
+        run_sae_hyperparameter_analysis(args)
+    elif args.run_all:
         run_all_forget_digits(args)
+    elif args.continual_unlearning:
+        run_continual_unlearning(args)
     else:
         # Single-run
         run_pipeline(
@@ -641,7 +1010,5 @@ if __name__ == "__main__":
             build_U_top=args.build_U_top, beta=args.beta, leace=not args.no_leace, leace_ridge=args.leace_ridge,
             noise_sigma=args.noise_sigma, forget_digits=args.forget_digits,
             encoder=args.encoder, embeddings_path=args.embeddings_path,
-            wav2vec2_model=args.wav2vec2_model if hasattr(args, 'wav2vec2_model') else "facebook/wav2vec2-base",
-            hubert_model=args.hubert_model if hasattr(args, 'hubert_model') else "facebook/hubert-base-ls960",
-            conformer_model=args.conformer_model
+            wav2vec2_model=args.wav2vec2_model, hubert_model=args.hubert_model, conformer_model=args.conformer_model
         )
