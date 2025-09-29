@@ -1,5 +1,40 @@
-# Interpretability-guided-unlearning-audio
+# Interpretability-guided-unlearning-audio (Modular)
 
-- the original implementation of the pipeline from the V1 pdf
-- contains plots, numerical checks, diagnostic monosemanticity visuals
-- has both SAE variants, with SAE applied only at the end of final encoder layers 
+This repo performs class/speaker unlearning in audio with SAE-driven feature mining, LEACE edits, and comprehensive evaluations and interpretability.
+
+## Quickstart
+
+1) Choose a dataset config under `configs/`:
+- `configs/voxceleb.yaml`
+- `configs/speech_commands.yaml`
+- `configs/audiomnist.yaml`
+- `configs/librispeech.yaml`
+- `configs/lahaja.yaml`
+
+2) Run single unlearning (config-driven):
+
+```bash
+python src/cli/run.py --config configs/voxceleb.yaml
+```
+
+Set `orchestration.mode` to `multi` for all classes or `continual` for sequential forgetting.
+
+3) Interpretability over saved artifacts:
+
+```bash
+python src/cli/interpret.py --config configs/voxceleb.yaml
+```
+
+4) Grid search (basic, modular wrapper):
+
+```bash
+python src/cli/grid.py --config configs/voxceleb.yaml
+```
+
+## Structure
+- `src/core/*`: whitening, encoders, SAE, feature mining, edits, evals
+- `src/datasets/*`: dataset adapters (unified manifest + precompute)
+- `src/orchestration/*`: single, multi, continual flows
+- `src/cli/*`: config-driven entrypoints for training, analysis, and grid search
+
+All existing capabilities (SAE variants, hyperparam sweep, LEACE, gating, probing, classifier, MIA, interpretability analysis) are preserved and accessible via the new structure.
