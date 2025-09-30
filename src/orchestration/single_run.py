@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict
 import os, json
 import numpy as np
 from src.core.utils.seed import seed_all
@@ -13,9 +13,7 @@ from src.core.evals.verification import build_verification_trials, compute_score
 from src.core.edits.apply import apply_edits
 
 def run_single(adapter, cfg: Dict):
-    seed = cfg['experiment']['seed']
-    device = cfg['experiment']['device']
-    save_dir = cfg['experiment']['save_dir']
+    seed, device, save_dir = cfg['experiment']['seed'], cfg['experiment']['device'], cfg['experiment']['save_dir']
     seed_all(seed)
 
     pre = adapter.precompute(
@@ -71,7 +69,7 @@ def run_single(adapter, cfg: Dict):
         dev_indices = np.where(pre.mask_dev)[0]
         Y_dev = np.array([1 if all_labels[i] == forget_label else 0 for i in dev_indices], dtype=int).reshape(-1, 1)
         E_edit, info = apply_edits(
-            pre.Z_all, sae, feat_idx, U, pre.mu, pre.W,
+            pre.Z_all[pre.mask_dev], sae, feat_idx, U, pre.mu, pre.W,
             beta=cfg['edits']['beta'], do_leace=cfg['edits']['leace'], leace_params={'Y_dev': pre.Z_all[pre.mask_dev] @ U if U.shape[1]>0 else np.zeros((pre.mask_dev.sum(),0)), 'ridge': cfg['edits']['leace_ridge']}, noise_sigma=cfg['edits']['noise_sigma'], device=device
         )
         E_all_norm2 = E_edit / (np.linalg.norm(E_edit, axis=1, keepdims=True) + 1e-12)
