@@ -3,9 +3,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.linear_model import LogisticRegression
-from .classification import ResNetClassifier, train_classifier
+from .classification import SimpleClassifier, train_classifier
 
-def train_shadow_models(X_all: np.ndarray, labels: List[str], target_speaker: str, num_shadow_models: int = 5, shadow_train_ratio: float = 0.7, device: str = 'cuda', epochs: int = 15, seed: int = 42) -> List[ResNetClassifier]:
+def train_shadow_models(X_all: np.ndarray, labels: List[str], target_speaker: str, num_shadow_models: int = 5, shadow_train_ratio: float = 0.7, device: str = 'cuda', epochs: int = 15, seed: int = 42) -> List[SimpleClassifier]:
     rng = np.random.RandomState(seed)
     all_speakers = list(set(labels))
     non_target_speakers = [s for s in all_speakers if s != target_speaker]
@@ -29,7 +29,7 @@ def train_shadow_models(X_all: np.ndarray, labels: List[str], target_speaker: st
         shadow_models.append(shadow_model)
     return shadow_models
 
-def extract_mia_features(embeddings: np.ndarray, labels: List[str], target_speaker: str, shadow_models: List[ResNetClassifier], device: str = 'cuda') -> Tuple[np.ndarray, np.ndarray]:
+def extract_mia_features(embeddings: np.ndarray, labels: List[str], target_speaker: str, shadow_models: List[SimpleClassifier], device: str = 'cuda') -> Tuple[np.ndarray, np.ndarray]:
     if len(shadow_models) == 0:
         return np.array([]), np.array([])
     N = embeddings.shape[0]

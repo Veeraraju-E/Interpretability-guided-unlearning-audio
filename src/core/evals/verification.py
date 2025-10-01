@@ -76,5 +76,3 @@ def avg_eers(per_class_dict: Dict[str, Tuple[float, float]]) -> Tuple[float, flo
     avg_be = float(np.mean(be)) if len(be) > 0 else float('nan')
     avg_ae = float(np.mean(ae)) if len(ae) > 0 else float('nan')
     return avg_be, avg_ae
-
-

@@ -5,6 +5,15 @@ from .noise import inject_noise_in_subspace
 from ..preprocess.whitening import invert_whitener
 
 def apply_edits(Z_all: np.ndarray, sae, feat_idx, U, mu, W, *, beta: float, do_leace: bool, leace_params: dict, noise_sigma: float, device: str) -> tuple[np.ndarray, dict]:
+    """
+    Applies r_LEACE in U: r(z) = z - W_r^+ P W_r (z - mu_r), implemented as:
+    ZU' = (ZU - mu_r) @ P_r.T + mu_r,
+    Then map back.
+
+    Args:
+        For SAUCE edits: sae, feat_idx, beta
+        For LEACE edits: Z_all, U, mu, W, leace_params, noise_sigma
+    """
     Z_edit = Z_all.copy()
     info = {}
     if beta and beta > 0.0:
@@ -19,5 +28,3 @@ def apply_edits(Z_all: np.ndarray, sae, feat_idx, U, mu, W, *, beta: float, do_l
         Z_edit = inject_noise_in_subspace(Z_edit, U, sigma=noise_sigma)
     E_edit = invert_whitener(Z_edit, mu, W)
     return E_edit, info
-
-

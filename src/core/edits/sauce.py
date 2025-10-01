@@ -16,5 +16,3 @@ def apply_sauce_gating(sae_model: SAE, Z: np.ndarray, feat_idx: list[int], beta:
         z_hat = sae_model.decode(a)
         Z_out.append(z_hat.cpu().numpy())
     return np.vstack(Z_out) if len(Z_out) > 0 else np.zeros_like(Z)
-
-
