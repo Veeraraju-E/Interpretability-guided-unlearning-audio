@@ -34,5 +34,3 @@ def _hubert(entries, device='cuda', label_key='label', hubert_model: str = "face
 @register('wav2vec2-conformer')
 def _conformer(entries, device='cuda', label_key='label', conformer_model: str = "facebook/wav2vec2-conformer-rel-pos-large", **_):
     return extractors.extract_hf_embeddings(entries, model_name=conformer_model, device=device, label_key=label_key)
-
-

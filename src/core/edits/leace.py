@@ -1,6 +1,7 @@
 import numpy as np
 
 def leace_projector_in_U(Z: np.ndarray, U: np.ndarray, Y: np.ndarray, ridge: float = 1e-6):
+
     # ensure Z and Y are for same data split
     assert Z.shape[0] == Y.shape[0], "Z and Y must have the same number of samples"
 
@@ -11,10 +12,7 @@ def leace_projector_in_U(Z: np.ndarray, U: np.ndarray, Y: np.ndarray, ridge: flo
     Yc = Y - Y.mean(axis=0, keepdims=True)  # Y_centered
     N = ZU.shape[0]
     Sig = (ZUc.T @ ZUc) / max(1, N - 1) # emperical cross-covariance bw ZUc and itself
-    print(f"in leace.py, Sig: {Sig.shape}, Yc: {Yc.shape}, ZUc: {ZUc.shape}")   # [192, 192]; [25071, 912]; [25071, 192]
-    print(f"in leace.py, Sig: {Sig}")
-    print(f"in leace.py, ZUc: {ZUc}")
-    print(f"in leace.py, Yc: {Yc}")
+    # print(f"in leace.py, Sig: {Sig.shape}, Yc: {Yc.shape}, ZUc: {ZUc.shape}")   # [192, 192]; [B, 912]; [B, 192]
     Sig_ZY = (ZUc.T @ Yc) / max(1, N - 1) # emperical cross-covariance bw ZUc and Yc
     evals, evecs = np.linalg.eigh(Sig + ridge * np.eye(Sig.shape[0]))   # EVD on noise-added emperical cross-covariance
     evals = np.clip(evals, 1e-12, None)

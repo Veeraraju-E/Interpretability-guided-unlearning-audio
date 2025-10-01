@@ -29,5 +29,3 @@ def apply_whitener(X: np.ndarray, mu: np.ndarray, W: np.ndarray) -> np.ndarray:
 def invert_whitener(Z: np.ndarray, mu: np.ndarray, W: np.ndarray) -> np.ndarray:
     W_inv = np.linalg.pinv(W)
     return (Z @ W_inv.T) + mu
-
-

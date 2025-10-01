@@ -70,7 +70,7 @@ def run_single(adapter, cfg: Dict):
         Y_dev = np.array([1 if all_labels[i] == forget_label else 0 for i in dev_indices], dtype=int).reshape(-1, 1)
         E_edit, info = apply_edits(
             pre.Z_all[pre.mask_dev], sae, feat_idx, U, pre.mu, pre.W,
-            beta=cfg['edits']['beta'], do_leace=cfg['edits']['leace'], leace_params={'Y_dev': pre.Z_all[pre.mask_dev] @ U if U.shape[1]>0 else np.zeros((pre.mask_dev.sum(),0)), 'ridge': cfg['edits']['leace_ridge']}, noise_sigma=cfg['edits']['noise_sigma'], device=device
+            beta=cfg['edits']['beta'], do_leace=cfg['edits']['leace'], leace_params={'Y_dev': Y_dev, 'ridge': cfg['edits']['leace_ridge']}, noise_sigma=cfg['edits']['noise_sigma'], device=device
         )
         E_all_norm2 = E_edit / (np.linalg.norm(E_edit, axis=1, keepdims=True) + 1e-12)
 
