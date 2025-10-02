@@ -7,7 +7,7 @@ experiment:
 dataset:
   name: lahaja
   root_or_manifest: test  # HF split: train|validation|test
-  dev_frac: 0.75
+  dev_frac: 0.7
   forget_labels: [spk_001]
 
 encoder:
@@ -24,6 +24,7 @@ sae:
   lambda_sparsity: 0.0
   epochs: 100
   batch_size: 64
+  hidden_dim: 0
 
 feature_mining:
   build_U_top: 200

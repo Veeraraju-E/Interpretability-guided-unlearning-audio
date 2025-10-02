@@ -7,7 +7,7 @@ experiment:
 dataset:
   name: librispeech
   root_or_manifest: /data/veer/testing/new/datasets/librispeech_data_dev/LibriSpeech
-  dev_frac: 0.8
+  dev_frac: 0.7
   forget_labels: [174]
 
 encoder:
@@ -24,7 +24,8 @@ sae:
   lambda_sparsity: 0.0
   epochs: 100
   batch_size: 64
-
+  hidden_dim: 0
+  
 feature_mining:
   build_U_top: 200
 

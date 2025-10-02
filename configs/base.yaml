@@ -25,6 +25,7 @@ sae:
   lambda_sparsity: 0.0
   epochs: 100
   batch_size: 64
+  hidden_dim: 0
 
 feature_mining:
   build_U_top: 200
@@ -46,9 +47,6 @@ interpretability:
 
 grid_search:
   enabled: false
-  # override ranges here when enabled
   sae_multipliers: [2.0, 4.0, 8.0, 16.0, 32.0]
   sae_topks: [32, 64, 128, 256, 512]
   sweep_epochs: 100
-
-
