@@ -65,14 +65,14 @@ def run_single(adapter, cfg: Dict):
         prune_and_normalize_decoder(dec_w)
         U = build_U_from_decoder(dec_w, feat_idx)
 
-        # LEACE params
-        dev_indices = np.where(pre.mask_dev)[0]
-        Y_dev = np.array([1 if all_labels[i] == forget_label else 0 for i in dev_indices], dtype=int).reshape(-1, 1)
+        # LEACE params - create labels for the full dataset
+        Y_all = np.array([1 if all_labels[i] == forget_label else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
         E_edit, info = apply_edits(
-            pre.Z_all[pre.mask_dev], sae, feat_idx, U, pre.mu, pre.W,
-            beta=cfg['edits']['beta'], do_leace=cfg['edits']['leace'], leace_params={'Y_dev': Y_dev, 'ridge': cfg['edits']['leace_ridge']}, noise_sigma=cfg['edits']['noise_sigma'], device=device
+            pre.Z_all, sae, feat_idx, U, pre.mu, pre.W,
+            beta=cfg['edits']['beta'], do_leace=cfg['edits']['leace'], leace_params={'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, noise_sigma=cfg['edits']['noise_sigma'], device=device
         )
-        E_all_norm2 = E_edit / (np.linalg.norm(E_edit, axis=1, keepdims=True) + 1e-12)
+        E_all_edited = E_edit
+        E_all_norm2 = E_all_edited / (np.linalg.norm(E_all_edited, axis=1, keepdims=True) + 1e-12)
 
         # EERs
         test_mask_for_trials = M_ret_test | M_fgt_test
@@ -101,8 +101,8 @@ def run_single(adapter, cfg: Dict):
 
         # Probe AUC
         split_mask_dict = {'dev': pre.mask_dev, 'test': pre.mask_test}
-        _, auc_before = safe_linear_probe(pre.Z_all, all_labels, U, split_mask_dict, [forget_label])
-        _, auc_after = safe_linear_probe(pre.Z_all - pre.Z_all + (E_edit - E_edit) + pre.Z_all, all_labels, U, split_mask_dict, [forget_label])
+        _, auc_before = safe_linear_probe(E_all_norm, all_labels, U, split_mask_dict, [forget_label])
+        _, auc_after = safe_linear_probe(E_all_norm2, all_labels, U, split_mask_dict, [forget_label])
 
         res = {
             "FA_before": acc_fgt_before, "FA_after": acc_fgt_after,
@@ -122,7 +122,7 @@ def run_single(adapter, cfg: Dict):
         # interpretability dump: Z_all, Z_edit, U, labels, sets, manifest, forget_labels
         sets_np = np.array(sets)
         np.savez_compressed(os.path.join(run_save_dir, "interpretability_data.npz"),
-                            Z_all=pre.Z_all, Z_edit=(pre.Z_all - pre.Z_all + pre.Z_all), U=U,
+                            Z_all=pre.Z_all, Z_edit=E_all_edited, U=U,
                             labels=np.array(all_labels), sets=sets_np, manifest=np.array(pre.manifest, dtype=object), forget_spks=np.array([forget_label]))
         # SAE and whitener
         import torch
