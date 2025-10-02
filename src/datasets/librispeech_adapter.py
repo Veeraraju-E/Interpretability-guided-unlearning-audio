@@ -3,8 +3,8 @@ import os, glob, random
 import numpy as np
 from pathlib import Path
 from .adapter_base import DatasetAdapter, Precomp
-from core.encoders.registry import extract_embeddings
-from core.preprocess.whitening import fit_whitener, apply_whitener
+from ..core.encoders.registry import extract_embeddings
+from ..core.preprocess.whitening import fit_whitener, apply_whitener
 
 class LibriSpeechAdapter(DatasetAdapter):
     name = "librispeech"

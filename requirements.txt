@@ -1,0 +1,14 @@
+# Visualization dependencies for embedding analysis
+matplotlib
+seaborn
+pandas
+scikit-learn
+umap-learn
+numpy
+torch
+torchvision
+torchaudio
+speechbrain
+tqdm
+pandas
+transformers

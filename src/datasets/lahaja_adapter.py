@@ -1,10 +1,10 @@
 from typing import List, Dict, Optional
 import os, random
 import numpy as np
-from datasets import load_dataset
+import datasets
 from .adapter_base import DatasetAdapter, Precomp
-from core.encoders.registry import extract_embeddings
-from core.preprocess.whitening import fit_whitener, apply_whitener
+from ..core.encoders.registry import extract_embeddings
+from ..core.preprocess.whitening import fit_whitener, apply_whitener
 
 class LahajaAdapter(DatasetAdapter):
     name = "lahaja"
@@ -44,7 +44,7 @@ class LahajaAdapter(DatasetAdapter):
                 raise RuntimeError("embeddings .npz must contain 'labels' or 'y' array when embeddings_path is used")
             raw_entries = [{'path': f'dummy_{i}', 'label': labels[i], 'segment_id': ids[i] if ids is not None else None} for i in range(len(labels))]
         else:
-            ds = load_dataset("ai4bharat/Lahaja", split=split, streaming=True)
+            ds = datasets.load_dataset("ai4bharat/Lahaja", split=split, streaming=True)
             raw_entries = []
             for i, item in enumerate(ds):
                 audio_info = self._extract_audio_info_from_item(item, i)

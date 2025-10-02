@@ -11,6 +11,7 @@ from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
 from src.core.evals.verification import build_verification_trials, compute_scores, eer_from_scores, per_class_eers, avg_eers
 from src.core.edits.apply import apply_edits
+from src.core.visualization import create_embedding_visualizations, create_embedding_summary_stats
 
 def run_single(adapter, cfg: Dict):
     seed, device, save_dir = cfg['experiment']['seed'], cfg['experiment']['device'], cfg['experiment']['save_dir']
@@ -161,6 +162,48 @@ def run_single(adapter, cfg: Dict):
         import torch
         torch.save(sae.state_dict(), os.path.join(run_save_dir, "sae_state_dict.pt"))
         np.savez_compressed(os.path.join(run_save_dir, "whitener.npz"), mu=pre.mu, W=pre.W)
+        
+        # Create embedding visualizations
+        print(f"[VIZ] Creating embedding visualizations for forget label: {forget_label}")
+        try:
+            viz_dir = os.path.join(run_save_dir, "visualizations")
+            os.makedirs(viz_dir, exist_ok=True)
+            
+            # Create visualizations using normalized embeddings
+            plot_paths = create_embedding_visualizations(
+                embeddings_before=E_all_norm,
+                embeddings_after=E_all_norm2,
+                labels=all_labels,
+                forget_labels=[forget_label],
+                save_dir=viz_dir,
+                title_prefix=f"Unlearning Analysis - {forget_label}"
+            )
+            
+            # Create summary statistics
+            stats = create_embedding_summary_stats(
+                embeddings_before=E_all_norm,
+                embeddings_after=E_all_norm2,
+                labels=all_labels,
+                forget_labels=[forget_label],
+                save_dir=viz_dir
+            )
+            
+            # Add visualization paths to results
+            res["visualization_paths"] = plot_paths
+            res["embedding_statistics"] = stats
+            
+            print(f"[VIZ] Visualizations saved to: {viz_dir}")
+            for plot_name, plot_path in plot_paths.items():
+                print(f"  - {plot_name}: {plot_path}")
+            
+            # Print summary information
+            if 'summary' in plot_paths:
+                print(f"[VIZ] Summary page: {plot_paths['summary']}")
+            print(f"[VIZ] Statistics: {stats}")
+                
+        except Exception as e:
+            print(f"[VIZ] Warning: Failed to create visualizations: {e}")
+            res["visualization_error"] = str(e)
 
     return results_all
 

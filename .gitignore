@@ -3,3 +3,4 @@ __pycache__
 pretrained_models
 *plots*
 *runs*
+.venv
