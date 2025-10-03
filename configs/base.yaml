@@ -25,7 +25,7 @@ sae:
   lambda_sparsity: 0.0
   epochs: 100
   batch_size: 64
-  hidden_dim: 0
+  hidden_dim: 0 # if handling activation space dimentions through multiplier, set to 0
 
 feature_mining:
   build_U_top: 200

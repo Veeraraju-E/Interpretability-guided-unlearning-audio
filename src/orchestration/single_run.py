@@ -176,7 +176,7 @@ def run_single(adapter, cfg: Dict):
                 labels=all_labels,
                 forget_labels=[forget_label],
                 save_dir=viz_dir,
-                title_prefix=f"Unlearning Analysis - {forget_label}"
+                title_prefix=f"Class {forget_label}"
             )
             
             # Create summary statistics
