@@ -34,7 +34,5 @@ python src/cli/grid.py --config configs/voxceleb.yaml
 ## Structure
 - `src/core/*`: whitening, encoders, SAE, feature mining, edits, evals
 - `src/datasets/*`: dataset adapters (unified manifest + precompute)
-- `src/orchestration/*`: single, multi, continual flows
+- `src/orchestration/*`: single, multi, continual unlearning flows
 - `src/cli/*`: config-driven entrypoints for training, analysis, and grid search
-
-All existing capabilities (SAE variants, hyperparam sweep, LEACE, gating, probing, classifier, MIA, interpretability analysis) are preserved and accessible via the new structure.
