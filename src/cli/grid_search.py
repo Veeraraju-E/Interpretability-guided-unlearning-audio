@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from src.datasets.voxceleb_adapter import build_manifest
 from src.core.utils.seed import seed_all
-from core.encoders.registry import extract_embeddings
+from src.core.encoders.registry import extract_embeddings
 from src.core.preprocess.whitening import fit_whitener, apply_whitener, invert_whitener
 from src.core.sae.model import SAE
 from src.core.sae.train import train_sae

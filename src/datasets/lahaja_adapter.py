@@ -1,10 +1,18 @@
 from typing import List, Dict, Optional
 import os, random
 import numpy as np
-import datasets
 from .adapter_base import DatasetAdapter, Precomp
 from src.core.encoders.registry import extract_embeddings
 from src.core.preprocess.whitening import fit_whitener, apply_whitener
+from rich.console import Console
+
+console = Console()
+
+# Import datasets with explicit import to avoid conflicts
+try:
+    from datasets import load_dataset
+except ImportError:
+    raise ImportError("datasets library not found. Please install with: pip install datasets")
 
 class LahajaAdapter(DatasetAdapter):
     name = "lahaja"
@@ -12,27 +20,45 @@ class LahajaAdapter(DatasetAdapter):
 
     def _extract_audio_info_from_item(self, item: Dict, index: int = 0) -> Optional[Dict]:
         audio_info = {}
-        for key in ['audio', 'audio_filepath']:
-            if key in item and isinstance(item[key], dict):
-                audio_dict = item[key]
-                if 'array' in audio_dict and 'sampling_rate' in audio_dict:
-                    audio_info['array'] = audio_dict['array']
-                    audio_info['sampling_rate'] = audio_dict['sampling_rate']
-                    audio_info['path'] = audio_dict.get('path', f"audio_{index}")
-                    return audio_info
-        if 'array' in item and 'sampling_rate' in item:
-            audio_info['array'] = item['array']
-            audio_info['sampling_rate'] = item['sampling_rate']
-            audio_info['path'] = item.get('path', f"audio_{index}")
-            return audio_info
-        for key in ('path', 'file', 'audio_filepath', 'audio_path', 'audio'):
+        
+        # Lahaja dataset uses 'audio_filepath' key with AudioDecoder object
+        if 'audio_filepath' in item:
+            audio_decoder = item['audio_filepath']
+            # The AudioDecoder object has array and sampling_rate attributes directly
+            try:
+                # Access the audio data directly from the decoder
+                audio_array = audio_decoder['array']
+                sampling_rate = audio_decoder['sampling_rate']
+                
+                audio_info['array'] = audio_array
+                audio_info['sampling_rate'] = sampling_rate
+                audio_info['path'] = f"lahaja_audio_{index}"
+                return audio_info
+            except Exception as e:
+                print(f"Warning: Could not decode audio for item {index}: {e}")
+                return None
+        
+        # Fallback: try other possible audio keys
+        audio_keys = ['audio', 'audio_path', 'file', 'path']
+        for key in audio_keys:
             if key in item:
                 val = item[key]
-                if isinstance(val, str):
-                    audio_info['path'] = val; return audio_info
                 if isinstance(val, dict):
-                    if 'path' in val and isinstance(val['path'], str):
-                        audio_info['path'] = val['path']; return audio_info
+                    # Handle audio dict with array and sampling_rate
+                    if 'array' in val and 'sampling_rate' in val:
+                        audio_info['array'] = val['array']
+                        audio_info['sampling_rate'] = val['sampling_rate']
+                        audio_info['path'] = val.get('path', f"lahaja_audio_{index}")
+                        return audio_info
+                    # Handle audio dict with path
+                    elif 'path' in val and isinstance(val['path'], str):
+                        audio_info['path'] = val['path']
+                        return audio_info
+                elif isinstance(val, str):
+                    # Handle direct path string
+                    audio_info['path'] = val
+                    return audio_info
+        
         return None
 
     def build_manifest(self, split: str, embeddings_path: Optional[str], dev_frac: float, seed: int) -> List[Dict]:
@@ -44,17 +70,40 @@ class LahajaAdapter(DatasetAdapter):
                 raise RuntimeError("embeddings .npz must contain 'labels' or 'y' array when embeddings_path is used")
             raw_entries = [{'path': f'dummy_{i}', 'label': labels[i], 'segment_id': ids[i] if ids is not None else None} for i in range(len(labels))]
         else:
-            ds = datasets.load_dataset("ai4bharat/Lahaja", split=split, streaming=True)
+            print(f"Loading Lahaja dataset with split: {split}")
+            try:
+                ds = load_dataset("ai4bharat/Lahaja", split=split, streaming=True)
+                print("Dataset loaded successfully")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load Lahaja dataset: {e}. Please ensure you have access to the dataset and have accepted the terms.")
+            
             raw_entries = []
+            speaker_ids = set()
             for i, item in enumerate(ds):
+                # if i % 100 == 0:  # Progress indicator
+                #     print(f"Processing item {i}...")
+                
                 audio_info = self._extract_audio_info_from_item(item, i)
                 if audio_info is None:
+                    console.print(f"[red] Warning: Could not extract audio info for item {i}")
                     continue
+                    
+                # Extract speaker ID - Lahaja uses 'sp_id' field
+                speaker_id = item.get('sp_id')
+                if speaker_id is None:
+                    console.print(f"[red] Warning: No speaker ID found for item {i}, skipping...")
+                    continue
+                
+                speaker_ids.add(str(speaker_id))
                 raw_entries.append({
                     'path': audio_info.get('path', f"lahaja_{i}"),
-                    'label': item.get('sp_id') or item.get('spk_id') or item.get('speaker') or item.get('speaker_id'),
-                    'segment_id': f"lahaja_{i}"
+                    'label': str(speaker_id),  # Convert to string for consistency
+                    'segment_id': f"lahaja_{i}",
+                    'audio_array': audio_info.get('array'),  # Store the actual audio data
+                    'sampling_rate': audio_info.get('sampling_rate')  # Store the sampling rate
                 })
+            
+            console.print(f"[green] Found {len(speaker_ids)} unique speakers: {sorted(list(speaker_ids))[:10]}...")  # Show first 10 speakers
         valid_manifest = [m for m in raw_entries if m.get('label') is not None]
         by = {}
         for i, m in enumerate(valid_manifest):

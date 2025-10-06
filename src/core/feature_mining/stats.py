@@ -10,18 +10,33 @@ except Exception:
 
 def cohens_d(x_pos: np.ndarray, x_neg: np.ndarray) -> float:
     n1, n2 = len(x_pos), len(x_neg)
+    
+    # Fail fast for empty arrays - this indicates a data issue
+    if n1 == 0:
+        raise ValueError("Cannot compute Cohen's d: positive samples array is empty. This suggests a data filtering or sampling issue.")
+    if n2 == 0:
+        raise ValueError("Cannot compute Cohen's d: negative samples array is empty. This suggests a data filtering or sampling issue.")
+    
     m1, m2 = x_pos.mean(), x_neg.mean()
     s1, s2 = x_pos.var(ddof=1), x_neg.var(ddof=1)
     s_pooled = math.sqrt(((n1-1)*s1 + (n2-1)*s2) / max(1, n1+n2-2))
-    if s_pooled == 0: return 0.0
+    if s_pooled == 0: 
+        raise ValueError("Cannot compute Cohen's d: pooled standard deviation is zero. This indicates no variance in the data.")
     return float((m1 - m2) / s_pooled)
 
 def mann_whitney_u_p(x_pos: np.ndarray, x_neg: np.ndarray) -> tuple[float,float]:
+    n1, n2 = len(x_pos), len(x_neg)
+    
+    # Fail fast for empty arrays - this indicates a data issue
+    if n1 == 0:
+        raise ValueError("Cannot compute Mann-Whitney U: positive samples array is empty. This suggests a data filtering or sampling issue.")
+    if n2 == 0:
+        raise ValueError("Cannot compute Mann-Whitney U: negative samples array is empty. This suggests a data filtering or sampling issue.")
+    
     x = np.concatenate([x_pos, x_neg])
     labels = np.concatenate([np.ones(len(x_pos)), np.zeros(len(x_neg))])
     ranks = np.argsort(np.argsort(x)) + 1
     r1 = ranks[labels==1].sum()
-    n1, n2 = len(x_pos), len(x_neg)
     U1 = r1 - n1*(n1+1)/2
     auc = U1 / (n1*n2 + 1e-12)
     mu = n1*n2/2
@@ -32,15 +47,26 @@ def mann_whitney_u_p(x_pos: np.ndarray, x_neg: np.ndarray) -> tuple[float,float]
     return auc, p
 
 def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray) -> Dict:
+    # Validate input arrays
+    if A_pos.shape[0] == 0:
+        raise ValueError("Cannot compute feature statistics: positive samples array is empty. This suggests a data filtering or sampling issue.")
+    if A_neg.shape[0] == 0:
+        raise ValueError("Cannot compute feature statistics: negative samples array is empty. This suggests a data filtering or sampling issue.")
+    
     m = A_pos.shape[1]
     stats = {"cohens_d": np.zeros(m), "auc": np.zeros(m), "pval": np.ones(m)}
     for j in range(m):
         x_pos = A_pos[:, j]; x_neg = A_neg[:, j]
         stats["cohens_d"][j] = cohens_d(x_pos, x_neg)
+        
+        # ROC AUC computation - let it fail if there are issues
         try:
-            stats["auc"][j] = float(roc_auc_score(np.concatenate([np.ones(len(x_pos)), np.zeros(len(x_neg))]), np.concatenate([x_pos, x_neg])))
-        except Exception:
-            stats["auc"][j] = 0.5
+            y_true = np.concatenate([np.ones(len(x_pos)), np.zeros(len(x_neg))])
+            y_scores = np.concatenate([x_pos, x_neg])
+            stats["auc"][j] = float(roc_auc_score(y_true, y_scores))
+        except Exception as e:
+            raise ValueError(f"Cannot compute ROC AUC for feature {j}: {e}. This suggests data quality issues.")
+            
         _, p = mann_whitney_u_p(x_pos, x_neg)
         stats["pval"][j] = p
     return stats

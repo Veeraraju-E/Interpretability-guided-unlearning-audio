@@ -12,3 +12,5 @@ speechbrain
 tqdm
 pandas
 transformers
+typer
+rich

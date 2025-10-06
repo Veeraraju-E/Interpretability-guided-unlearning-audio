@@ -84,8 +84,24 @@ def run_single(adapter, cfg: Dict):
     results_all = {}
     forget_list = cfg['dataset']['forget_labels']
     os.makedirs(save_dir, exist_ok=True)
+    
+    # Debug: Print label types and values
+    print(f"Debug: forget_list = {forget_list}")
+    print(f"Debug: all_labels sample = {all_labels[:5]}")
+    print(f"Debug: all_labels types = {[type(lbl) for lbl in all_labels[:5]]}")
+    print(f"Debug: unique labels = {set(all_labels)}")
+    
     for forget_label in forget_list:
-        sets = [f"{'forget' if lbl == forget_label else 'retain'}:{'dev' if pre.mask_dev[i] else 'test'}" for i, lbl in enumerate(all_labels)]
+        # Convert forget_label to string for comparison
+        forget_label_str = str(forget_label)
+        print(f"Debug: Processing forget_label = {forget_label_str}")
+        
+        sets = [f"{'forget' if str(lbl) == forget_label_str else 'retain'}:{'dev' if pre.mask_dev[i] else 'test'}" for i, lbl in enumerate(all_labels)]
+        
+        # Debug: Count forget/retain samples
+        forget_count = sum(1 for s in sets if s.startswith('forget'))
+        retain_count = sum(1 for s in sets if s.startswith('retain'))
+        print(f"Debug: forget_count = {forget_count}, retain_count = {retain_count}")
         M_ret_dev = np.array([s == 'retain:dev' for s in sets], dtype=bool)
         M_fgt_dev = np.array([s == 'forget:dev' for s in sets], dtype=bool)
         M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
@@ -169,21 +185,29 @@ def run_single(adapter, cfg: Dict):
             viz_dir = os.path.join(run_save_dir, "visualizations")
             os.makedirs(viz_dir, exist_ok=True)
             
-            # Create visualizations using normalized embeddings
+            # Filter to only use test data for visualizations
+            test_mask = pre.mask_test
+            E_test_before = E_all_norm[test_mask]
+            E_test_after = E_all_norm2[test_mask]
+            test_labels = [all_labels[i] for i in range(len(all_labels)) if test_mask[i]]
+            
+            print(f"[VIZ] Using {len(E_test_before)} test samples for visualizations")
+            
+            # Create visualizations using test-only normalized embeddings
             plot_paths = create_embedding_visualizations(
-                embeddings_before=E_all_norm,
-                embeddings_after=E_all_norm2,
-                labels=all_labels,
+                embeddings_before=E_test_before,
+                embeddings_after=E_test_after,
+                labels=test_labels,
                 forget_labels=[forget_label],
                 save_dir=viz_dir,
                 title_prefix=f"Class {forget_label}"
             )
             
-            # Create summary statistics
+            # Create summary statistics using test-only data
             stats = create_embedding_summary_stats(
-                embeddings_before=E_all_norm,
-                embeddings_after=E_all_norm2,
-                labels=all_labels,
+                embeddings_before=E_test_before,
+                embeddings_after=E_test_after,
+                labels=test_labels,
                 forget_labels=[forget_label],
                 save_dir=viz_dir
             )
