@@ -24,6 +24,7 @@ The framework supports multiple datasets with pre-configured settings:
 - `configs/speech_commands.yaml` - Speech Commands recognition
 - `configs/librispeech.yaml` - LibriSpeech speaker identification
 - `configs/lahaja.yaml` - Lahaja speech recognition
+- `configs/mls_spanish.yaml` - MLS Spanish speaker identification
 
 ### 2. Run Unlearning Experiments
 
