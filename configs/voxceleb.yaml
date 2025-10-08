@@ -1,6 +1,6 @@
 experiment:
   name: voxceleb_exp
-  save_dir: ./runs/voxceleb
+  save_dir: ./runs/voxceleb2
   device: cuda
   seed: 1337
 
@@ -8,7 +8,7 @@ dataset:
   name: voxceleb
   root_or_manifest: /data/veer/testing/new/datasets/voxceleb2/manifest.csv
   dev_frac: 0.7
-  forget_labels: [id00017]
+  forget_labels: ['id00017']
 
 encoder:
   name: ecapa

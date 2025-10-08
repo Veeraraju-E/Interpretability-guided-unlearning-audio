@@ -1,7 +1,7 @@
-from typing import List, Tuple, Dict
+from typing import List, Dict, Tuple
 import numpy as np
 from itertools import combinations
-from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score
+from sklearn.metrics import roc_curve
 
 def compute_scores(embeddings: np.ndarray, trials: List[Tuple[int, int]]):
     return np.array([float(np.dot(embeddings[i], embeddings[j])) for i, j in trials])

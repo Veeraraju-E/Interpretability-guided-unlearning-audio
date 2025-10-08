@@ -1,5 +1,6 @@
 from typing import List, Dict, Optional
-import os, random
+import random
+import os
 from pathlib import Path
 import numpy as np
 from .adapter_base import DatasetAdapter, Precomp
@@ -40,12 +41,38 @@ class SpeechCommandsAdapter(DatasetAdapter):
             n_dev = max(1, int(len(group) * dev_frac))
             if len(group) > 1 and n_dev >= len(group):
                 n_dev = len(group) - 1
+            
+            # Ensure at least one sample goes to dev and one to test for each class
+            # This prevents the issue where all samples of a rare class end up in one split
+            if len(group) >= 2:
+                # Ensure we have at least one sample in each split
+                n_dev = max(1, min(n_dev, len(group) - 1))
+            
             for e in group[:n_dev]:
                 ec = e.copy(); ec['split'] = 'dev'; manifest.append(ec)
             for e in group[n_dev:]:
                 ec = e.copy(); ec['split'] = 'test'; manifest.append(ec)
         if len(manifest) == 0:
             raise RuntimeError("No entries found in manifest")
+        
+        # Debug: Print distribution of samples across splits
+        dev_count = sum(1 for m in manifest if m['split'] == 'dev')
+        test_count = sum(1 for m in manifest if m['split'] == 'test')
+        print(f"Debug: Dataset split - dev: {dev_count}, test: {test_count}")
+        
+        # Debug: Print per-class distribution
+        by_label_split = {}
+        for m in manifest:
+            label = m['label']
+            split = m['split']
+            if label not in by_label_split:
+                by_label_split[label] = {'dev': 0, 'test': 0}
+            by_label_split[label][split] += 1
+        
+        print(f"Debug: Per-class distribution:")
+        for label, counts in sorted(by_label_split.items()):
+            print(f"  {label}: dev={counts['dev']}, test={counts['test']}")
+        
         return manifest
 
     def precompute(self, data_root: str, embeddings_path: Optional[str], dev_frac: float, seed: int, encoder_cfg: Dict, device: str) -> Precomp:

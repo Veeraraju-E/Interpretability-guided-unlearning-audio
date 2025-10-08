@@ -1,0 +1,41 @@
+experiment:
+  name: mls_spanish_exp
+  save_dir: ./runs/mls_spanish/multi_run
+  device: cuda
+  seed: 1337
+
+dataset:
+  name: mls_spanish
+  root_or_manifest: /data/veer/testing/new/datasets/mls_spanish/dev/audio
+  dev_frac: 0.7
+  forget_labels: ['2592'] # moot when mode is multi
+
+encoder:
+  name: wav2vec2
+  wav2vec2_model: facebook/wav2vec2-large-xlsr-53-spanish
+  hubert_model: facebook/hubert-base-ls960
+  conformer_model: facebook/wav2vec2-conformer-rel-pos-large
+  embeddings_path: null
+
+sae:
+  variant: topk
+  multiplier: 10.0
+  topk: 128
+  lambda_sparsity: 0.0
+  epochs: 500
+  batch_size: 64
+  hidden_dim: 0
+  
+feature_mining:
+  build_U_top: 200
+
+edits:
+  beta: 0.0
+  leace: true
+  leace_ridge: 1e-6
+  noise_sigma: 0.02
+
+orchestration:
+  mode: multi
+  seeds: [1337, 1338, 1339]
+  classifier_epochs: 20

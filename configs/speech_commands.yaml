@@ -8,7 +8,7 @@ dataset:
   name: speech_commands
   root_or_manifest: /data/veer/testing/new/datasets/speech_commands
   dev_frac: 0.7
-  forget_labels: [yes]
+  forget_labels: ["yes"]
 
 encoder:
   name: ecapa
@@ -22,7 +22,7 @@ sae:
   multiplier: 10.0
   topk: 128
   lambda_sparsity: 0.0
-  epochs: 100
+  epochs: 250
   batch_size: 64
   hidden_dim: 0
 
