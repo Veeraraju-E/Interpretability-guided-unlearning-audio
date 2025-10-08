@@ -1,5 +1,5 @@
 from typing import List, Dict, Optional
-import os, random
+import random
 from pathlib import Path
 import numpy as np
 from .adapter_base import DatasetAdapter, Precomp

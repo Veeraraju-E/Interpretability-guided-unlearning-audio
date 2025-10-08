@@ -8,11 +8,11 @@ dataset:
   name: mls_spanish
   root_or_manifest: /data/veer/testing/new/datasets/mls_spanish/dev/audio
   dev_frac: 0.7
-  forget_labels: [10367]  # Example speaker to forget - adjust as needed
+  forget_labels: ['2592']
 
 encoder:
-  name: ecapa
-  wav2vec2_model: facebook/wav2vec2-base
+  name: wav2vec2
+  wav2vec2_model: facebook/wav2vec2-large-xlsr-53-spanish
   hubert_model: facebook/hubert-base-ls960
   conformer_model: facebook/wav2vec2-conformer-rel-pos-large
   embeddings_path: null
@@ -22,10 +22,10 @@ sae:
   multiplier: 10.0
   topk: 128
   lambda_sparsity: 0.0
-  epochs: 100
+  epochs: 1000
   batch_size: 64
   hidden_dim: 0
-
+  
 feature_mining:
   build_U_top: 200
 
@@ -36,16 +36,6 @@ edits:
   noise_sigma: 0.02
 
 orchestration:
-  mode: single
+  mode: multi
   seeds: [1337, 1338, 1339]
   classifier_epochs: 20
-
-interpretability:
-  run: true
-  out_subdir: interpretability_analysis
-
-grid_search:
-  enabled: false
-  sae_multipliers: [2.0, 4.0, 8.0, 16.0, 32.0]
-  sae_topks: [32, 64, 128, 256, 512]
-  sweep_epochs: 100

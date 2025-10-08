@@ -7,7 +7,7 @@ import os
 import sys
 import yaml
 from pathlib import Path
-from typing import Optional, List, Literal
+from typing import Optional
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -22,6 +22,7 @@ from src.datasets.speech_commands_adapter import SpeechCommandsAdapter
 from src.datasets.audiomnist_adapter import AudioMNISTAdapter
 from src.datasets.librispeech_adapter import LibriSpeechAdapter
 from src.datasets.lahaja_adapter import LahajaAdapter
+from src.datasets.mls_spanish_adapter import MLSSpanishAdapter
 from src.orchestration.single_run import run_single
 from src.orchestration.multi_run import run_multi
 from src.orchestration.continual import run_continual
@@ -42,6 +43,7 @@ ADAPTERS = {
     'audiomnist': AudioMNISTAdapter(),
     'librispeech': LibriSpeechAdapter(),
     'lahaja': LahajaAdapter(),
+    'mls_spanish': MLSSpanishAdapter(),
 }
 
 def load_config(path: str) -> dict:
@@ -153,7 +155,7 @@ def run(
     try:
         if mode == 'single':
             console.print("[yellow]Running single unlearning experiment...[/yellow]")
-            results = run_single(adapter, cfg)
+            results = run_single(adapter, cfg, verbose=verbose)
             console.print(f"[green] Single unlearning completed. Results: {len(results)} classes processed[/green]")
             
         elif mode == 'multi':

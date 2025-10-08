@@ -8,7 +8,7 @@ dataset:
   name: librispeech
   root_or_manifest: /data/veer/testing/new/datasets/librispeech_data_dev/LibriSpeech
   dev_frac: 0.7
-  forget_labels: [174]
+  forget_labels: ['6319']
 
 encoder:
   name: ecapa
@@ -19,10 +19,10 @@ encoder:
 
 sae:
   variant: topk
-  multiplier: 10.0
+  multiplier: 4.0
   topk: 128
   lambda_sparsity: 0.0
-  epochs: 100
+  epochs: 80
   batch_size: 64
   hidden_dim: 0
   

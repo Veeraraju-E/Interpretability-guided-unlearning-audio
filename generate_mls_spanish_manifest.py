@@ -1,73 +1,41 @@
 #!/usr/bin/env python3
-"""
-Generate manifest for MLS Spanish dataset.
-Similar to generate_voxceleb_manifest.py but adapted for MLS Spanish structure.
-"""
-
 import os
 import csv
-import glob
-from pathlib import Path
+
+# Root MLS Spanish directory
+ROOT_DIR = "/data/veer/testing/new/datasets/mls_spanish/dev/audio"
+OUT_MANIFEST = "mls_spanish_manifest.csv"
 
 def make_manifest(root_dir, out_path):
-    """
-    Generate manifest for MLS Spanish dataset.
-    
-    Args:
-        root_dir: Path to MLS Spanish dev/audio directory
-        out_path: Output CSV file path
-    """
     rows = []
-    
-    # MLS Spanish structure: /dev/audio/{speaker_id}/{subfolder_id}/*.flac
-    pattern = os.path.join(root_dir, "*", "*", "*.flac")
-    audio_files = glob.glob(pattern)
-    
-    print(f"Found {len(audio_files)} audio files")
-    
-    for audio_file in sorted(audio_files):
-        path_parts = Path(audio_file).parts
-        if len(path_parts) >= 3:
-            speaker_id = path_parts[-3]  # speaker folder name
-            filename = os.path.basename(audio_file)
-            
-            # Create a unique segment ID
-            segment_id = f"{speaker_id}_{filename}"
-            
-            # Add to manifest
-            rows.append([
-                segment_id,  # segment_id
-                audio_file,  # path
-                speaker_id,  # speaker_id (same as label)
-                speaker_id,  # label
-                speaker_id   # speaker (for compatibility)
-            ])
-    
-    # Write CSV
-    with open(out_path, 'w', newline='') as f:
+    for speaker in os.listdir(root_dir):
+        spk_dir = os.path.join(root_dir, speaker)
+        if not os.path.isdir(spk_dir):
+            continue
+        for book in os.listdir(spk_dir):
+            book_dir = os.path.join(spk_dir, book)
+            if not os.path.isdir(book_dir):
+                continue
+            for flacfile in os.listdir(book_dir):
+                if not flacfile.endswith(".flac"):
+                    continue
+                flac_path = os.path.join(book_dir, flacfile)
+                segment_id = os.path.splitext(flacfile)[0]   # e.g., "10367_10282_000000"
+                rows.append([
+                    segment_id,     # segment_id
+                    flac_path,      # flac_path
+                    "",             # start (empty = default 0.0)
+                    "",             # end (empty = None)
+                    speaker,        # speaker_id (e.g., 10367)
+                    book            # book_id (e.g., 10282)
+                ])
+
+    with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(['segment_id', 'path', 'speaker_id', 'label', 'speaker'])
-        writer.writerows(rows)
-    
+        for row in rows:
+            writer.writerow(row)
+
     print(f"Manifest written with {len(rows)} entries to {out_path}")
-    
-    # Print some statistics
-    speakers = set(row[2] for row in rows)
-    print(f"Found {len(speakers)} unique speakers: {sorted(speakers)}")
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) != 3:
-        print("Usage: python generate_mls_spanish_manifest.py <root_dir> <out_path>")
-        print("Example: python generate_mls_spanish_manifest.py /data/veer/testing/new/datasets/mls_spanish/dev/audio /data/veer/testing/new/datasets/mls_spanish/manifest.csv")
-        sys.exit(1)
-    
-    root_dir = sys.argv[1]
-    out_path = sys.argv[2]
-    
-    if not os.path.exists(root_dir):
-        print(f"Error: Root directory {root_dir} does not exist")
-        sys.exit(1)
-    
-    make_manifest(root_dir, out_path)
+    make_manifest(ROOT_DIR, OUT_MANIFEST)

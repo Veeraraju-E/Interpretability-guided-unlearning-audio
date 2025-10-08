@@ -1,7 +1,7 @@
-from typing import Tuple, Dict
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import trange
 from torch.utils.data import DataLoader, TensorDataset
 from .model import SAE
 
@@ -23,7 +23,9 @@ def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 
         'epochs': [], 'train_loss': [], 'val_loss': [], 'train_l1_loss': [], 'val_l1_loss': [], 'dead_latent_fraction': []
     } if return_loss_history else None
 
-    for epoch in range(1, epochs + 1):
+
+    pbar = trange(1, epochs + 1, desc="Epoch", position=0)
+    for epoch in pbar:
         model.train(); acc_loss = 0.0; acc_l1 = 0.0; n = 0
         for (z_batch,) in dl:
             z_batch = z_batch.to(device)
@@ -56,6 +58,12 @@ def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 
                 all_a.append(a.cpu())
         val_loss = acc_v / max(1, n_v)
         val_l1 = acc_v_l1 / max(1, n_v)
+
+        # Update tqdm bar with only epoch, train_loss, val_loss
+        pbar.set_postfix({
+            "train_loss": f"{train_loss:.4f}",
+            "val_loss": f"{val_loss:.4f}"
+        })
 
         A = torch.cat(all_a, dim=0)
         dead_mask = (A.abs().mean(dim=0) < 1e-5)
