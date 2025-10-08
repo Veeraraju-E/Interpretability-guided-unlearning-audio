@@ -160,7 +160,7 @@ def run(
             
         elif mode == 'multi':
             console.print("[yellow]Running multi-class unlearning experiment...[/yellow]")
-            run_multi(adapter, cfg)
+            run_multi(adapter, cfg, verbose=verbose)
             console.print("[green] Multi-class unlearning completed[/green]")
             
         elif mode == 'continual':

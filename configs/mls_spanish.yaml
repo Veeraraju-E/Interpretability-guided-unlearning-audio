@@ -1,6 +1,6 @@
 experiment:
   name: mls_spanish_exp
-  save_dir: ./runs/mls_spanish
+  save_dir: ./runs/mls_spanish/multi_run
   device: cuda
   seed: 1337
 
@@ -8,7 +8,7 @@ dataset:
   name: mls_spanish
   root_or_manifest: /data/veer/testing/new/datasets/mls_spanish/dev/audio
   dev_frac: 0.7
-  forget_labels: ['2592']
+  forget_labels: ['2592'] # moot when mode is multi
 
 encoder:
   name: wav2vec2
@@ -22,7 +22,7 @@ sae:
   multiplier: 10.0
   topk: 128
   lambda_sparsity: 0.0
-  epochs: 1000
+  epochs: 500
   batch_size: 64
   hidden_dim: 0
   
