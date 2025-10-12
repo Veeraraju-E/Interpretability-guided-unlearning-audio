@@ -28,6 +28,7 @@ sae:
 
 feature_mining:
   build_U_top: 200
+  statistical_method: cohens_d  # Only cohens_d supported
 
 edits:
   beta: 0.0

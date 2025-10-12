@@ -66,21 +66,21 @@ Set the `orchestration.mode` in your config file:
 ```
 src/
 ├── core/                    # Core algorithms and utilities
-│   ├── encoders/           # Audio encoders (wav2vec2, ECAPA, etc.)
-│   ├── sae/               # Sparse Autoencoder implementation
-│   ├── feature_mining/    # Feature discovery and subspace analysis
-│   ├── edits/             # LEACE and noise injection
-│   ├── evals/             # Evaluation metrics and probes
-│   ├── preprocess/        # Whitening and normalization
-│   └── visualization/     # Plotting and analysis tools (test data only)
-├── datasets/              # Dataset adapters and preprocessing
-├── orchestration/         # Unlearning workflow orchestration
-│   ├── single_run.py     # Single-class unlearning with test-only visualizations
-│   ├── multi_run.py      # Multi-class unlearning
-│   └── continual.py      # Continual unlearning
-└── cli/                   # Command-line interfaces
-    ├── main.py           # Modern Typer-based CLI
-    └── grid_search.py    # Grid search implementation
+│   ├── encoders/            # Audio encoders (wav2vec2, ECAPA, etc.)
+│   ├── sae/                 # Sparse Autoencoder implementation
+│   ├── feature_mining/      # Feature discovery and subspace analysis
+│   ├── edits/               # LEACE and noise injection
+│   ├── evals/               # Evaluation metrics and probes
+│   ├── utils/               # Whitening and normalization
+│   └── visualization/       # Plotting and analysis tools (test data only)
+├── datasets/                # Dataset adapters and preprocessing
+├── orchestration/           # Unlearning workflow orchestration
+│   ├── single_run.py        # Single-class unlearning with test-only visualizations
+│   ├── multi_run.py         # Multi-class unlearning
+│   └── continual.py         # Continual unlearning
+└── cli/                     # Command-line interfaces
+    ├── main.py              # Main CLI
+    └── grid_search.py       # Grid search implementation
 ```
 
 ## Debug Mode

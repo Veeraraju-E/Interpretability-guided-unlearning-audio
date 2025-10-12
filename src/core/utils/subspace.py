@@ -24,5 +24,3 @@ def build_U_from_decoder(dec_weight: np.ndarray, feat_idx: list[int]) -> np.ndar
     if rank == 0:
         return np.zeros((D_S.shape[0], 0))
     return Uu[:, :rank]
-
-

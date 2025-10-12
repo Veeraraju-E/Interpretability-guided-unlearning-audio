@@ -3,9 +3,9 @@ import random
 import os
 from pathlib import Path
 import numpy as np
-from .adapter_base import DatasetAdapter, Precomp
+from src.datasets.adapter_base import DatasetAdapter, Precomp
 from src.core.encoders.registry import extract_embeddings
-from src.core.preprocess.whitening import fit_whitener, apply_whitener
+from src.core.utils.whitening import fit_whitener, apply_whitener
 
 class SpeechCommandsAdapter(DatasetAdapter):
     name = "speech_commands"

@@ -8,7 +8,7 @@ dataset:
   name: mls_spanish
   root_or_manifest: /data/veer/testing/new/datasets/mls_spanish/dev/audio
   dev_frac: 0.7
-  forget_labels: ['2592'] # moot when mode is multi
+  forget_labels: ['2592']
 
 encoder:
   name: wav2vec2
@@ -28,6 +28,7 @@ sae:
   
 feature_mining:
   build_U_top: 200
+  statistical_method: cohens_d  # Only cohens_d supported
 
 edits:
   beta: 0.0

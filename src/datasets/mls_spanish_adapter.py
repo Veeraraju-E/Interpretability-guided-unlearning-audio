@@ -2,9 +2,9 @@ from typing import List, Dict, Optional
 import os, glob, random
 import numpy as np
 from pathlib import Path
-from .adapter_base import DatasetAdapter, Precomp
+from src.datasets.adapter_base import DatasetAdapter, Precomp
 from src.core.encoders.registry import extract_embeddings
-from src.core.preprocess.whitening import fit_whitener, apply_whitener
+from src.core.utils.whitening import fit_whitener, apply_whitener
 
 class MLSSpanishAdapter(DatasetAdapter):
     name = "mls_spanish"

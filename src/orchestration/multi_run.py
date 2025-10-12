@@ -5,8 +5,8 @@ from core.utils.seed import seed_all
 from core.sae.model import SAE
 from core.sae.train import train_sae
 from core.sae.encode import sae_encode_batch
-from core.feature_mining.stats import feature_stats, select_features_from_stats
-from core.feature_mining.subspace import prune_and_normalize_decoder, build_U_from_decoder
+from core.utils.stats import compute_feature_stats, select_features
+from core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
 from core.evals.classification import train_classifier, evaluate_classifier
 from core.evals.probes import safe_linear_probe
 from core.evals.verification import build_verification_trials, compute_scores, eer_from_scores, per_class_eers, avg_eers
@@ -164,8 +164,10 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     A_ret = A_all[M_ret_dev]
     A_fgt = A_all[M_fgt_dev]
     
-    stats = feature_stats(A_fgt, A_ret, verbose=verbose)
-    feat_idx = select_features_from_stats(stats, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05, verbose=verbose)
+    # Get statistical method from config, default to cohens_d
+    method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
+    stats = compute_feature_stats(A_fgt, A_ret, method=method, verbose=verbose)
+    feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05, verbose=verbose)
     
     if len(feat_idx) == 0:
         console.print(f"ERROR: No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.", style="red")
