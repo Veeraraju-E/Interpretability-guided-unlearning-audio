@@ -10,12 +10,12 @@ import pandas as pd
 from src.datasets.voxceleb_adapter import build_manifest
 from src.core.utils.seed import seed_all
 from src.core.encoders.registry import extract_embeddings
-from src.core.preprocess.whitening import fit_whitener, apply_whitener, invert_whitener
+from src.core.utils.whitening import fit_whitener, apply_whitener, invert_whitener
 from src.core.sae.model import SAE
 from src.core.sae.train import train_sae
 from src.core.sae.encode import sae_encode_batch
-from src.core.feature_mining.stats import feature_stats, select_features_from_stats
-from src.core.feature_mining.subspace import build_U_from_decoder
+from src.core.utils.stats import compute_feature_stats, select_features
+from src.core.utils.subspace import build_U_from_decoder
 from src.core.edits.leace import leace_projector_in_U
 from src.core.edits.noise import inject_noise_in_subspace
 from src.core.evals.probes import safe_linear_probe
@@ -86,8 +86,10 @@ def run_grid_search(cfg: dict):
             )
             sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sweep_epochs, device=device, return_loss_history=False)
             A_all = sae_encode_batch(sae, Z_all, device=device)
-            stats = feature_stats(A_all[mask_dev], A_all[mask_dev])
-            feat_idx = select_features_from_stats(stats, top_k=cfg['feature_mining']['build_U_top'])
+            # Get statistical method from config, default to cohens_d
+            method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
+            stats = compute_feature_stats(A_all[mask_dev], A_all[mask_dev], method=method)
+            feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'])
             dec_w = sae.dec.weight.detach().cpu().numpy()
             U = build_U_from_decoder(dec_w, feat_idx)
             

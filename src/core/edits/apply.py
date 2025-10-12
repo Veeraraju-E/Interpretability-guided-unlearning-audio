@@ -1,8 +1,7 @@
 import numpy as np
-from .leace import leace_projector_in_U
-from .sauce import apply_sauce_gating
-from .noise import inject_noise_in_subspace
-from ..preprocess.whitening import invert_whitener
+from src.core.edits.leace import leace_projector_in_U
+from src.core.edits.noise import inject_noise_in_subspace
+from src.core.utils.whitening import invert_whitener
 
 def apply_edits(Z_all: np.ndarray, sae, feat_idx, U, mu, W, *, beta: float, do_leace: bool, leace_params: dict, noise_sigma: float, device: str) -> tuple[np.ndarray, dict]:
     """
@@ -11,13 +10,12 @@ def apply_edits(Z_all: np.ndarray, sae, feat_idx, U, mu, W, *, beta: float, do_l
     Then map back.
 
     Args:
-        For SAUCE edits: sae, feat_idx, beta
         For LEACE edits: Z_all, U, mu, W, leace_params, noise_sigma
     """
     Z_edit = Z_all.copy()
     info = {}
     if beta and beta > 0.0:
-        Z_edit = apply_sauce_gating(sae, Z_edit, feat_idx, beta=beta, device=device, batch=8192)
+        raise NotImplementedError("SAUCE edits are not implemented yet")
     if do_leace:
         P_r, mu_r = leace_projector_in_U(Z_all, U, leace_params['Y_dev'], ridge=float(leace_params.get('ridge', 1e-6)))
         ZU = Z_edit @ U

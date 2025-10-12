@@ -1,6 +1,6 @@
 experiment:
   name: voxceleb_exp
-  save_dir: ./runs/voxceleb2
+  save_dir: ./runs/voxceleb_single_u_top_1_percent
   device: cuda
   seed: 1337
 
@@ -19,15 +19,16 @@ encoder:
 
 sae:
   variant: topk
-  multiplier: 10.0
+  multiplier: 8.0
   topk: 128
   lambda_sparsity: 0.0
-  epochs: 100
+  epochs: 1
   batch_size: 64
   hidden_dim: 0
 
 feature_mining:
-  build_U_top: 200
+  build_U_top: 61 # 1% of 6144
+  statistical_method: cohens_d  # Only cohens_d supported
 
 edits:
   beta: 0.0

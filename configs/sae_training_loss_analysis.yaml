@@ -1,0 +1,42 @@
+experiment:
+  name: sae_training_loss_analysis_voxceleb
+  save_dir: ./runs/sae_training_loss_analysis_w2v2
+  device: cuda
+  seed: 1337
+
+dataset:
+  name: voxceleb
+  root_or_manifest: /data/veer/testing/new/datasets/voxceleb2/manifest.csv
+  dev_frac: 0.7
+  forget_labels: ['id00017']  # Single forget label for focused analysis
+
+encoder:
+  name: wav2vec2
+  wav2vec2_model: facebook/wav2vec2-base
+  hubert_model: facebook/hubert-base-ls960
+  conformer_model: facebook/wav2vec2-conformer-rel-pos-large
+  embeddings_path: null  # Will be cached automatically
+
+sae:
+  variant: topk
+  multiplier: 10.0  # Default, will be overridden in analysis
+  topk: 128  # Default, will be overridden in analysis
+  lambda_sparsity: 0.0
+  epochs: 500  # Increased for detailed loss curves
+  batch_size: 64
+  hidden_dim: 0
+
+feature_mining:
+  build_U_top: 200
+  statistical_method: cohens_d  # Only cohens_d supported
+
+edits:
+  beta: 0.0
+  leace: true
+  leace_ridge: 1e-6
+  noise_sigma: 0.02
+
+orchestration:
+  mode: single
+  seeds: [1337]  # Single seed for focused analysis
+  classifier_epochs: 20

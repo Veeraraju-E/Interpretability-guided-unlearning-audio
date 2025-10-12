@@ -9,6 +9,7 @@ try:
 except Exception:
     multipletests = None
 
+
 def cohens_d(x_pos: np.ndarray, x_neg: np.ndarray) -> float:
     n1, n2 = len(x_pos), len(x_neg)
     
@@ -56,6 +57,9 @@ def mann_whitney_u_p(x_pos: np.ndarray, x_neg: np.ndarray) -> tuple[float,float]
     p = 2*(1 - 0.5*(1+erf(abs(z)/sqrt(2))))
     return auc, p
 
+
+
+
 def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, verbose: bool = False) -> Dict:
     # Validate input arrays
     if A_pos.shape[0] == 0:
@@ -69,22 +73,20 @@ def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, verbose: bool = False) -
         print(f"DEBUG: A_neg stats - mean: {A_neg.mean():.6f}, std: {A_neg.std():.6f}, min: {A_neg.min():.6f}, max: {A_neg.max():.6f}")
     
     m = A_pos.shape[1]
-    
-    # Identify dead features (never activated)
     pos_activity = (A_pos > 1e-6).sum(axis=0)
     neg_activity = (A_neg > 1e-6).sum(axis=0)
-    dead_features = (pos_activity == 0) & (neg_activity == 0)
-    active_features = ~dead_features
+    dead_latents = (pos_activity == 0) & (neg_activity == 0)    
     
     if verbose:
-        print(f"DEBUG: Dead features (never activated): {dead_features.sum()} out of {m} total features")
-        print(f"DEBUG: Active features: {active_features.sum()} out of {m} total features")
+        active_latents = ~dead_latents
+        print(f"DEBUG: Dead features (never activated): {dead_latents.sum()} out of {m} total features")
+        print(f"DEBUG: Active features: {active_latents.sum()} out of {m} total features")
     
     stats = {"cohens_d": np.zeros(m), "auc": np.zeros(m), "pval": np.ones(m)}
     
     # Only compute statistics for active features
     for j in range(m):
-        if dead_features[j]:
+        if dead_latents[j]:
             # Skip dead features - they have no discriminative power
             stats["cohens_d"][j] = 0.0
             stats["auc"][j] = 0.5  # Random performance
@@ -108,7 +110,7 @@ def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, verbose: bool = False) -
             stats["cohens_d"][j] = cohens_d(x_pos, x_neg)
         except ValueError as e:
             if verbose:
-                print(f"DEBUG: Cohen's d failed for feature {j}: {e}")
+                print(f"DEBUG: Cohen's d will not work for feature {j}: {e}")
             stats["cohens_d"][j] = 0.0
         
         # ROC AUC computation
@@ -118,7 +120,7 @@ def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, verbose: bool = False) -
             stats["auc"][j] = float(roc_auc_score(y_true, y_scores))
         except Exception as e:
             if verbose:
-                print(f"DEBUG: ROC AUC failed for feature {j}: {e}")
+                print(f"DEBUG: ROC AUC did not work for feature {j}: {e}")
             stats["auc"][j] = 0.5
             
         try:
@@ -172,3 +174,39 @@ def select_features_from_stats(stats: dict, top_k: int = 200, fdr: float = 0.05,
     return list(idx)
 
 
+def compute_feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, method: str = "cohens_d", verbose: bool = False) -> Dict:
+    """
+    Compute feature statistics using Cohen's d method.
+    
+    Args:
+        A_pos: Positive class activations (N_pos x m)
+        A_neg: Negative class activations (N_neg x m)
+        method: Statistical method to use (only "cohens_d" supported)
+        verbose: Whether to print debug information
+    
+    Returns:
+        Dictionary with computed statistics
+    """
+    if method == "cohens_d":
+        return feature_stats(A_pos, A_neg, verbose=verbose)
+    else:
+        raise ValueError(f"Unknown statistical method: {method}. Only 'cohens_d' is supported.")
+
+def select_features(stats: dict, method: str = "cohens_d", top_k: int = 200, fdr: float = 0.05, verbose: bool = False):
+    """
+    Select features using Cohen's d method.
+    
+    Args:
+        stats: Dictionary with computed statistics
+        method: Statistical method to use (only "cohens_d" supported)
+        top_k: Maximum number of features to select
+        fdr: False Discovery Rate threshold
+        verbose: Whether to print debug information
+    
+    Returns:
+        List of selected feature indices
+    """
+    if method == "cohens_d":
+        return select_features_from_stats(stats, top_k=top_k, fdr=fdr, verbose=verbose)
+    else:
+        raise ValueError(f"Unknown statistical method: {method}. Only 'cohens_d' is supported.")
