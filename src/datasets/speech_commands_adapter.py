@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import numpy as np
 from src.datasets.adapter_base import DatasetAdapter, Precomp
-from src.core.encoders.registry import extract_embeddings
+from src.core.encoders import extract_embeddings
 from src.core.utils.whitening import fit_whitener, apply_whitener
 
 class SpeechCommandsAdapter(DatasetAdapter):

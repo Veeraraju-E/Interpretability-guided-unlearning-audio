@@ -1,4 +1,5 @@
 from typing import Dict, List
+from copy import deepcopy
 import os, csv
 import numpy as np
 from core.utils.seed import seed_all
@@ -28,7 +29,7 @@ def run_continual(adapter, cfg: Dict, sequence: List[str]):
                 active_mask = np.array([l not in forgotten for l in pre.labels], dtype=bool)
                 labels_active = list(np.array(pre.labels)[active_mask])
                 classes_active = sorted(list(set(labels_active)))
-                cfg_local = copy.deepcopy(cfg)
+                cfg_local = deepcopy(cfg)
                 cfg_local['dataset']['forget_labels'] = [target]
                 # reuse run_single; adapters will still read from cfg for paths
                 res = run_single(adapter, cfg_local)[target]

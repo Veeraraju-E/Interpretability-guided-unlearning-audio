@@ -77,5 +77,3 @@ def compute_mia_score(embeddings: np.ndarray, labels: List[str], target_speaker:
         return float(roc_auc_score(membership_labels, mia_probs))
     except Exception:
         return float('nan')
-
-

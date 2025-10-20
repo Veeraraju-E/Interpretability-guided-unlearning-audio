@@ -1,6 +1,5 @@
 """
 Grid search implementation for SAE hyperparameter optimization.
-This module contains the actual grid search logic that was previously in grid.py.
 """
 
 import os
@@ -9,22 +8,17 @@ import numpy as np
 import pandas as pd
 from src.datasets.voxceleb_adapter import build_manifest
 from src.core.utils.seed import seed_all
-from src.core.encoders.registry import extract_embeddings
+from src.core.encoders import extract_embeddings
 from src.core.utils.whitening import fit_whitener, apply_whitener, invert_whitener
-from src.core.sae.model import SAE
-from src.core.sae.train import train_sae
-from src.core.sae.encode import sae_encode_batch
+from src.core.sae import SAE, train_sae, sae_encode_batch
 from src.core.utils.stats import compute_feature_stats, select_features
 from src.core.utils.subspace import build_U_from_decoder
-from src.core.edits.leace import leace_projector_in_U
-from src.core.edits.noise import inject_noise_in_subspace
+from src.core.edits import leace_projector_in_U, inject_noise_in_subspace
 from src.core.evals.probes import safe_linear_probe
 from src.core.evals.verification import per_class_eers, avg_eers
 
 def load_config(path: str):
-    """Load YAML configuration file."""
-    with open(path, 'r') as f:
-        return yaml.safe_load(f)
+    with open(path, 'r') as f: return yaml.safe_load(f)
 
 def run_grid_search(cfg: dict):
     """
@@ -36,12 +30,12 @@ def run_grid_search(cfg: dict):
     device = cfg['experiment']['device']
     seed_all(cfg['experiment']['seed'])
 
-    # Build a minimal grid from config overrides
+
     multipliers = cfg.get('grid_search', {}).get('sae_multipliers', [2.0, 4.0, 8.0, 16.0, 32.0])
     topks = cfg.get('grid_search', {}).get('sae_topks', [32, 64, 128, 256, 512])
     sweep_epochs = cfg.get('grid_search', {}).get('sweep_epochs', 100)
 
-    # Precompute on VoxCeleb-style manifest for consistency
+    # precompute
     entries = build_manifest(
         cfg['dataset']['root_or_manifest'], 
         embeddings_path=cfg['encoder'].get('embeddings_path'), 
@@ -50,6 +44,7 @@ def run_grid_search(cfg: dict):
     )
     sets = [f"retain:{m['split']}" for m in entries]  # placeholder set labels
     labels = [m['speaker'] if 'speaker' in m else (m['label'] if 'label' in m else 'NA') for m in entries]
+    # extract embeddings
     E_all, _labels, _ = extract_embeddings(
         entries, 
         encoder=cfg['encoder']['name'], 
@@ -77,23 +72,18 @@ def run_grid_search(cfg: dict):
             perm = np.random.permutation(Z_train.shape[0])
             cut = int(0.8 * len(perm))
             Z_sae_train, Z_sae_val = Z_train[perm[:cut]], Z_train[perm[cut:]]
-            sae = SAE(
-                input_dim=Z_all.shape[1], 
-                hidden_mult=mult, 
-                k=k, 
-                variant='topk', 
-                hidden_dim=cfg['sae']['hidden_dim']
-            )
+            sae = SAE(input_dim=Z_all.shape[1], hidden_mult=mult, k=k, variant='topk', hidden_dim=cfg['sae']['hidden_dim'])
             sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=sweep_epochs, device=device, return_loss_history=False)
+
             A_all = sae_encode_batch(sae, Z_all, device=device)
-            # Get statistical method from config, default to cohens_d
+            # compute feature stats
             method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
             stats = compute_feature_stats(A_all[mask_dev], A_all[mask_dev], method=method)
             feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'])
             dec_w = sae.dec.weight.detach().cpu().numpy()
             U = build_U_from_decoder(dec_w, feat_idx)
             
-            # LEACE on dev split for a placeholder Y_dev (binary zeros)
+            # LEACE on dev split
             Y_dev = np.zeros((mask_dev.sum(), 1), dtype=int)
             P_r, mu_r = leace_projector_in_U(Z_all[mask_dev], U, Y_dev, ridge=cfg['edits']['leace_ridge'])
             Z_edit = Z_all.copy()

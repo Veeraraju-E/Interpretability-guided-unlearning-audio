@@ -3,18 +3,17 @@ import os
 import json
 import numpy as np
 from src.core.utils.seed import seed_all
-from src.core.sae.model import SAE
-from src.core.sae.train import train_sae
-from src.core.sae.encode import sae_encode_batch
+from src.core.sae import SAE, train_sae, sae_encode_batch
 from src.core.utils.stats import compute_feature_stats, select_features
 from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
 from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
 from src.core.evals.verification import build_verification_trials, compute_scores, eer_from_scores, per_class_eers, avg_eers
-from src.core.edits.apply import apply_edits
+from src.core.edits import apply_edits
 from src.core.visualization import create_embedding_visualizations, create_embedding_summary_stats
+ 
 
-def run_single(adapter, cfg: Dict, verbose: bool = False):
+def run_single(adapter, cfg: Dict):
     seed, device, save_dir = cfg['experiment']['seed'], cfg['experiment']['device'], cfg['experiment']['save_dir']
     seed_all(seed)
 
@@ -68,7 +67,7 @@ def run_single(adapter, cfg: Dict, verbose: bool = False):
     # print(cfg)
     sae = SAE(input_dim=pre.Z_all.shape[1], hidden_mult=cfg['sae']['multiplier'], k=cfg['sae']['topk'], variant=cfg['sae']['variant'], hidden_dim=cfg['sae']['hidden_dim'])
     sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae']['epochs'], batch_size=cfg['sae']['batch_size'], lr=1e-3, device=device, lambda_sparsity=cfg['sae']['lambda_sparsity'])
-    A_all = sae_encode_batch(sae, pre.Z_all, device=device, batch=256, verbose=verbose)
+    A_all = sae_encode_batch(sae, pre.Z_all, device=device, batch=256)
     dec_w = sae.dec.weight.detach().cpu().numpy()
 
     # Classifier once
@@ -92,18 +91,9 @@ def run_single(adapter, cfg: Dict, verbose: bool = False):
     console.print(f"Forget list: {forget_list}", style="yellow")
     
     # Debug: Print label types and values
-    if verbose:
-        print(f"Debug: all_labels sample = {all_labels[:5]}")
-        print(f"Debug: all_labels types = {[type(lbl) for lbl in all_labels[:5]]}")
-    
     # Debug: Count samples per class
     from collections import Counter
     label_counts = Counter(all_labels)
-    
-    if verbose:
-        print(f"Debug: Per-class sample counts:")
-        for label, count in sorted(label_counts.items()):
-            print(f"  {label}: {count} samples")
     
     # Filter out classes with less than 5 samples
     valid_labels = {label for label, count in label_counts.items() if count >= 5}
@@ -114,10 +104,6 @@ def run_single(adapter, cfg: Dict, verbose: bool = False):
     labels_display = labels_to_show + (["..."] if len(unique_labels_list) > 20 else [])
     console.print(f"Unique labels (first 20): {labels_display}", style="yellow")
     
-    if verbose:
-        print(f"Debug: Classes with >=5 samples: {len(valid_labels)} out of {len(label_counts)}")
-        print(f"Debug: Valid classes: {sorted(valid_labels)}")
-    
     # Check if forget labels are valid
     invalid_forget_labels = [label for label in forget_list if str(label) not in valid_labels]
     if invalid_forget_labels:
@@ -127,17 +113,11 @@ def run_single(adapter, cfg: Dict, verbose: bool = False):
     for forget_label in forget_list:
         # Convert forget_label to string for comparison
         forget_label_str = str(forget_label)
-        if verbose:
-            print(f"Debug: Processing forget_label = {forget_label_str}")
-        
         sets = [f"{'forget' if str(lbl) == forget_label_str else 'retain'}:{'dev' if pre.mask_dev[i] else 'test'}" for i, lbl in enumerate(all_labels)]
         
         # Debug: Count forget/retain samples
         forget_count = sum(1 for s in sets if s.startswith('forget'))
         retain_count = sum(1 for s in sets if s.startswith('retain'))
-        if verbose:
-            print(f"Debug: forget_count = {forget_count}, retain_count = {retain_count}")
-        
         # Check minimum sample requirement
         if forget_count < 5:
             console.print(f"WARNING: Forget class '{forget_label_str}' has only {forget_count} samples, minimum 5 required. Skipping this class.", style="red")
@@ -148,36 +128,23 @@ def run_single(adapter, cfg: Dict, verbose: bool = False):
         M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
         M_fgt_test = np.array([s == 'forget:test' for s in sets], dtype=bool)
 
-        if verbose:
-            print(f"Debug: M_ret_dev samples: {M_ret_dev.sum()}, M_fgt_dev samples: {M_fgt_dev.sum()}")
-            print(f"Debug: M_ret_test samples: {M_ret_test.sum()}, M_fgt_test samples: {M_fgt_test.sum()}")
-
         # Feature mining
         A_ret = A_all[M_ret_dev]
         A_fgt = A_all[M_fgt_dev]
-        
-        if verbose:
-            print(f"Debug: A_ret shape: {A_ret.shape}, A_fgt shape: {A_fgt.shape}")
-            print(f"Debug: A_ret activation stats - mean: {A_ret.mean():.6f}, std: {A_ret.std():.6f}, min: {A_ret.min():.6f}, max: {A_ret.max():.6f}")
-            print(f"Debug: A_fgt activation stats - mean: {A_fgt.mean():.6f}, std: {A_fgt.std():.6f}, min: {A_fgt.min():.6f}, max: {A_fgt.max():.6f}")
         
         # Check for dead features (never activated)
         ret_active_features = (A_ret > 1e-6).sum(axis=0)
         fgt_active_features = (A_fgt > 1e-6).sum(axis=0)
         dead_features = (ret_active_features == 0) & (fgt_active_features == 0)
-        if verbose:
-            print(f"Debug: Dead features (never activated): {dead_features.sum()} out of {len(dead_features)}")
-        
         # Get statistical method from config, default to cohens_d
         method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
-        stats = compute_feature_stats(A_fgt, A_ret, method=method, verbose=verbose)
-        feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05, verbose=verbose)
+        stats = compute_feature_stats(A_fgt, A_ret, method=method)
+        feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
         
         if len(feat_idx) == 0:
             print(f"ERROR: No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
             continue
             
-        print(f"DEBUG: Using {len(feat_idx)} features for editing")
         prune_and_normalize_decoder(dec_w)
         U = build_U_from_decoder(dec_w, feat_idx)
 
@@ -185,7 +152,7 @@ def run_single(adapter, cfg: Dict, verbose: bool = False):
         Y_all = np.array([1 if all_labels[i] == forget_label else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
         E_edit, info = apply_edits(
             pre.Z_all, sae, feat_idx, U, pre.mu, pre.W,
-            beta=cfg['edits']['beta'], do_leace=cfg['edits']['leace'], leace_params={'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, noise_sigma=cfg['edits']['noise_sigma'], device=device
+            cfg['edits']['beta'], cfg['edits']['leace'], {'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, cfg['edits']['noise_sigma']
         )
         E_all_edited = E_edit
         E_all_norm2 = E_all_edited / (np.linalg.norm(E_all_edited, axis=1, keepdims=True) + 1e-12)
@@ -296,6 +263,3 @@ def run_single(adapter, cfg: Dict, verbose: bool = False):
             res["visualization_error"] = str(e)
 
     return results_all
-
-
-

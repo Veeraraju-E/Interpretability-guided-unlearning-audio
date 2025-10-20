@@ -1,18 +1,16 @@
 from typing import Dict
-import os, csv, pickle, torch
+import os, csv, pickle
 import numpy as np
-from core.utils.seed import seed_all
-from core.sae.model import SAE
-from core.sae.train import train_sae
-from core.sae.encode import sae_encode_batch
-from core.utils.stats import compute_feature_stats, select_features
-from core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
-from core.evals.classification import train_classifier, evaluate_classifier
-from core.evals.probes import safe_linear_probe
-from core.evals.verification import build_verification_trials, compute_scores, eer_from_scores, per_class_eers, avg_eers
-from core.edits.apply import apply_edits
+from src.core.utils.seed import seed_all
+from src.core.sae import SAE, train_sae, sae_encode_batch
+from src.core.utils.stats import compute_feature_stats, select_features
+from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
+from src.core.evals.classification import train_classifier, evaluate_classifier
+from src.core.evals.probes import safe_linear_probe
+from src.core.evals.verification import build_verification_trials, compute_scores, per_class_eers, avg_eers
+from src.core.edits import apply_edits
 
-def run_multi(adapter, cfg: Dict, verbose: bool = False):
+def run_multi(adapter, cfg: Dict):
     base_save_dir = cfg['experiment']['save_dir']
     os.makedirs(base_save_dir, exist_ok=True)
     seeds = cfg['orchestration']['seeds']
@@ -44,8 +42,7 @@ def run_multi(adapter, cfg: Dict, verbose: bool = False):
         
         # Cache embeddings
         cache_data = {'pre': pre, 'classes': classes}
-        with open(embeddings_cache_path, 'wb') as f:
-            pickle.dump(cache_data, f)
+        with open(embeddings_cache_path, 'wb') as f: pickle.dump(cache_data, f)
         print("Embeddings cached successfully!")
     
     # Step 2: Train SAE and compute activations once per seed (if not cached)
@@ -83,24 +80,20 @@ def run_multi(adapter, cfg: Dict, verbose: bool = False):
                     
                     sae = SAE(input_dim=pre.Z_all.shape[1], hidden_mult=cfg['sae']['multiplier'], k=cfg['sae']['topk'], variant=cfg['sae']['variant'], hidden_dim=cfg['sae']['hidden_dim'])
                     sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae']['epochs'], batch_size=cfg['sae']['batch_size'], lr=1e-3, device=device, lambda_sparsity=cfg['sae']['lambda_sparsity'])
-                    A_all = sae_encode_batch(sae, pre.Z_all, device=device, batch=256, verbose=verbose)
+                    A_all = sae_encode_batch(sae, pre.Z_all, device=device, batch=256)
                     dec_w = sae.dec.weight.detach().cpu().numpy()
                     
                     # Cache SAE and activations
                     sae_state = sae.state_dict()
-                    with open(sae_cache_path, 'wb') as f:
-                        pickle.dump(sae_state, f)
-                    with open(activations_cache_path, 'wb') as f:
-                        pickle.dump({'A_all': A_all, 'dec_w': dec_w}, f)
+                    with open(sae_cache_path, 'wb') as f: pickle.dump(sae_state, f)
+                    with open(activations_cache_path, 'wb') as f: pickle.dump({'A_all': A_all, 'dec_w': dec_w}, f)
                     print(f"SAE and activations cached for seed {seed}!")
                 
                 # Step 3: Run unlearning for each class (reusing cached data)
                 for forget in classes:
                     try:
                         print(f"Processing seed {seed}, forget class: {forget}")
-                        res = run_single_class_unlearning(
-                            pre, A_all, dec_w, forget, classes, cfg, device, verbose
-                        )
+                        res = run_single_class_unlearning(pre, A_all, dec_w, forget, classes, cfg, device)
                         row = {"seed": seed, "forget_label": forget, **res, "error": ""}
                         writer.writerow(row)
                         fh.flush()
@@ -116,25 +109,18 @@ def run_multi(adapter, cfg: Dict, verbose: bool = False):
                 fh.flush()
 
 
-def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, device, verbose=False):
-    """
-    Run unlearning for a single class using pre-computed embeddings and SAE activations.
-    This function skips visualizations for multi-run efficiency.
-    """
+def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, device):
     from rich.console import Console
     console = Console()
     
-    # Convert forget_label to string for comparison
     forget_label_str = str(forget_label)
     all_labels = pre.labels
     
-    # Check minimum sample requirement
     forget_count = sum(1 for lbl in all_labels if str(lbl) == forget_label_str)
     if forget_count < 5:
         console.print(f"WARNING: Forget class '{forget_label_str}' has only {forget_count} samples, minimum 5 required. Skipping this class.", style="red")
         return {"error": f"Insufficient samples: {forget_count}"}
     
-    # Create forget/retain masks
     sets = [f"{'forget' if str(lbl) == forget_label_str else 'retain'}:{'dev' if pre.mask_dev[i] else 'test'}" for i, lbl in enumerate(all_labels)]
     
     M_ret_dev = np.array([s == 'retain:dev' for s in sets], dtype=bool)
@@ -142,18 +128,18 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
     M_fgt_test = np.array([s == 'forget:test' for s in sets], dtype=bool)
     
-    # Train multi-class classifier (same as single_run)
+    # Train multi-class classifier
     E_all_norm = pre.E_all / (np.linalg.norm(pre.E_all, axis=1, keepdims=True) + 1e-12)
     
-    # Create class mapping (same as single_run)
+    # Create class mapping
     unique_labels = sorted(list(set(all_labels)))
     cls2id = {d: i for i, d in enumerate(unique_labels)}
     
-    # Training data (dev set)
+    # Training data
     X_train = E_all_norm[pre.mask_dev]
     y_train = [cls2id[d] for d in np.array(all_labels)[pre.mask_dev]]
     
-    # Validation data (test set) 
+    # Validation data 
     X_val = E_all_norm[pre.mask_test]
     y_val = [cls2id[d] for d in np.array(all_labels)[pre.mask_test]]
     
@@ -166,8 +152,8 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     
     # Get statistical method from config, default to cohens_d
     method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
-    stats = compute_feature_stats(A_fgt, A_ret, method=method, verbose=verbose)
-    feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05, verbose=verbose)
+    stats = compute_feature_stats(A_fgt, A_ret, method=method)
+    feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
     
     if len(feat_idx) == 0:
         console.print(f"ERROR: No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.", style="red")
@@ -181,7 +167,7 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     Y_all = np.array([1 if all_labels[i] == forget_label else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
     E_edit, info = apply_edits(
         pre.Z_all, None, feat_idx, U, pre.mu, pre.W,
-        beta=cfg['edits']['beta'], do_leace=cfg['edits']['leace'], leace_params={'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, noise_sigma=cfg['edits']['noise_sigma'], device=device
+        cfg['edits']['beta'], cfg['edits']['leace'], {'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, cfg['edits']['noise_sigma']
     )
     E_all_edited = E_edit
     E_all_norm2 = E_all_edited / (np.linalg.norm(E_all_edited, axis=1, keepdims=True) + 1e-12)
@@ -241,5 +227,3 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
         "linear_probe_auc_before": auc_before,
         "linear_probe_auc_after": auc_after
     }
-
-

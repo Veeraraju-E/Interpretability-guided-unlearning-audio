@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 Build_U_top Percentage Analysis for Single-Class Unlearning
-Analyzes the impact of different build_U_top percentages (1%, 5%, 10%, 25%, 50%) 
-on ERB scores across ECAPA, Wav2Vec2, and HuBERT encoders.
 """
 
 import os
@@ -18,37 +16,32 @@ from typing import Dict, Tuple
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from src.datasets.voxceleb_adapter import VoxCelebAdapter
+from src.datasets.speech_commands_adapter import SpeechCommandsAdapter
+from src.datasets.audiomnist_adapter import AudioMNISTAdapter
+from src.datasets.librispeech_adapter import LibriSpeechAdapter
+from src.datasets.lahaja_adapter import LahajaAdapter
+from src.datasets.mls_spanish_adapter import MLSSpanishAdapter
 from src.core.utils.seed import seed_all
-from src.core.sae.model import SAE
-from src.core.sae.train import train_sae
-from src.core.sae.encode import sae_encode_batch
+from src.core.sae import SAE, train_sae, sae_encode_batch
 from src.core.utils.stats import compute_feature_stats, select_features
 from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
 from src.core.evals.classification import train_classifier, evaluate_classifier
-from src.core.edits.apply import apply_edits
+from src.core.edits import apply_edits
 
 
 def load_config(config_path: str) -> Dict:
-    """Load configuration from YAML file."""
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+    with open(config_path, 'r') as f: return yaml.safe_load(f)
 
 
 def calculate_erb_score(fa_after: float, ra_after: float) -> float:
     """Calculate ERB score: 2*(100-FA)*RA / (100-FA+RA)"""
     fa_percent = fa_after * 100 if fa_after <= 1.0 else fa_after
     ra_percent = ra_after * 100 if ra_after <= 1.0 else ra_after
-    numerator = 2 * (100 - fa_percent) * ra_percent
-    denominator = (100 - fa_percent) + ra_percent
-    
-    if denominator == 0:
-        return 0.0
-    
-    return numerator / denominator
-
+    Nr = 2 * (100 - fa_percent) * ra_percent
+    Dr = (100 - fa_percent) + ra_percent
+    return Nr / Dr if Dr else 0.0
 
 def get_encoder_dimensions() -> Dict[str, int]:
-    """Get embedding dimensions for each encoder."""
     return {
         'ecapa': 192,
         'wav2vec2': 768,
@@ -57,11 +50,10 @@ def get_encoder_dimensions() -> Dict[str, int]:
 
 
 def calculate_build_u_top_values(encoder: str, multiplier: float = 8.0) -> Dict[str, int]:
-    """Calculate build_U_top values for each percentage."""
     base_dim = get_encoder_dimensions()[encoder]
     sae_latent_dim = int(base_dim * multiplier)
     
-    percentages = [1, 2, 3, 4, 5]
+    percentages = [1, 2, 5, 10, 25]
     return {f"{p}%": int(sae_latent_dim * p / 100) for p in percentages}
 
 
@@ -86,14 +78,48 @@ def cache_embeddings(adapter, encoder: str, cfg: Dict, device: str, cache_dir: s
         encoder_cfg = cfg['encoder'].copy()
         encoder_cfg['name'] = encoder
         
-        pre = adapter.precompute(
-            root_or_manifest=cfg['dataset']['root_or_manifest'],
-            embeddings_path=cfg['encoder'].get('embeddings_path'),
-            dev_frac=cfg['dataset']['dev_frac'],
-            seed=cfg['experiment']['seed'],
-            encoder_cfg=encoder_cfg,
-            device=device,
-        )
+        # Use appropriate parameter name based on adapter type
+        data_path_param = cfg['dataset']['root_or_manifest']
+        if hasattr(adapter, 'name'):
+            if adapter.name in ['audiomnist', 'speech_commands']:
+                pre = adapter.precompute(
+                    data_root=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=encoder_cfg,
+                    device=device,
+                )
+            elif adapter.name == 'librispeech':
+                pre = adapter.precompute(
+                    root=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=encoder_cfg,
+                    device=device,
+                )
+            elif adapter.name == 'lahaja':
+                pre = adapter.precompute(
+                    split=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=encoder_cfg,
+                    device=device,
+                )
+            else:  # voxceleb and others
+                pre = adapter.precompute(
+                    root_or_manifest=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=encoder_cfg,
+                    device=device,
+                )
+        else:
+            raise NotImplementedError(f"Adapter {adapter.name} not implemented for {cfg['dataset']['name']}.")
+        
         classes = pre.classes
         
         # Cache embeddings
@@ -123,13 +149,7 @@ def cache_sae_and_activations(pre, encoder: str, cfg: Dict, device: str, cache_d
             dec_w = cache_data['dec_w']
         
         # Reconstruct SAE model
-        sae = SAE(
-            input_dim=pre.Z_all.shape[1], 
-            hidden_mult=cfg['sae']['multiplier'], 
-            k=cfg['sae']['topk'], 
-            variant=cfg['sae']['variant'], 
-            hidden_dim=cfg['sae']['hidden_dim']
-        )
+        sae = SAE(input_dim=pre.Z_all.shape[1], hidden_mult=cfg['sae']['multiplier'], k=cfg['sae']['topk'], variant=cfg['sae']['variant'], hidden_dim=cfg['sae']['hidden_dim'])
         sae.load_state_dict(sae_state)
         
         print(f"SAE and activations loaded for {encoder}")
@@ -142,30 +162,15 @@ def cache_sae_and_activations(pre, encoder: str, cfg: Dict, device: str, cache_d
         cut = int(0.8 * len(perm)) if len(perm) > 1 else int(0.5 * len(perm))
         Z_sae_train, Z_sae_val = (Z_train, Z_train) if cut <= 0 else (Z_train[perm[:cut]], Z_train[perm[cut:]])
         
-        sae = SAE(
-            input_dim=pre.Z_all.shape[1], 
-            hidden_mult=cfg['sae']['multiplier'], 
-            k=cfg['sae']['topk'], 
-            variant=cfg['sae']['variant'], 
-            hidden_dim=cfg['sae']['hidden_dim']
-        )
-        sae = train_sae(
-            sae, Z_sae_train, Z_sae_val, 
-            epochs=cfg['sae']['epochs'], 
-            batch_size=cfg['sae']['batch_size'], 
-            lr=1e-3, 
-            device=device, 
-            lambda_sparsity=cfg['sae']['lambda_sparsity']
-        )
-        A_all = sae_encode_batch(sae, pre.Z_all, device=device, batch=256, verbose=False)
+        sae = SAE(input_dim=pre.Z_all.shape[1], hidden_mult=cfg['sae']['multiplier'], k=cfg['sae']['topk'], variant=cfg['sae']['variant'], hidden_dim=cfg['sae']['hidden_dim'])
+        sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae']['epochs'], batch_size=cfg['sae']['batch_size'], lr=1e-3, device=device, lambda_sparsity=cfg['sae']['lambda_sparsity'])
+        A_all = sae_encode_batch(sae, pre.Z_all, device=device, batch=256)
         dec_w = sae.dec.weight.detach().cpu().numpy()
         
         # Cache SAE and activations
         sae_state = sae.state_dict()
-        with open(sae_cache_path, 'wb') as f:
-            pickle.dump(sae_state, f)
-        with open(activations_cache_path, 'wb') as f:
-            pickle.dump({'A_all': A_all, 'dec_w': dec_w}, f)
+        with open(sae_cache_path, 'wb') as f: pickle.dump(sae_state, f)
+        with open(activations_cache_path, 'wb') as f: pickle.dump({'A_all': A_all, 'dec_w': dec_w}, f)
         print(f"SAE and activations cached for {encoder}")
     
     return sae, A_all, dec_w
@@ -180,8 +185,7 @@ def cache_classifier(pre, classes, encoder: str, cfg: Dict, device: str, cache_d
     
     if os.path.exists(classifier_cache_path):
         print(f"Loading cached classifier for {encoder}...")
-        with open(classifier_cache_path, 'rb') as f:
-            clf = pickle.load(f)
+        with open(classifier_cache_path, 'rb') as f: clf = pickle.load(f)
         print(f"Classifier loaded for {encoder}")
     else:
         print(f"Training classifier for {encoder} (this will be cached)...")
@@ -195,29 +199,16 @@ def cache_classifier(pre, classes, encoder: str, cfg: Dict, device: str, cache_d
         X_cls_val = E_all_norm[pre.mask_test]
         y_cls_val = [cls2id[s] for i, s in enumerate(all_labels) if pre.mask_test[i]]
         
-        clf = train_classifier(
-            X_cls_train, y_cls_train, X_cls_val, y_cls_val, 
-            num_classes=len(classes), 
-            device=device, 
-            epochs=cfg['orchestration']['classifier_epochs'], 
-            batch_size=512, 
-            lr=1e-3
-        )
+        clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(classes), device=device, epochs=cfg['orchestration']['classifier_epochs'], batch_size=512, lr=1e-3)
         
         # Cache classifier
-        with open(classifier_cache_path, 'wb') as f:
-            pickle.dump(clf, f)
+        with open(classifier_cache_path, 'wb') as f: pickle.dump(clf, f)
         print(f"Classifier cached for {encoder}")
     
     return clf
 
 
-def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, encoder: str, build_u_top_pct: str, 
-                                  build_u_top_value: int, cfg: Dict, device: str) -> Dict:
-    """
-    Run unlearning analysis for a single build_U_top value.
-    Returns results dictionary with FA, RA, and ERB scores.
-    """
+def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, encoder: str, build_u_top_pct: str, build_u_top_value: int, cfg: Dict, device: str) -> Dict:
     print(f"  Analyzing {encoder} with {build_u_top_pct} ({build_u_top_value} features)...")
     
     # Setup data
@@ -255,8 +246,8 @@ def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, encoder: str, build_
     
     # Get statistical method from config, default to cohens_d
     method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
-    stats = compute_feature_stats(A_fgt, A_ret, method=method, verbose=False)
-    feat_idx = select_features(stats, method=method, top_k=build_u_top_value, fdr=0.05, verbose=False)
+    stats = compute_feature_stats(A_fgt, A_ret, method=method)
+    feat_idx = select_features(stats, method=method, top_k=build_u_top_value, fdr=0.05)
     
     if len(feat_idx) == 0:
         print(f"    ERROR: No discriminative features found. Cannot proceed with editing.")
@@ -281,11 +272,10 @@ def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, encoder: str, build_
     
     E_edit, info = apply_edits(
         pre.Z_all, None, feat_idx, U, pre.mu, pre.W,
-        beta=cfg['edits']['beta'], 
-        do_leace=cfg['edits']['leace'], 
-        leace_params={'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, 
-        noise_sigma=cfg['edits']['noise_sigma'], 
-        device=device
+        cfg['edits']['beta'], 
+        cfg['edits']['leace'], 
+        {'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, 
+        cfg['edits']['noise_sigma']
     )
     E_all_edited = E_edit
     E_all_norm = pre.E_all / (np.linalg.norm(pre.E_all, axis=1, keepdims=True) + 1e-12)
@@ -324,7 +314,7 @@ def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, encoder: str, build_
     }
 
 
-def run_build_u_top_analysis(cfg: Dict, verbose: bool = False) -> pd.DataFrame:
+def run_build_u_top_analysis(cfg: Dict) -> pd.DataFrame:
     """
     Run build_U_top percentage analysis for all encoders and percentages.
     """
@@ -333,7 +323,7 @@ def run_build_u_top_analysis(cfg: Dict, verbose: bool = False) -> pd.DataFrame:
     
     # Define encoders and build_U_top percentages
     encoders = ['ecapa', 'wav2vec2', 'hubert']
-    build_u_top_percentages = ['1%', '2%', '3%', '4%', '5%']
+    build_u_top_percentages = ['1%', '2%', '5%', '10%', '25%']
     
     print(f"Build_U_top Analysis Configuration:")
     print(f"  - Encoders: {encoders}")
@@ -353,8 +343,22 @@ def run_build_u_top_analysis(cfg: Dict, verbose: bool = False) -> pd.DataFrame:
     fieldnames = ["encoder", "build_U_top_pct", "build_U_top_value", "FA_before", "FA_after", "RA_before", "RA_after", "ERB_score", "error"]
     write_header = not os.path.exists(results_path)
     
-    # Initialize adapter
-    adapter = VoxCelebAdapter()
+    # Initialize adapter based on dataset configuration
+    dataset_name = cfg['dataset']['name']
+    adapters = {
+        'voxceleb': VoxCelebAdapter(),
+        'speech_commands': SpeechCommandsAdapter(),
+        'audiomnist': AudioMNISTAdapter(),
+        'librispeech': LibriSpeechAdapter(),
+        'lahaja': LahajaAdapter(),
+        'mls_spanish': MLSSpanishAdapter(),
+    }
+    
+    if dataset_name not in adapters:
+        raise ValueError(f"Unknown dataset: {dataset_name}. Available: {list(adapters.keys())}")
+    
+    adapter = adapters[dataset_name]
+    print(f"Using adapter for dataset: {dataset_name}")
     
     results = []
     
@@ -454,7 +458,6 @@ def main():
     
     parser = argparse.ArgumentParser(description='Build_U_top Percentage Analysis')
     parser.add_argument('--config', '-c', type=str, required=True, help='Path to YAML configuration file')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
     
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -462,7 +465,7 @@ def main():
     # Update save directory for this analysis
     cfg['experiment']['save_dir'] = os.path.join(cfg['experiment']['save_dir'], 'build_u_top_analysis')
     
-    results_df = run_build_u_top_analysis(cfg, verbose=args.verbose)
+    results_df = run_build_u_top_analysis(cfg)
     
     print(f"\nAnalysis complete! Check the results in: {cfg['experiment']['save_dir']}")
 

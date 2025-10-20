@@ -40,4 +40,3 @@ orchestration:
   mode: single
   seeds: [1337, 1338, 1339]
   classifier_epochs: 20
-

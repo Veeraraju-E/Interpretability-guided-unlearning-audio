@@ -1,7 +1,12 @@
 __pycache__
 *out*
 pretrained_models
-*plots*
+*plot*
 *runs*
 .venv
-*.tex
+*.png
+*.pkl
+*.jpg
+*.pdf
+*.npy
+visualization
