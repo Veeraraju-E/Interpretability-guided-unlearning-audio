@@ -47,5 +47,3 @@ def evaluate_classifier(model: SimpleClassifier, X: np.ndarray, y: List[int], de
         preds = model(torch.from_numpy(X).float().to(device)).argmax(1).cpu().numpy()
     acc = accuracy_score(y, preds)
     return acc
-
-

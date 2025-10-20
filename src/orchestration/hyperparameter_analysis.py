@@ -12,26 +12,19 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.datasets.voxceleb_adapter import VoxCelebAdapter
 from src.core.utils.seed import seed_all
-from src.core.sae.model import SAE
-from src.core.sae.train import train_sae
-from src.core.sae.encode import sae_encode_batch
+from src.core.sae import SAE, train_sae, sae_encode_batch
 from src.core.utils.stats import compute_feature_stats, select_features
 from src.core.utils.subspace import build_U_from_decoder
 from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
+from src.core.edits import apply_edits
 
 
 def load_config(config_path: str) -> Dict:
-    """Load configuration from YAML file."""
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+    with open(config_path, 'r') as f: return yaml.safe_load(f)
 
 
 def cache_embeddings(adapter, cfg: Dict, device: str) -> Tuple:
-    """
-    Cache embeddings to avoid recomputation across hyperparameter combinations.
-    Returns (pre, classes) where pre contains all precomputed data.
-    """
     base_save_dir = cfg['experiment']['save_dir']
     os.makedirs(base_save_dir, exist_ok=True)
     
@@ -65,30 +58,20 @@ def cache_embeddings(adapter, cfg: Dict, device: str) -> Tuple:
     return pre, classes
 
 
-def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_factor: float, topk: int, device: str, baseline_clf, baseline_FA: float, baseline_RA: float, verbose: bool = False) -> Dict:
+def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_factor: float, topk: int, device: str, baseline_clf, baseline_FA: float, baseline_RA: float) -> Dict:
     """
     Evaluate a single hyperparameter combination (expansion_factor, topk).
     Returns FA and RA metrics.
     """
-    if verbose:
-        print(f"  Evaluating: expansion_factor={expansion_factor}, topk={topk}")
     
-    # Set up data
     Z_all = pre.Z_all
-    all_labels = pre.labels  # Use same naming as single_run
+    all_labels = pre.labels
     mask_dev = pre.mask_dev
     mask_test = pre.mask_test
     
-    # Create forget/retain masks for the first forget label (following single_run pattern)
     forget_label = cfg['dataset']['forget_labels'][0]
     forget_label_str = str(forget_label)
-    
-    if verbose:
-        print(f"    Debug: forget_label = {forget_label_str}")
-        print(f"    Debug: all_labels sample = {all_labels[:5]}")
-        print(f"    Debug: all_labels types = {[type(lbl) for lbl in all_labels[:5]]}")
-    
-    # Create sets following single_run pattern
+
     sets = [f"{'forget' if str(lbl) == forget_label_str else 'retain'}:{'dev' if mask_dev[i] else 'test'}" for i, lbl in enumerate(all_labels)]
     
     M_ret_dev = np.array([s == 'retain:dev' for s in sets], dtype=bool)
@@ -96,43 +79,16 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
     M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
     M_fgt_test = np.array([s == 'forget:test' for s in sets], dtype=bool)
     
-    if verbose:
-        print(f"    Debug: M_ret_dev samples: {M_ret_dev.sum()}, M_fgt_dev samples: {M_fgt_dev.sum()}")
-        print(f"    Debug: M_ret_test samples: {M_ret_test.sum()}, M_fgt_test samples: {M_fgt_test.sum()}")
+    Z_train = Z_all[mask_dev]; perm = np.random.permutation(Z_train.shape[0]); cut = int(0.8 * len(perm)); Z_sae_train, Z_sae_val = Z_train[perm[:cut]], Z_train[perm[cut:]]
     
-    # Train SAE with current hyperparameters
-    Z_train = Z_all[mask_dev]
-    perm = np.random.permutation(Z_train.shape[0])
-    cut = int(0.8 * len(perm))
-    Z_sae_train, Z_sae_val = Z_train[perm[:cut]], Z_train[perm[cut:]]
+    sae = SAE(input_dim=Z_all.shape[1], hidden_mult=expansion_factor, k=topk, variant='topk', hidden_dim=cfg['sae']['hidden_dim'])
     
-    sae = SAE(
-        input_dim=Z_all.shape[1], 
-        hidden_mult=expansion_factor, 
-        k=topk, 
-        variant='topk', 
-        hidden_dim=cfg['sae']['hidden_dim']
-    )
-    
-    # Train SAE
-    sae = train_sae(
-        sae, Z_sae_train, Z_sae_val, 
-        epochs=cfg['sae']['epochs'], 
-        device=device, 
-        return_loss_history=False
-    )
-    
-    # Get SAE activations
+    sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae']['epochs'], device=device, return_loss_history=False)
     A_all = sae_encode_batch(sae, Z_all, device=device)
     
     # Feature mining (following single_run pattern)
     A_ret = A_all[M_ret_dev]
     A_fgt = A_all[M_fgt_dev]
-    
-    if verbose:
-        print(f"    Debug: A_ret shape: {A_ret.shape}, A_fgt shape: {A_fgt.shape}")
-        print(f"    Debug: A_ret activation stats - mean: {A_ret.mean():.6f}, std: {A_ret.std():.6f}")
-        print(f"    Debug: A_fgt activation stats - mean: {A_fgt.mean():.6f}, std: {A_fgt.std():.6f}")
     
     # Check if we have enough samples
     if M_fgt_dev.sum() < 5 or M_ret_dev.sum() < 5:
@@ -152,8 +108,8 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
     
     # Get statistical method from config, default to cohens_d
     method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
-    stats = compute_feature_stats(A_fgt, A_ret, method=method, verbose=verbose)
-    feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05, verbose=verbose)
+    stats = compute_feature_stats(A_fgt, A_ret, method=method)
+    feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
     
     if len(feat_idx) == 0:
         print(f"    ERROR: No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
@@ -170,35 +126,28 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
             'error': 'No discriminative features found'
         }
     
-    # Build subspace and apply edits (following single_run pattern)
+    # Build subspace and apply edits
     dec_w = sae.dec.weight.detach().cpu().numpy()
     from src.core.utils.subspace import prune_and_normalize_decoder
     prune_and_normalize_decoder(dec_w)
     U = build_U_from_decoder(dec_w, feat_idx)
     
-    # LEACE params - create labels for the full dataset (following single_run pattern)
+    # LEACE params - create labels for the full dataset
     Y_all = np.array([1 if all_labels[i] == forget_label else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
     
-    if verbose:
-        print(f"    Debug: Y_all shape: {Y_all.shape}, Y_all unique values: {np.unique(Y_all)}")
-        print(f"    Debug: forget_label type: {type(forget_label)}, all_labels[0] type: {type(all_labels[0])}")
-    
-    # Apply edits using the same function as single_run
-    from src.core.edits.apply import apply_edits
+    # Apply edits
     E_edit, info = apply_edits(
         pre.Z_all, sae, feat_idx, U, pre.mu, pre.W,
-        beta=cfg['edits']['beta'], do_leace=cfg['edits']['leace'], 
-        leace_params={'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, 
-        noise_sigma=cfg['edits']['noise_sigma'], device=device
+        cfg['edits']['beta'], cfg['edits']['leace'], 
+        {'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, 
+        cfg['edits']['noise_sigma']
     )
     E_all_edited = E_edit
     E_all_norm = pre.E_all / (np.linalg.norm(pre.E_all, axis=1, keepdims=True) + 1e-12)
     E_all_norm2 = E_all_edited / (np.linalg.norm(E_all_edited, axis=1, keepdims=True) + 1e-12)
     
-    # Use the baseline classifier (no need to retrain)
     cls2id = {c: i for i, c in enumerate(classes)}
     
-    # Evaluate classification accuracy using baseline classifier
     E_ret_test = E_all_norm[M_ret_test]
     L_ret_test = [cls2id[d] for d in np.array(all_labels)[M_ret_test]]
     E_fgt_test = E_all_norm[M_fgt_test]
@@ -230,10 +179,7 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
     }
 
 
-def run_hyperparameter_analysis(cfg: Dict, verbose: bool = False) -> pd.DataFrame:
-    """
-    Run hyperparameter analysis for the specified expansion factors and topk values.
-    """
+def run_hyperparameter_analysis(cfg: Dict) -> pd.DataFrame:
     device = cfg['experiment']['device']
     seed_all(cfg['experiment']['seed'])
     
@@ -254,7 +200,7 @@ def run_hyperparameter_analysis(cfg: Dict, verbose: bool = False) -> pd.DataFram
     adapter = VoxCelebAdapter()
     pre, classes = cache_embeddings(adapter, cfg, device)
     
-    # Train classifier ONCE at the beginning (this ensures consistent FA/RA baseline)
+    # Train classifier ONCE at the beginning
     print(f"\nTraining baseline classifier...")
     E_all_norm = pre.E_all / (np.linalg.norm(pre.E_all, axis=1, keepdims=True) + 1e-12)
     all_labels = pre.labels
@@ -265,12 +211,9 @@ def run_hyperparameter_analysis(cfg: Dict, verbose: bool = False) -> pd.DataFram
     X_cls_val = E_all_norm[pre.mask_test]
     y_cls_val = [cls2id[l] for l in np.array(all_labels)[pre.mask_test]]
     
-    baseline_clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, 
-                                   num_classes=len(classes), device=device, 
-                                   epochs=cfg['orchestration']['classifier_epochs'], 
-                                   batch_size=512, lr=1e-3)
+    baseline_clf = train_classifier(X_cls_train, y_cls_train, X_cls_val, y_cls_val, num_classes=len(classes), device=device, epochs=cfg['orchestration']['classifier_epochs'], batch_size=512, lr=1e-3)
     
-    # Compute baseline FA and RA (these should be consistent across all combinations)
+    # Compute baseline FA and RA
     forget_label = cfg['dataset']['forget_labels'][0]
     forget_label_str = str(forget_label)
     sets = [f"{'forget' if str(lbl) == forget_label_str else 'retain'}:{'dev' if pre.mask_dev[i] else 'test'}" for i, lbl in enumerate(all_labels)]
@@ -298,18 +241,9 @@ def run_hyperparameter_analysis(cfg: Dict, verbose: bool = False) -> pd.DataFram
             print(f"\n[{combination_num}/{total_combinations}] Testing expansion_factor={expansion_factor}, topk={topk}")
             
             try:
-                result = evaluate_hyperparameter_combination(
-                    pre, classes, cfg, expansion_factor, topk, device, baseline_clf, 
-                    baseline_FA, baseline_RA, verbose
-                )
+                result = evaluate_hyperparameter_combination(pre, classes, cfg, expansion_factor, topk, device, baseline_clf, baseline_FA, baseline_RA)
                 results.append(result)
                 
-                if verbose:
-                    print(f"    FA_before: {result['FA_before']:.4f}, FA_after: {result['FA_after']:.4f}")
-                    print(f"    RA_before: {result['RA_before']:.4f}, RA_after: {result['RA_after']:.4f}")
-                else:
-                    print(f"    FA: {result['FA_before']:.4f} → {result['FA_after']:.4f}, RA: {result['RA_before']:.4f} → {result['RA_after']:.4f}")
-                    
             except Exception as e:
                 print(f"    ERROR: {str(e)}")
                 results.append({
@@ -325,7 +259,7 @@ def run_hyperparameter_analysis(cfg: Dict, verbose: bool = False) -> pd.DataFram
                     'error': str(e)
                 })
     
-    # Save results
+    # Save
     results_df = pd.DataFrame(results)
     output_dir = cfg['experiment']['save_dir']
     os.makedirs(output_dir, exist_ok=True)
@@ -347,11 +281,10 @@ def run_hyperparameter_analysis(cfg: Dict, verbose: bool = False) -> pd.DataFram
 def main():
     parser = argparse.ArgumentParser(description='Hyperparameter Analysis for TopK SAE Module')
     parser.add_argument('--config', '-c', type=str, required=True, help='Path to YAML configuration file')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
     
     args = parser.parse_args()
     cfg = load_config(args.config)    
-    results_df = run_hyperparameter_analysis(cfg, verbose=args.verbose)
+    _ = run_hyperparameter_analysis(cfg)
     
     print(f"\nAnalysis complete! Check the results in: {cfg['experiment']['save_dir']}/hyperparameter_analysis_results.csv")
 

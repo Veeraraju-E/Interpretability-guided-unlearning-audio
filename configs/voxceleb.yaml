@@ -1,6 +1,6 @@
 experiment:
   name: voxceleb_exp
-  save_dir: ./runs/voxceleb_single_u_top_1_percent
+  save_dir: ./runs/voxceleb
   device: cuda
   seed: 1337
 
@@ -11,7 +11,7 @@ dataset:
   forget_labels: ['id00017']
 
 encoder:
-  name: ecapa
+  name: wav2vec2
   wav2vec2_model: facebook/wav2vec2-base
   hubert_model: facebook/hubert-base-ls960
   conformer_model: facebook/wav2vec2-conformer-rel-pos-large
@@ -22,12 +22,12 @@ sae:
   multiplier: 8.0
   topk: 128
   lambda_sparsity: 0.0
-  epochs: 1
+  epochs: 100
   batch_size: 64
   hidden_dim: 0
 
 feature_mining:
-  build_U_top: 61 # 1% of 6144
+  build_U_top: 305 # 5% of 6144
   statistical_method: cohens_d  # Only cohens_d supported
 
 edits:

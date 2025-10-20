@@ -1,9 +1,7 @@
 """
 Main CLI interface for Interpretability-guided-unlearning-audio using Typer.
-Provides a unified command-line interface for all unlearning operations.
 """
 
-import os
 import sys
 import yaml
 from pathlib import Path
@@ -12,9 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich import print as rprint
 
-# Add src to path for imports
 sys.path.append('/data/veer/testing/new/Interpretability-guided-unlearning-audio/src')
 
 from src.datasets.voxceleb_adapter import VoxCelebAdapter
@@ -47,10 +43,8 @@ ADAPTERS = {
 }
 
 def load_config(path: str) -> dict:
-    """Load YAML configuration file."""
     try:
-        with open(path, 'r') as f:
-            return yaml.safe_load(f)
+        with open(path, 'r') as f: return yaml.safe_load(f)
     except FileNotFoundError:
         console.print(f"[red]Error: Config file '{path}' not found[/red]")
         raise typer.Exit(1)
@@ -118,11 +112,6 @@ def run(
         help="Path to YAML configuration file",
         exists=True
     ),
-    verbose: bool = typer.Option(
-        False, 
-        "--verbose", "-v", 
-        help="Enable verbose output"
-    ),
     show_config: bool = typer.Option(
         False, 
         "--show-config", 
@@ -141,7 +130,7 @@ def run(
     cfg = load_config(str(config))
     validate_config_dict(cfg)
     
-    if show_config or verbose:
+    if show_config:
         print_config_summary(cfg)
     
     # Get adapter and mode
@@ -155,12 +144,12 @@ def run(
     try:
         if mode == 'single':
             console.print("[yellow]Running single unlearning experiment...[/yellow]")
-            results = run_single(adapter, cfg, verbose=verbose)
+            results = run_single(adapter, cfg)
             console.print(f"[green] Single unlearning completed. Results: {len(results)} classes processed[/green]")
             
         elif mode == 'multi':
             console.print("[yellow]Running multi-class unlearning experiment...[/yellow]")
-            run_multi(adapter, cfg, verbose=verbose)
+            run_multi(adapter, cfg)
             console.print("[green] Multi-class unlearning completed[/green]")
             
         elif mode == 'continual':
@@ -175,8 +164,6 @@ def run(
             
     except Exception as e:
         console.print(f"[red]Error during execution: {e}[/red]")
-        if verbose:
-            console.print_exception()
         raise typer.Exit(1)
 
 @app.command()
@@ -196,11 +183,6 @@ def interpret(
         "--device", "-d", 
         help="Device to use for analysis"
     ),
-    verbose: bool = typer.Option(
-        False, 
-        "--verbose", "-v", 
-        help="Enable verbose output"
-    )
 ):
     """
     Run interpretability analysis on saved artifacts.
@@ -232,8 +214,6 @@ def interpret(
         
     except Exception as e:
         console.print(f"[red]Error during interpretability analysis: {e}[/red]")
-        if verbose:
-            console.print_exception()
         raise typer.Exit(1)
 
 @app.command()
@@ -243,11 +223,6 @@ def grid(
         "--config", "-c", 
         help="Path to YAML configuration file",
         exists=True
-    ),
-    verbose: bool = typer.Option(
-        False, 
-        "--verbose", "-v", 
-        help="Enable verbose output"
     ),
     show_config: bool = typer.Option(
         False, 
@@ -267,7 +242,7 @@ def grid(
     cfg = load_config(str(config))
     validate_config_dict(cfg)
     
-    if show_config or verbose:
+    if show_config:
         print_config_summary(cfg)
     
     # Get grid search parameters
@@ -293,13 +268,10 @@ def grid(
         
     except Exception as e:
         console.print(f"[red]Error during grid search: {e}[/red]")
-        if verbose:
-            console.print_exception()
         raise typer.Exit(1)
 
 @app.command()
 def list_configs():
-    """List available configuration files."""
     console.print(Panel.fit(" Available Configuration Files", style="bold blue"))
     
     configs_dir = Path("configs")
@@ -334,13 +306,11 @@ def validate_config(
         exists=True
     )
 ):
-    """Validate a configuration file without running experiments."""
     console.print(Panel.fit(" Validating Configuration", style="bold blue"))
     
     try:
         cfg = load_config(str(config))
         validate_config_dict(cfg)
-        
         console.print("[green] Configuration is valid![/green]")
         print_config_summary(cfg)
         
@@ -357,13 +327,10 @@ def main(
     )
 ):
     """
-    Interpretability-guided unlearning for audio with SAE-driven feature mining.
-    
-    This tool provides comprehensive unlearning capabilities for audio models,
-    including single-class, multi-class, and continual unlearning scenarios.
+    Main interface for SAE-guided unlearning for audio.    
     """
     if version:
-        console.print("Interpretability-guided-unlearning-audio")
+        console.print("SAE-guided-unlearning-audio")
         raise typer.Exit()
 
 if __name__ == "__main__":

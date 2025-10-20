@@ -12,20 +12,13 @@ except Exception:
 
 def cohens_d(x_pos: np.ndarray, x_neg: np.ndarray) -> float:
     n1, n2 = len(x_pos), len(x_neg)
-    
-    # Fail fast for empty arrays - this indicates a data issue
-    if n1 == 0:
+    if n1 == 0 or n2 == 0:
         raise ValueError("Cannot compute Cohen's d: positive samples array is empty. This suggests a data filtering or sampling issue.")
-    if n2 == 0:
-        raise ValueError("Cannot compute Cohen's d: negative samples array is empty. This suggests a data filtering or sampling issue.")
-    
     m1, m2 = x_pos.mean(), x_neg.mean()
     s1, s2 = x_pos.var(ddof=1), x_neg.var(ddof=1)
     s_pooled = math.sqrt(((n1-1)*s1 + (n2-1)*s2) / max(1, n1+n2-2))
     
-    # Debug: Print detailed statistics when variance is zero
     if s_pooled == 0:
-        print(f"DEBUG: Cohen's d zero variance detected!")
         print(f"  Positive samples (n={n1}): mean={m1:.6f}, var={s1:.6f}, std={math.sqrt(s1):.6f}")
         print(f"  Negative samples (n={n2}): mean={m2:.6f}, var={s2:.6f}, std={math.sqrt(s2):.6f}")
         print(f"  Positive sample values: {x_pos[:min(10, len(x_pos))]}")
@@ -37,13 +30,9 @@ def cohens_d(x_pos: np.ndarray, x_neg: np.ndarray) -> float:
 
 def mann_whitney_u_p(x_pos: np.ndarray, x_neg: np.ndarray) -> tuple[float,float]:
     n1, n2 = len(x_pos), len(x_neg)
-    
-    # Fail fast for empty arrays - this indicates a data issue
-    if n1 == 0:
-        raise ValueError("Cannot compute Mann-Whitney U: positive samples array is empty. This suggests a data filtering or sampling issue.")
-    if n2 == 0:
-        raise ValueError("Cannot compute Mann-Whitney U: negative samples array is empty. This suggests a data filtering or sampling issue.")
-    
+    if n1 == 0 or n2 == 0:
+        raise ValueError("Cannot compute Mann-Whitney U: samples array is empty. This suggests a data filtering or sampling issue.")
+
     x = np.concatenate([x_pos, x_neg])
     labels = np.concatenate([np.ones(len(x_pos)), np.zeros(len(x_neg))])
     ranks = np.argsort(np.argsort(x)) + 1
@@ -58,39 +47,24 @@ def mann_whitney_u_p(x_pos: np.ndarray, x_neg: np.ndarray) -> tuple[float,float]
     return auc, p
 
 
-
-
-def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, verbose: bool = False) -> Dict:
+def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray) -> Dict:
     # Validate input arrays
-    if A_pos.shape[0] == 0:
+    if A_pos.shape[0] == 0 or A_neg.shape[0] == 0:
         raise ValueError("Cannot compute feature statistics: positive samples array is empty. This suggests a data filtering or sampling issue.")
-    if A_neg.shape[0] == 0:
-        raise ValueError("Cannot compute feature statistics: negative samples array is empty. This suggests a data filtering or sampling issue.")
-    
-    if verbose:
-        print(f"DEBUG: feature_stats called with A_pos shape: {A_pos.shape}, A_neg shape: {A_neg.shape}")
-        print(f"DEBUG: A_pos stats - mean: {A_pos.mean():.6f}, std: {A_pos.std():.6f}, min: {A_pos.min():.6f}, max: {A_pos.max():.6f}")
-        print(f"DEBUG: A_neg stats - mean: {A_neg.mean():.6f}, std: {A_neg.std():.6f}, min: {A_neg.min():.6f}, max: {A_neg.max():.6f}")
-    
     m = A_pos.shape[1]
     pos_activity = (A_pos > 1e-6).sum(axis=0)
     neg_activity = (A_neg > 1e-6).sum(axis=0)
     dead_latents = (pos_activity == 0) & (neg_activity == 0)    
     
-    if verbose:
-        active_latents = ~dead_latents
-        print(f"DEBUG: Dead features (never activated): {dead_latents.sum()} out of {m} total features")
-        print(f"DEBUG: Active features: {active_latents.sum()} out of {m} total features")
     
     stats = {"cohens_d": np.zeros(m), "auc": np.zeros(m), "pval": np.ones(m)}
     
     # Only compute statistics for active features
     for j in range(m):
         if dead_latents[j]:
-            # Skip dead features - they have no discriminative power
             stats["cohens_d"][j] = 0.0
-            stats["auc"][j] = 0.5  # Random performance
-            stats["pval"][j] = 1.0  # Non-significant
+            stats["auc"][j] = 0.5
+            stats["pval"][j] = 1.0 
             continue
             
         x_pos = A_pos[:, j]; x_neg = A_neg[:, j]
@@ -99,8 +73,6 @@ def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, verbose: bool = False) -
         pos_var = x_pos.var(ddof=1)
         neg_var = x_neg.var(ddof=1)
         if pos_var == 0 and neg_var == 0:
-            if verbose:
-                print(f"DEBUG: Active feature {j} has zero variance in both groups")
             stats["cohens_d"][j] = 0.0
             stats["auc"][j] = 0.5
             stats["pval"][j] = 1.0
@@ -109,8 +81,6 @@ def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, verbose: bool = False) -
         try:
             stats["cohens_d"][j] = cohens_d(x_pos, x_neg)
         except ValueError as e:
-            if verbose:
-                print(f"DEBUG: Cohen's d will not work for feature {j}: {e}")
             stats["cohens_d"][j] = 0.0
         
         # ROC AUC computation
@@ -118,27 +88,23 @@ def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, verbose: bool = False) -
             y_true = np.concatenate([np.ones(len(x_pos)), np.zeros(len(x_neg))])
             y_scores = np.concatenate([x_pos, x_neg])
             stats["auc"][j] = float(roc_auc_score(y_true, y_scores))
-        except Exception as e:
-            if verbose:
-                print(f"DEBUG: ROC AUC did not work for feature {j}: {e}")
+        except Exception:
             stats["auc"][j] = 0.5
             
         try:
             _, p = mann_whitney_u_p(x_pos, x_neg)
             stats["pval"][j] = p
-        except Exception as e:
-            if verbose:
-                print(f"DEBUG: Mann-Whitney U failed for feature {j}: {e}")
+        except Exception:
             stats["pval"][j] = 1.0
     
     return stats
 
-def select_features_from_stats(stats: dict, top_k: int = 200, fdr: float = 0.05, verbose: bool = False):
+def select_features_from_stats(stats: dict, top_k: int = 200, fdr: float = 0.05):
     pvals = stats["pval"]
     
-    # Filter out features with AUC = 0.5 (random performance, likely dead features)
+    # Filter out features with AUC = 0.5 (random performance)
     auc_scores = np.abs(stats["auc"] - 0.5)
-    valid_features = auc_scores > 1e-6  # Features with some discriminative power
+    valid_features = auc_scores > 1e-6
     
     console = Console()
     console.print(f"Features with discriminative power (AUC != 0.5): {valid_features.sum()} out of {len(valid_features)}", style="yellow")
@@ -159,7 +125,7 @@ def select_features_from_stats(stats: dict, top_k: int = 200, fdr: float = 0.05,
         if len(significant_indices) == 0:
             # Fallback: select top features by AUC
             idx = np.argsort(-auc_scores)[:top_k]
-            idx = idx[valid_features[idx]]  # Only keep valid features
+            idx = idx[valid_features[idx]]
         else:
             # Sort significant features by AUC
             idx = sorted(significant_indices, key=lambda j: -auc_scores[j])
@@ -167,14 +133,12 @@ def select_features_from_stats(stats: dict, top_k: int = 200, fdr: float = 0.05,
     else:
         # Select top features by AUC, but only from valid features
         idx = np.argsort(-auc_scores)[:top_k]
-        idx = idx[valid_features[idx]]  # Only keep valid features
+        idx = idx[valid_features[idx]]
     
-    if verbose:
-        print(f"DEBUG: Selected {len(idx)} features for editing")
     return list(idx)
 
 
-def compute_feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, method: str = "cohens_d", verbose: bool = False) -> Dict:
+def compute_feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, method: str = "cohens_d") -> Dict:
     """
     Compute feature statistics using Cohen's d method.
     
@@ -182,17 +146,16 @@ def compute_feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, method: str = "c
         A_pos: Positive class activations (N_pos x m)
         A_neg: Negative class activations (N_neg x m)
         method: Statistical method to use (only "cohens_d" supported)
-        verbose: Whether to print debug information
     
     Returns:
         Dictionary with computed statistics
     """
     if method == "cohens_d":
-        return feature_stats(A_pos, A_neg, verbose=verbose)
+        return feature_stats(A_pos, A_neg)
     else:
         raise ValueError(f"Unknown statistical method: {method}. Only 'cohens_d' is supported.")
 
-def select_features(stats: dict, method: str = "cohens_d", top_k: int = 200, fdr: float = 0.05, verbose: bool = False):
+def select_features(stats: dict, method: str = "cohens_d", top_k: int = 200, fdr: float = 0.05):
     """
     Select features using Cohen's d method.
     
@@ -201,12 +164,11 @@ def select_features(stats: dict, method: str = "cohens_d", top_k: int = 200, fdr
         method: Statistical method to use (only "cohens_d" supported)
         top_k: Maximum number of features to select
         fdr: False Discovery Rate threshold
-        verbose: Whether to print debug information
     
     Returns:
         List of selected feature indices
     """
     if method == "cohens_d":
-        return select_features_from_stats(stats, top_k=top_k, fdr=fdr, verbose=verbose)
+        return select_features_from_stats(stats, top_k=top_k, fdr=fdr)
     else:
         raise ValueError(f"Unknown statistical method: {method}. Only 'cohens_d' is supported.")

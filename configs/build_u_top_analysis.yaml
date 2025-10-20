@@ -1,14 +1,14 @@
 experiment:
   name: build_u_top_analysis
-  save_dir: ./runs/build_u_top_analysis
+  save_dir: ./runs/build_u_top_analysis/audiomnist
   device: cuda
   seed: 1337
 
 dataset:
-  name: voxceleb
-  root_or_manifest: /data/veer/testing/new/datasets/voxceleb2/manifest.csv
+  name: audiomnist
+  root_or_manifest: /data/veer/testing/new/datasets/audiomnist_data
   dev_frac: 0.7
-  forget_labels: ['id00017']  # Single forget label for focused analysis
+  forget_labels: ['1']  # Single forget label for focused analysis
 
 encoder:
   name: ecapa  # Will be overridden in analysis script

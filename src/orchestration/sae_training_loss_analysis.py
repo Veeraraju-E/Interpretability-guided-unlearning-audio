@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 SAE Training Loss Analysis
-Creates a unified script for SAE hyperparameter grid search that records validation MSE loss curves
-and generates publication-quality visualization with 4 subplots showing loss vs epochs for each alpha value.
 """
 
 import os
@@ -10,7 +8,6 @@ import sys
 import yaml
 import pickle
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Dict, Tuple
 import argparse
@@ -21,8 +18,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from src.datasets.voxceleb_adapter import VoxCelebAdapter
 from src.core.utils.seed import seed_all
-from src.core.sae.model import SAE
-from src.core.sae.train import train_sae
+from src.core.sae import SAE, train_sae
 
 # Set publication-quality style matching the project theme
 plt.style.use('default')
@@ -51,9 +47,7 @@ plt.rcParams.update({
 
 
 def load_config(config_path: str) -> Dict:
-    """Load configuration from YAML file."""
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
+    with open(config_path, 'r') as f: return yaml.safe_load(f)
 
 
 def cache_embeddings(adapter, cfg: Dict, device: str) -> Tuple:
@@ -87,14 +81,13 @@ def cache_embeddings(adapter, cfg: Dict, device: str) -> Tuple:
         
         # Cache embeddings
         cache_data = {'pre': pre, 'classes': classes}
-        with open(embeddings_cache_path, 'wb') as f:
-            pickle.dump(cache_data, f)
+        with open(embeddings_cache_path, 'wb') as f: pickle.dump(cache_data, f)
         print(f"Embeddings cached successfully: {pre.E_all.shape[0]} samples, {pre.E_all.shape[1]} dimensions")
     
     return pre, classes
 
 
-def run_training_analysis(cfg: Dict, verbose: bool = False) -> Dict:
+def run_training_analysis(cfg: Dict) -> Dict:
     """
     Run SAE training across all hyperparameter combinations and record loss histories.
     Returns nested dictionary with results.
@@ -145,36 +138,15 @@ def run_training_analysis(cfg: Dict, verbose: bool = False) -> Dict:
             print(f"\n[{combination_num}/{total_combinations}] Training SAE: α={alpha}, k={k}")
             
             try:
-                # Create SAE model
-                sae = SAE(
-                    input_dim=Z_all.shape[1], 
-                    hidden_mult=alpha, 
-                    k=k, 
-                    variant='topk', 
-                    hidden_dim=cfg['sae']['hidden_dim']
-                )
+                sae = SAE(input_dim=Z_all.shape[1], hidden_mult=alpha, k=k, variant='topk', hidden_dim=cfg['sae']['hidden_dim'])
                 
-                # Train SAE with loss history tracking
-                sae, loss_history = train_sae(
-                    sae, Z_sae_train, Z_sae_val, 
-                    epochs=cfg['sae']['epochs'], 
-                    batch_size=cfg['sae']['batch_size'],
-                    lr=1e-4,
-                    device=device, 
-                    return_loss_history=True
-                )
+                sae, loss_history = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae']['epochs'], batch_size=cfg['sae']['batch_size'],lr=1e-4,device=device, return_loss_history=True)
                 
-                # Store results
                 results[alpha][k] = {
                     'epochs': loss_history['epochs'],
                     'val_mse': loss_history['val_loss']
                 }
                 
-                if verbose:
-                    print(f"    Final validation MSE: {loss_history['val_loss'][-1]:.6f}")
-                else:
-                    print(f"    Final validation MSE: {loss_history['val_loss'][-1]:.6f}")
-                    
             except Exception as e:
                 print(f"    ERROR: {str(e)}")
                 results[alpha][k] = {
@@ -199,9 +171,6 @@ def run_training_analysis(cfg: Dict, verbose: bool = False) -> Dict:
 
 
 def create_visualization(cfg: Dict, results: Dict = None) -> None:
-    """
-    Create publication-quality visualization of SAE training loss curves.
-    """
     # Load results if not provided
     if results is None:
         output_dir = cfg['experiment']['save_dir']
@@ -214,11 +183,9 @@ def create_visualization(cfg: Dict, results: Dict = None) -> None:
         with open(results_path, 'rb') as f:
             results = pickle.load(f)
     
-    # Define hyperparameter values
     expansion_factors = [2, 4, 8, 16]
     topk_values = [1, 2, 4, 8, 16, 32, 64, 128]
     
-    # Create figure with 2x2 subplots
     fig, axes = plt.subplots(2, 2, figsize=(6.0, 6.0))
     fig.suptitle('SAE Validation Loss', fontsize=8, fontweight='bold', y=0.98)
     
@@ -255,17 +222,11 @@ def create_visualization(cfg: Dict, results: Dict = None) -> None:
         ax.set_ylabel('Validation MSE')
         ax.grid(True, alpha=0.3)
         
-        # Set axis limits
-        ax.set_xlim(0, 500)
-        
-        # Set y-axis to log scale with adaptive range
+        ax.set_xlim(0, 500)        
         # ax.set_yscale('log')
         
-        # Add legend to each subplot (compact)
-        ax.legend(loc='upper right', frameon=True, fancybox=False, shadow=False, 
-                 fontsize=4, markerscale=0.8, handlelength=1.5, ncol=2)
+        ax.legend(loc='upper right', frameon=True, fancybox=False, shadow=False, fontsize=4, markerscale=0.8, handlelength=1.5, ncol=2)
     
-    # Adjust layout
     plt.tight_layout()
     plt.subplots_adjust(top=0.90, hspace=0.3, wspace=0.3)
     
@@ -287,7 +248,6 @@ def main():
     parser = argparse.ArgumentParser(description='SAE Training Loss Analysis')
     parser.add_argument('--config', '-c', type=str, required=True, help='Path to YAML configuration file')
     parser.add_argument('--mode', type=str, choices=['train', 'plot', 'all'], default='all', help='Mode: train (run training only), plot (generate plot only), all (both)')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose output')
     
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -302,7 +262,7 @@ def main():
         print("\n" + "="*60)
         print("RUNNING TRAINING ANALYSIS")
         print("="*60)
-        results = run_training_analysis(cfg, verbose=args.verbose)
+        results = run_training_analysis(cfg)
     
     # Generate visualization if requested
     if args.mode in ['plot', 'all']:

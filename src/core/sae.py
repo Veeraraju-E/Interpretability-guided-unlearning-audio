@@ -1,15 +1,90 @@
+"""
+SAE module for monosemantic basis.
+"""
+
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import trange
 from torch.utils.data import DataLoader, TensorDataset
-from .model import SAE
+from tqdm import tqdm, trange
 
-def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 30, batch_size: int = 4096, lr: float = 1e-3, device: str = 'cuda', lambda_sparsity: float = 0.0, return_loss_history: bool = False):
+
+class SAE(nn.Module):
+    def __init__(self, input_dim: int, hidden_mult: float = 8.0, k: int = 32, hidden_dim: int = 0, variant: str = "topk"):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.hidden_mult = float(hidden_mult)
+        self.m = int(hidden_dim) if hidden_dim else int(round(self.input_dim * self.hidden_mult))
+        self.k = int(k)
+        self.variant = variant.lower()
+        if self.variant not in ["topk", "standard"]:
+            raise ValueError(f"SAE variant must be 'topk' or 'standard', got '{variant}'")
+        self.enc = nn.Linear(self.input_dim, self.m, bias=True)
+        self.dec = nn.Linear(self.m, self.input_dim, bias=False)
+        nn.init.xavier_uniform_(self.enc.weight)
+        nn.init.zeros_(self.enc.bias)
+        nn.init.xavier_uniform_(self.dec.weight)
+
+    def _ensure_2d(self, z: torch.Tensor) -> torch.Tensor:
+        if z.ndim == 3 and z.size(1) == 1:
+            z = z.squeeze(1)
+        if z.ndim > 2:
+            z = z.view(z.size(0), -1)
+        return z
+
+    def encode(self, z: torch.Tensor) -> torch.Tensor:
+        z = self._ensure_2d(z)
+        a = F.relu(self.enc(z))
+        if self.variant == "topk" and 0 < self.k < a.shape[1]:
+            topk_vals, _ = torch.topk(a, self.k, dim=1)
+            kth = topk_vals[:, -1].unsqueeze(1)
+            mask = (a >= kth).float()
+            a = a * mask
+        return a
+
+    def decode(self, a: torch.Tensor) -> torch.Tensor:
+        return self.dec(a)
+
+    def forward(self, z: torch.Tensor):
+        z = self._ensure_2d(z)
+        a = self.encode(z)
+        z_hat = self.decode(a)
+        return z_hat, a
+
+
+@torch.no_grad()
+def sae_encode_batch(model: SAE, Z: np.ndarray, device: str = 'cuda', batch: int = 8192) -> np.ndarray:
+    model = model.to(device).eval()
+    Z = np.asarray(Z)
+    if Z.ndim > 2:
+        Z = Z.reshape(Z.shape[0], -1)
+    A = []
+    for i in tqdm(range(0, Z.shape[0], batch), desc="SAE encode"):
+        z = torch.from_numpy(Z[i:i+batch]).float().to(device)
+        a = model.encode(z)
+        A.append(a.cpu().numpy())
+    A_all = np.vstack(A) if len(A) > 0 else np.zeros((0, model.m))
+    return A_all
+
+
+def train_sae(
+    model: SAE,
+    Z_train: np.ndarray,
+    Z_val: np.ndarray,
+    epochs: int = 30,
+    batch_size: int = 4096,
+    lr: float = 1e-3,
+    device: str = 'cuda',
+    lambda_sparsity: float = 0.0,
+    return_loss_history: bool = False,
+):
     Z_train = np.asarray(Z_train)
     Z_val = np.asarray(Z_val)
-    if Z_train.ndim > 2: Z_train = Z_train.reshape(Z_train.shape[0], -1)
-    if Z_val.ndim > 2: Z_val = Z_val.reshape(Z_val.shape[0], -1)
+    if Z_train.ndim > 2:
+        Z_train = Z_train.reshape(Z_train.shape[0], -1)
+    if Z_val.ndim > 2:
+        Z_val = Z_val.reshape(Z_val.shape[0], -1)
     if Z_train.shape[1] != model.input_dim:
         raise RuntimeError(f"SAE input dim mismatch: model.input_dim={model.input_dim} but Z_train has dim={Z_train.shape[1]}")
 
@@ -22,7 +97,6 @@ def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 
     loss_history = {
         'epochs': [], 'train_loss': [], 'val_loss': [], 'train_l1_loss': [], 'val_l1_loss': [], 'dead_latent_fraction': []
     } if return_loss_history else None
-
 
     pbar = trange(1, epochs + 1, desc="Epoch", position=0)
     for epoch in pbar:
@@ -59,7 +133,6 @@ def train_sae(model: SAE, Z_train: np.ndarray, Z_val: np.ndarray, epochs: int = 
         val_loss = acc_v / max(1, n_v)
         val_l1 = acc_v_l1 / max(1, n_v)
 
-        # Update tqdm bar with only epoch, train_loss, val_loss
         pbar.set_postfix({
             "train_loss": f"{train_loss:.4f}",
             "val_loss": f"{val_loss:.4f}"

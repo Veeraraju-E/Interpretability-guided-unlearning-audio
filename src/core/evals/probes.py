@@ -30,5 +30,3 @@ def safe_linear_probe(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split
         return float(acc), float(auc_val)
     except Exception:
         return float('nan'), float('nan')
-
-
