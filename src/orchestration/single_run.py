@@ -47,7 +47,16 @@ def run_single(adapter, cfg: Dict):
                 encoder_cfg=cfg['encoder'],
                 device=device,
             )
-        else:  # voxceleb and others
+        elif adapter.name == 'mls_spanish':
+            pre = adapter.precompute(
+                root_or_manifest=data_path_param,
+                embeddings_path=cfg['encoder'].get('embeddings_path'),
+                dev_frac=cfg['dataset']['dev_frac'],
+                seed=seed,
+                encoder_cfg=cfg['encoder'],
+                device=device,
+            )
+        else:  # voxceleb
             pre = adapter.precompute(
                 root_or_manifest=data_path_param,
                 embeddings_path=cfg['encoder'].get('embeddings_path'),
@@ -138,8 +147,16 @@ def run_single(adapter, cfg: Dict):
         dead_features = (ret_active_features == 0) & (fgt_active_features == 0)
         # Get statistical method from config, default to cohens_d
         method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
-        stats = compute_feature_stats(A_fgt, A_ret, method=method)
-        feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
+        balance_negs = cfg['feature_mining'].get('balance_negatives', False)
+        if balance_negs and A_ret.shape[0] > 0 and A_fgt.shape[0] > 0 and A_ret.shape[0] != A_fgt.shape[0]:
+            rng = np.random.default_rng(seed)
+            sel = rng.choice(A_ret.shape[0], size=min(A_ret.shape[0], A_fgt.shape[0]), replace=False)
+            A_ret_bal = A_ret[sel]
+        else:
+            A_ret_bal = A_ret
+        stats = compute_feature_stats(A_fgt, A_ret_bal, method=method)
+        fdr_thresh = cfg['feature_mining'].get('fdr', 0.05)
+        feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=fdr_thresh)
         
         if len(feat_idx) == 0:
             print(f"ERROR: No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
@@ -149,7 +166,7 @@ def run_single(adapter, cfg: Dict):
         U = build_U_from_decoder(dec_w, feat_idx)
 
         # LEACE params - create labels for the full dataset
-        Y_all = np.array([1 if all_labels[i] == forget_label else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
+        Y_all = np.array([1 if str(all_labels[i]) == forget_label_str else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
         E_edit, info = apply_edits(
             pre.Z_all, sae, feat_idx, U, pre.mu, pre.W,
             cfg['edits']['beta'], cfg['edits']['leace'], {'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, cfg['edits']['noise_sigma']
@@ -159,14 +176,18 @@ def run_single(adapter, cfg: Dict):
 
         # EERs
         test_mask_for_trials = M_ret_test | M_fgt_test
-        trials, tlabels = build_verification_trials(all_labels, [forget_label], test_mask_for_trials)
+        # Use all pos/neg pairs by default (set to 0 or None to mean "no cap")
+        max_pairs = cfg['orchestration'].get('max_pairs_per_class', 0)
+        trials, tlabels = build_verification_trials(all_labels, [forget_label_str], test_mask_for_trials, seed=seed, max_pairs_per_class=max_pairs)
+        pos_count = sum(1 for t in trials if all_labels[t[0]] == all_labels[t[1]] == forget_label_str)
+        neg_count = len(trials) - pos_count
         scores_before = compute_scores(E_all_norm, trials)
         scores_after = compute_scores(E_all_norm2, trials)
         eer_before = eer_from_scores(scores_before, tlabels)
         eer_after = eer_from_scores(scores_after, tlabels)
         per_class = per_class_eers(E_all_norm, E_all_norm2, all_labels, mask=test_mask_for_trials, rng_seed=seed)
-        per_class_ret = {c: vals for c, vals in per_class.items() if c != forget_label}
-        per_class_fgt = {c: vals for c, vals in per_class.items() if c == forget_label}
+        per_class_ret = {c: vals for c, vals in per_class.items() if str(c) != forget_label_str}
+        per_class_fgt = {c: vals for c, vals in per_class.items() if str(c) == forget_label_str}
         retain_avg_before, retain_avg_after = avg_eers(per_class_ret)
         forget_avg_before, forget_avg_after = avg_eers(per_class_fgt)
 
@@ -184,8 +205,8 @@ def run_single(adapter, cfg: Dict):
 
         # Probe AUC
         split_mask_dict = {'dev': pre.mask_dev, 'test': pre.mask_test}
-        _, auc_before = safe_linear_probe(E_all_norm, all_labels, U, split_mask_dict, [forget_label])
-        _, auc_after = safe_linear_probe(E_all_norm2, all_labels, U, split_mask_dict, [forget_label])
+        _, auc_before = safe_linear_probe(E_all_norm, all_labels, U, split_mask_dict, [forget_label_str])
+        _, auc_after = safe_linear_probe(E_all_norm2, all_labels, U, split_mask_dict, [forget_label_str])
 
         res = {
             "FA_before": acc_fgt_before, "FA_after": acc_fgt_after,
@@ -204,9 +225,11 @@ def run_single(adapter, cfg: Dict):
             json.dump(res, fh, indent=2)
         # interpretability dump: Z_all, Z_edit, U, labels, sets, manifest, forget_labels
         sets_np = np.array(sets)
-        np.savez_compressed(os.path.join(run_save_dir, "interpretability_data.npz"),
-                            Z_all=pre.Z_all, Z_edit=E_all_edited, U=U,
-                            labels=np.array(all_labels), sets=sets_np, manifest=np.array(pre.manifest, dtype=object), forget_spks=np.array([forget_label]))
+        np.savez_compressed(
+            os.path.join(run_save_dir, "interpretability_data.npz"),
+            Z_all=pre.Z_all, Z_edit=E_all_edited, U=U,
+            labels=np.array(all_labels), sets=sets_np, manifest=np.array(pre.manifest, dtype=object), forget_spks=np.array([forget_label])
+        )
         # SAE and whitener
         import torch
         torch.save(sae.state_dict(), os.path.join(run_save_dir, "sae_state_dict.pt"))
@@ -227,23 +250,10 @@ def run_single(adapter, cfg: Dict):
             print(f"[VIZ] Using {len(E_test_before)} test samples for visualizations")
             
             # Create visualizations using test-only normalized embeddings
-            plot_paths = create_embedding_visualizations(
-                embeddings_before=E_test_before,
-                embeddings_after=E_test_after,
-                labels=test_labels,
-                forget_labels=[forget_label],
-                save_dir=viz_dir,
-                title_prefix=f"Class {forget_label}"
-            )
+            plot_paths = create_embedding_visualizations(embeddings_before=E_test_before, embeddings_after=E_test_after, labels=test_labels, forget_labels=[forget_label], save_dir=viz_dir, title_prefix=f"Class {forget_label}")
             
             # Create summary statistics using test-only data
-            stats = create_embedding_summary_stats(
-                embeddings_before=E_test_before,
-                embeddings_after=E_test_after,
-                labels=test_labels,
-                forget_labels=[forget_label],
-                save_dir=viz_dir
-            )
+            stats = create_embedding_summary_stats(embeddings_before=E_test_before, embeddings_after=E_test_after, labels=test_labels, forget_labels=[forget_label], save_dir=viz_dir)
             
             # Add visualization paths to results
             res["visualization_paths"] = plot_paths

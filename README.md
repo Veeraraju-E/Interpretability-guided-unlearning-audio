@@ -89,8 +89,8 @@ src/
 If you use this framework in your research, please cite:
 
 ```bibtex
-@article{interpretability-guided-unlearning-audio,
-  title={Interpretability-guided Unlearning for Audio Models},
+@article{sae-guided-unlearning-audio,
+  title={sae-guided Unlearning for Audio Models},
   author={Your Name},
   journal={Your Journal},
   year={2024}

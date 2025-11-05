@@ -10,14 +10,55 @@ def run_continual(adapter, cfg: Dict, sequence: List[str]):
     os.makedirs(base_save_dir, exist_ok=True)
     seed = cfg['experiment']['seed']
     # Precompute once on full set
-    pre = adapter.precompute(
-        root_or_manifest=cfg['dataset']['root_or_manifest'],
-        embeddings_path=cfg['encoder'].get('embeddings_path'),
-        dev_frac=cfg['dataset']['dev_frac'],
-        seed=seed,
-        encoder_cfg=cfg['encoder'],
-        device=cfg['experiment']['device'],
-    )
+    data_path_param = cfg['dataset']['root_or_manifest']
+    if hasattr(adapter, 'name'):
+        if adapter.name in ['audiomnist', 'speech_commands']:
+            pre = adapter.precompute(
+                data_root=data_path_param,
+                embeddings_path=cfg['encoder'].get('embeddings_path'),
+                dev_frac=cfg['dataset']['dev_frac'],
+                seed=seed,
+                encoder_cfg=cfg['encoder'],
+                device=cfg['experiment']['device'],
+            )
+        elif adapter.name == 'librispeech':
+            pre = adapter.precompute(
+                root=data_path_param,
+                embeddings_path=cfg['encoder'].get('embeddings_path'),
+                dev_frac=cfg['dataset']['dev_frac'],
+                seed=seed,
+                encoder_cfg=cfg['encoder'],
+                device=cfg['experiment']['device'],
+            )
+        elif adapter.name == 'lahaja':
+            pre = adapter.precompute(
+                split=data_path_param,
+                embeddings_path=cfg['encoder'].get('embeddings_path'),
+                dev_frac=cfg['dataset']['dev_frac'],
+                seed=seed,
+                encoder_cfg=cfg['encoder'],
+                device=cfg['experiment']['device'],
+            )
+        elif adapter.name == 'mls_spanish':
+            pre = adapter.precompute(
+                root_or_manifest=data_path_param,
+                embeddings_path=cfg['encoder'].get('embeddings_path'),
+                dev_frac=cfg['dataset']['dev_frac'],
+                seed=seed,
+                encoder_cfg=cfg['encoder'],
+                device=cfg['experiment']['device'],
+            )
+        else:  # voxceleb and others
+            pre = adapter.precompute(
+                root_or_manifest=data_path_param,
+                embeddings_path=cfg['encoder'].get('embeddings_path'),
+                dev_frac=cfg['dataset']['dev_frac'],
+                seed=seed,
+                encoder_cfg=cfg['encoder'],
+                device=cfg['experiment']['device'],
+            )
+    else:
+        raise NotImplementedError(f"Adapter {adapter.name} not implemented for {cfg['dataset']['name']}.")
     csv_path = os.path.join(base_save_dir, f"continual_unlearning_results_seed{seed}.csv")
     fieldnames = ["step", "forgotten_label", "num_active_labels", "num_active_samples", "FA_before", "FA_after", "RA_before", "RA_after", "forget_EER_before", "forget_EER_after", "retain_EER_before", "retain_EER_after", "linear_probe_auc_before", "linear_probe_auc_after", "error"]
     with open(csv_path, "w", newline='') as fh:

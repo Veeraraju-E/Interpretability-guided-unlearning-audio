@@ -62,7 +62,18 @@ def cache_embeddings(adapter, encoder: str, cfg: Dict, device: str, cache_dir: s
     Cache embeddings to avoid recomputation across build_U_top values.
     Returns (pre, classes) where pre contains all precomputed data.
     """
-    embeddings_cache_path = os.path.join(cache_dir, f"embeddings_{encoder}.pkl")
+    # Create cache key that includes model name to avoid using wrong cached embeddings
+    encoder_cfg = cfg['encoder'].copy()
+    if encoder == 'wav2vec2':
+        model_name = encoder_cfg.get('wav2vec2_model', 'facebook/wav2vec2-base').replace('/', '_').replace('-', '_')
+        cache_key = f"embeddings_{encoder}_{model_name}"
+    elif encoder == 'hubert':
+        model_name = encoder_cfg.get('hubert_model', 'facebook/hubert-base-ls960').replace('/', '_').replace('-', '_')
+        cache_key = f"embeddings_{encoder}_{model_name}"
+    else:  # ecapa doesn't have model parameter
+        cache_key = f"embeddings_{encoder}"
+    
+    embeddings_cache_path = os.path.join(cache_dir, f"{cache_key}.pkl")
     
     if os.path.exists(embeddings_cache_path):
         print(f"Loading cached embeddings for {encoder}...")
@@ -108,6 +119,15 @@ def cache_embeddings(adapter, encoder: str, cfg: Dict, device: str, cache_dir: s
                     encoder_cfg=encoder_cfg,
                     device=device,
                 )
+            elif adapter.name == 'mls_spanish':
+                pre = adapter.precompute(
+                    root_or_manifest=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=encoder_cfg,
+                    device=device,
+                )
             else:  # voxceleb and others
                 pre = adapter.precompute(
                     root_or_manifest=data_path_param,
@@ -136,8 +156,19 @@ def cache_sae_and_activations(pre, encoder: str, cfg: Dict, device: str, cache_d
     Cache SAE model and activations to avoid retraining.
     Returns (sae, A_all, dec_w).
     """
-    sae_cache_path = os.path.join(cache_dir, f"sae_{encoder}.pkl")
-    activations_cache_path = os.path.join(cache_dir, f"activations_{encoder}.pkl")
+    # Create cache key that includes model name for consistency
+    encoder_cfg = cfg['encoder'].copy()
+    if encoder == 'wav2vec2':
+        model_name = encoder_cfg.get('wav2vec2_model', 'facebook/wav2vec2-base').replace('/', '_').replace('-', '_')
+        cache_key = f"{encoder}_{model_name}"
+    elif encoder == 'hubert':
+        model_name = encoder_cfg.get('hubert_model', 'facebook/hubert-base-ls960').replace('/', '_').replace('-', '_')
+        cache_key = f"{encoder}_{model_name}"
+    else:  # ecapa doesn't have model parameter
+        cache_key = encoder
+    
+    sae_cache_path = os.path.join(cache_dir, f"sae_{cache_key}.pkl")
+    activations_cache_path = os.path.join(cache_dir, f"activations_{cache_key}.pkl")
     
     if os.path.exists(sae_cache_path) and os.path.exists(activations_cache_path):
         print(f"Loading cached SAE and activations for {encoder}...")
@@ -181,7 +212,18 @@ def cache_classifier(pre, classes, encoder: str, cfg: Dict, device: str, cache_d
     Cache trained classifier to avoid retraining.
     Returns trained classifier.
     """
-    classifier_cache_path = os.path.join(cache_dir, f"classifier_{encoder}.pkl")
+    # Create cache key that includes model name for consistency
+    encoder_cfg = cfg['encoder'].copy()
+    if encoder == 'wav2vec2':
+        model_name = encoder_cfg.get('wav2vec2_model', 'facebook/wav2vec2-base').replace('/', '_').replace('-', '_')
+        cache_key = f"{encoder}_{model_name}"
+    elif encoder == 'hubert':
+        model_name = encoder_cfg.get('hubert_model', 'facebook/hubert-base-ls960').replace('/', '_').replace('-', '_')
+        cache_key = f"{encoder}_{model_name}"
+    else:  # ecapa doesn't have model parameter
+        cache_key = encoder
+    
+    classifier_cache_path = os.path.join(cache_dir, f"classifier_{cache_key}.pkl")
     
     if os.path.exists(classifier_cache_path):
         print(f"Loading cached classifier for {encoder}...")
@@ -208,7 +250,7 @@ def cache_classifier(pre, classes, encoder: str, cfg: Dict, device: str, cache_d
     return clf
 
 
-def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, encoder: str, build_u_top_pct: str, build_u_top_value: int, cfg: Dict, device: str) -> Dict:
+def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, sae, encoder: str, build_u_top_pct: str, build_u_top_value: int, cfg: Dict, device: str) -> Dict:
     print(f"  Analyzing {encoder} with {build_u_top_pct} ({build_u_top_value} features)...")
     
     # Setup data
@@ -268,10 +310,11 @@ def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, encoder: str, build_
     U = build_U_from_decoder(dec_w, feat_idx)
     
     # LEACE params - create labels for the full dataset
-    Y_all = np.array([1 if all_labels[i] == forget_label else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
+    # Use string comparison to match the label matching logic used elsewhere
+    Y_all = np.array([1 if str(all_labels[i]) == forget_label_str else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
     
     E_edit, info = apply_edits(
-        pre.Z_all, None, feat_idx, U, pre.mu, pre.W,
+        pre.Z_all, sae, feat_idx, U, pre.mu, pre.W,
         cfg['edits']['beta'], 
         cfg['edits']['leace'], 
         {'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, 
@@ -285,10 +328,12 @@ def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, encoder: str, build_
     classes = pre.classes
     cls2id = {c: i for i, c in enumerate(classes)}
     
+    # Ensure label types match - convert all_labels to strings for consistent lookup
+    all_labels_str = [str(lbl) for lbl in all_labels]
     E_ret_test = E_all_norm[M_ret_test]
-    L_ret_test = [cls2id[d] for d in np.array(all_labels)[M_ret_test]]
+    L_ret_test = [cls2id[str(d)] for d in np.array(all_labels)[M_ret_test]]
     E_fgt_test = E_all_norm[M_fgt_test]
-    L_fgt_test = [cls2id[d] for d in np.array(all_labels)[M_fgt_test]]
+    L_fgt_test = [cls2id[str(d)] for d in np.array(all_labels)[M_fgt_test]]
     E_ret_test_edit = E_all_norm2[M_ret_test]
     E_fgt_test_edit = E_all_norm2[M_fgt_test]
     
@@ -321,8 +366,14 @@ def run_build_u_top_analysis(cfg: Dict) -> pd.DataFrame:
     device = cfg['experiment']['device']
     seed_all(cfg['experiment']['seed'])
     
-    # Define encoders and build_U_top percentages
-    encoders = ['ecapa', 'wav2vec2', 'hubert']
+    # Define encoders based on dataset
+    # For non-English datasets (lahaja, mls_spanish), only use wav2vec2 with specialized models
+    dataset_name = cfg['dataset']['name']
+    if dataset_name in ['lahaja', 'mls_spanish']:
+        encoders = ['wav2vec2']
+    else:
+        encoders = ['ecapa', 'wav2vec2', 'hubert']
+    
     build_u_top_percentages = ['1%', '2%', '5%', '10%', '25%']
     
     print(f"Build_U_top Analysis Configuration:")
@@ -388,7 +439,7 @@ def run_build_u_top_analysis(cfg: Dict) -> pd.DataFrame:
                     
                     try:
                         result = run_single_build_u_top_analysis(
-                            pre, A_all, dec_w, clf, encoder, build_u_top_pct, 
+                            pre, A_all, dec_w, clf, sae, encoder, build_u_top_pct, 
                             build_u_top_value, cfg, device
                         )
                         results.append(result)

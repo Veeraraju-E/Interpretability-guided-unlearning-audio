@@ -11,7 +11,7 @@ dataset:
   forget_labels: ['id00017']
 
 encoder:
-  name: wav2vec2
+  name: ecapa
   wav2vec2_model: facebook/wav2vec2-base
   hubert_model: facebook/hubert-base-ls960
   conformer_model: facebook/wav2vec2-conformer-rel-pos-large
@@ -27,7 +27,7 @@ sae:
   hidden_dim: 0
 
 feature_mining:
-  build_U_top: 305 # 5% of 6144
+  build_U_top: 307 # 5% of 6144
   statistical_method: cohens_d  # Only cohens_d supported
 
 edits:
