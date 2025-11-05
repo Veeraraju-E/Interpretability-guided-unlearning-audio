@@ -8,7 +8,7 @@ dataset:
   name: lahaja
   root_or_manifest: test  # HF split: train|validation|test
   dev_frac: 0.7
-  forget_labels: [6012000339299]  # Using actual speaker IDs from the dataset
+  forget_labels: ['6012000339299']  # Using actual speaker IDs from the dataset
 
 encoder:
   name: wav2vec2
@@ -27,7 +27,7 @@ sae:
   hidden_dim: 0
 
 feature_mining:
-  build_U_top: 200
+  build_U_top: 3840
   statistical_method: cohens_d  # Only cohens_d supported
 
 edits:

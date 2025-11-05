@@ -30,14 +30,55 @@ def run_multi(adapter, cfg: Dict):
             classes = cache_data['classes']
     else:
         print("Computing embeddings (this will be cached)...")
-        pre = adapter.precompute(
-            root_or_manifest=cfg['dataset']['root_or_manifest'],
-            embeddings_path=cfg['encoder'].get('embeddings_path'),
-            dev_frac=cfg['dataset']['dev_frac'],
-            seed=cfg['experiment']['seed'],
-            encoder_cfg=cfg['encoder'],
-            device=device,
-        )
+        data_path_param = cfg['dataset']['root_or_manifest']
+        if hasattr(adapter, 'name'):
+            if adapter.name in ['audiomnist', 'speech_commands']:
+                pre = adapter.precompute(
+                    data_root=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            elif adapter.name == 'librispeech':
+                pre = adapter.precompute(
+                    root=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            elif adapter.name == 'lahaja':
+                pre = adapter.precompute(
+                    split=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            elif adapter.name == 'mls_spanish':
+                pre = adapter.precompute(
+                    root_or_manifest=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            else:  # voxceleb and others
+                pre = adapter.precompute(
+                    root_or_manifest=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+        else:
+            raise NotImplementedError(f"Adapter {adapter.name} not implemented for {cfg['dataset']['name']}.")
         classes = pre.classes
         
         # Cache embeddings
@@ -164,7 +205,7 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     U = build_U_from_decoder(dec_w, feat_idx)
     
     # LEACE params - create labels for the full dataset
-    Y_all = np.array([1 if all_labels[i] == forget_label else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
+    Y_all = np.array([1 if str(all_labels[i]) == forget_label_str else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
     E_edit, info = apply_edits(
         pre.Z_all, None, feat_idx, U, pre.mu, pre.W,
         cfg['edits']['beta'], cfg['edits']['leace'], {'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, cfg['edits']['noise_sigma']
@@ -174,7 +215,7 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     
     # Verification trials
     test_mask_for_trials = M_ret_test | M_fgt_test
-    trials, tlabels = build_verification_trials(pre.labels, [forget_label], test_mask_for_trials, seed=cfg['experiment']['seed'])
+    trials, tlabels = build_verification_trials(pre.labels, [forget_label_str], test_mask_for_trials, seed=cfg['experiment']['seed'])
     
     # Normalize embeddings for verification
     E_all_norm = pre.E_all / (np.linalg.norm(pre.E_all, axis=1, keepdims=True) + 1e-12)
@@ -188,14 +229,14 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     per_class = per_class_eers(E_all_norm, E_all_norm2, pre.labels, mask=test_mask_for_trials, rng_seed=cfg['experiment']['seed'])
     
     # Extract EERs for retain and forget classes
-    per_class_ret = {c: vals for c, vals in per_class.items() if c != forget_label}
-    per_class_fgt = {c: vals for c, vals in per_class.items() if c == forget_label}
+    per_class_ret = {c: vals for c, vals in per_class.items() if str(c) != forget_label_str}
+    per_class_fgt = {c: vals for c, vals in per_class.items() if str(c) == forget_label_str}
     
     # Get average EERs for retain classes
     retain_avg_before, retain_avg_after = avg_eers(per_class_ret)
     
     # Get EERs for forget class
-    forget_eer_before, forget_eer_after = per_class_fgt.get(forget_label, (0.0, 0.0))
+    forget_eer_before, forget_eer_after = per_class_fgt.get(forget_label_str, (0.0, 0.0))
     
     # Classification evaluation (same as single_run)
     E_ret_test = E_all_norm[M_ret_test]
@@ -211,8 +252,8 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     
     # Linear probe AUC
     split_mask_dict = {'dev': pre.mask_dev, 'test': pre.mask_test}
-    _, auc_before = safe_linear_probe(E_all_norm, all_labels, U, split_mask_dict, [forget_label])
-    _, auc_after = safe_linear_probe(E_all_norm2, all_labels, U, split_mask_dict, [forget_label])
+    _, auc_before = safe_linear_probe(E_all_norm, all_labels, U, split_mask_dict, [forget_label_str])
+    _, auc_after = safe_linear_probe(E_all_norm2, all_labels, U, split_mask_dict, [forget_label_str])
     
     # Return results
     return {

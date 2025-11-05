@@ -1,6 +1,6 @@
 experiment:
   name: mls_spanish_exp
-  save_dir: ./runs/mls_spanish/multi_run
+  save_dir: ./runs/mls_spanish
   device: cuda
   seed: 1337
 
@@ -22,12 +22,13 @@ sae:
   multiplier: 10.0
   topk: 128
   lambda_sparsity: 0.0
-  epochs: 500
+  epochs: 100
   batch_size: 64
   hidden_dim: 0
   
 feature_mining:
-  build_U_top: 200
+  build_U_top: 1536
+  fdr: 1
   statistical_method: cohens_d  # Only cohens_d supported
 
 edits:

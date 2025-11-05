@@ -38,15 +38,56 @@ def cache_embeddings(adapter, cfg: Dict, device: str) -> Tuple:
             classes = cache_data['classes']
         print(f"Loaded cached embeddings: {pre.E_all.shape[0]} samples, {pre.E_all.shape[1]} dimensions")
     else:
-        print("Computing embeddings (this will be cached for future runs)...")
-        pre = adapter.precompute(
-            root_or_manifest=cfg['dataset']['root_or_manifest'],
-            embeddings_path=cfg['encoder'].get('embeddings_path'),
-            dev_frac=cfg['dataset']['dev_frac'],
-            seed=cfg['experiment']['seed'],
-            encoder_cfg=cfg['encoder'],
-            device=device,
-        )
+        print("Computing embeddings (will be cached)...")
+        data_path_param = cfg['dataset']['root_or_manifest']
+        if hasattr(adapter, 'name'):
+            if adapter.name in ['audiomnist', 'speech_commands']:
+                pre = adapter.precompute(
+                    data_root=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            elif adapter.name == 'librispeech':
+                pre = adapter.precompute(
+                    root=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            elif adapter.name == 'lahaja':
+                pre = adapter.precompute(
+                    split=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            elif adapter.name == 'mls_spanish':
+                pre = adapter.precompute(
+                    root_or_manifest=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            else:  # voxceleb and others
+                pre = adapter.precompute(
+                    root_or_manifest=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+        else:
+            raise NotImplementedError(f"Adapter {adapter.name} not implemented for {cfg['dataset']['name']}.")
         classes = pre.classes
         
         # Cache embeddings
@@ -133,7 +174,7 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
     U = build_U_from_decoder(dec_w, feat_idx)
     
     # LEACE params - create labels for the full dataset
-    Y_all = np.array([1 if all_labels[i] == forget_label else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
+    Y_all = np.array([1 if str(all_labels[i]) == forget_label_str else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
     
     # Apply edits
     E_edit, info = apply_edits(
@@ -163,8 +204,8 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
     
     # Additional metrics for completeness
     split_mask_dict = {'dev': mask_dev, 'test': mask_test}
-    _, auc_before = safe_linear_probe(E_all_norm, all_labels, U, split_mask_dict, [forget_label])
-    _, auc_after = safe_linear_probe(E_all_norm2, all_labels, U, split_mask_dict, [forget_label])
+    _, auc_before = safe_linear_probe(E_all_norm, all_labels, U, split_mask_dict, [forget_label_str])
+    _, auc_after = safe_linear_probe(E_all_norm2, all_labels, U, split_mask_dict, [forget_label_str])
     
     return {
         'expansion_factor': expansion_factor,

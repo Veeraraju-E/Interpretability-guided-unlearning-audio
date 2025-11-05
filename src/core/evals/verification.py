@@ -23,16 +23,27 @@ def build_verification_trials(labels: List[str], forget_classes: List[str], spli
     trials, trial_labels = [], []
     forget_idx = [i for i in indices if labels[i] in forget_classes]
     retain_idx = [i for i in indices if labels[i] not in forget_classes]
+
+    # Positive pairs: all combinations within forget classes
     pos_pairs = []
     if len(forget_idx) >= 2:
         all_pos_pairs = list(combinations(forget_idx, 2))
-        pos_pairs = rng.choice(len(all_pos_pairs), size=min(len(all_pos_pairs), max_pairs_per_class), replace=False)
-        pos_pairs = [all_pos_pairs[i] for i in pos_pairs]
+        if max_pairs_per_class is None or max_pairs_per_class <= 0:
+            pos_pairs = all_pos_pairs
+        else:
+            sel = rng.choice(len(all_pos_pairs), size=min(len(all_pos_pairs), max_pairs_per_class), replace=False)
+            pos_pairs = [all_pos_pairs[i] for i in sel]
+
+    # Negative pairs: all cross pairs between forget and retain
     neg_pairs = []
     if len(forget_idx) > 0 and len(retain_idx) > 0:
         all_neg_pairs = [(f, r) for f in forget_idx for r in retain_idx]
-        neg_pairs = rng.choice(len(all_neg_pairs), size=min(len(all_neg_pairs), max_pairs_per_class), replace=False)
-        neg_pairs = [all_neg_pairs[i] for i in neg_pairs]
+        if max_pairs_per_class is None or max_pairs_per_class <= 0:
+            neg_pairs = all_neg_pairs
+        else:
+            sel = rng.choice(len(all_neg_pairs), size=min(len(all_neg_pairs), max_pairs_per_class), replace=False)
+            neg_pairs = [all_neg_pairs[i] for i in sel]
+
     trials = pos_pairs + neg_pairs
     trial_labels = np.array([1] * len(pos_pairs) + [0] * len(neg_pairs), dtype=int)
     return list(trials), trial_labels

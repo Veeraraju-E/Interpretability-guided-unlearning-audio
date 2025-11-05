@@ -68,15 +68,56 @@ def cache_embeddings(adapter, cfg: Dict, device: str) -> Tuple:
             classes = cache_data['classes']
         print(f"Loaded cached embeddings: {pre.E_all.shape[0]} samples, {pre.E_all.shape[1]} dimensions")
     else:
-        print("Computing embeddings (this will be cached for future runs)...")
-        pre = adapter.precompute(
-            root_or_manifest=cfg['dataset']['root_or_manifest'],
-            embeddings_path=cfg['encoder'].get('embeddings_path'),
-            dev_frac=cfg['dataset']['dev_frac'],
-            seed=cfg['experiment']['seed'],
-            encoder_cfg=cfg['encoder'],
-            device=device,
-        )
+        print("Computing embeddings (will be cached)...")
+        data_path_param = cfg['dataset']['root_or_manifest']
+        if hasattr(adapter, 'name'):
+            if adapter.name in ['audiomnist', 'speech_commands']:
+                pre = adapter.precompute(
+                    data_root=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            elif adapter.name == 'librispeech':
+                pre = adapter.precompute(
+                    root=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            elif adapter.name == 'lahaja':
+                pre = adapter.precompute(
+                    split=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            elif adapter.name == 'mls_spanish':
+                pre = adapter.precompute(
+                    root_or_manifest=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+            else:  # voxceleb and others
+                pre = adapter.precompute(
+                    root_or_manifest=data_path_param,
+                    embeddings_path=cfg['encoder'].get('embeddings_path'),
+                    dev_frac=cfg['dataset']['dev_frac'],
+                    seed=cfg['experiment']['seed'],
+                    encoder_cfg=cfg['encoder'],
+                    device=device,
+                )
+        else:
+            raise NotImplementedError(f"Adapter {adapter.name} not implemented for {cfg['dataset']['name']}.")
         classes = pre.classes
         
         # Cache embeddings
