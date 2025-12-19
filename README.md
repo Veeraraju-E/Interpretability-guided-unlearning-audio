@@ -24,6 +24,7 @@ The framework supports multiple datasets with pre-configured settings:
 - `configs/speech_commands.yaml` - Speech Commands recognition
 - `configs/librispeech.yaml` - LibriSpeech speaker identification
 - `configs/lahaja.yaml` - Lahaja speech recognition
+- `configs/mls_spanish.yaml` - MLS Spanish speech recognition
 
 ### 2. Run Unlearning Experiments
 
@@ -31,27 +32,38 @@ The framework supports multiple datasets with pre-configured settings:
 
 ```bash
 # Single-class unlearning
-./unlearn-audio run --config configs/voxceleb.yaml
+python -m src.cli.main run --config path/to/config
 
 # Multi-class unlearning (all classes)
-./unlearn-audio run --config configs/voxceleb.yaml --show-config
+python -m src.cli.main run --config path/to/config --show-config
 
 # Continual unlearning (sequential forgetting)
-./unlearn-audio run --config configs/voxceleb.yaml
+python -m src.cli.main run --config path/to/config
 
 # Grid search over SAE parameters
-./unlearn-audio grid --config configs/voxceleb.yaml
+python -m src.cli.main grid --config path/to/hyperparam/config
 
 # Interpretability analysis
-./unlearn-audio interpret --config configs/voxceleb.yaml
+python -m src.cli.main interpret --config path/to/interp/config
 
 # List available configurations
-./unlearn-audio list-configs
-
-# Validate configuration
-./unlearn-audio validate-config --config configs/voxceleb.yaml
+python -m src.cli.main list-configs
 ```
 
+#### Additional Analysis Scripts
+
+The framework also includes standalone analysis scripts that can be run directly:
+
+```bash
+# Hyperparameter analysis
+python -m src.orchestration.hyperparameter_analysis --config path/to/config [--mode analyze|plot|all]
+
+# Build U top analysis
+python -m src.orchestration.build_u_top_analysis --config path/to/config
+
+# SAE training loss analysis
+python -m src.orchestration.sae_training_loss_analysis --config path/to/config [--mode train|plot|all]
+```
 
 ### 3. Configuration Modes
 
@@ -65,28 +77,27 @@ Set the `orchestration.mode` in your config file:
 
 ```
 src/
-├── core/                    # Core algorithms and utilities (consolidated)
-│   ├── edits.py             # LEACE and noise injection (merged from edits/)
-│   ├── encoders.py          # Audio encoders (merged from encoders/)
-│   ├── sae.py               # Sparse Autoencoder (merged from sae/)
-│   ├── analysis/            # Feature discovery and subspace analysis
+├── core/
+│   ├── edits.py             # LEACE and noise injection
+│   ├── encoders.py          # Audio encoders
+│   ├── sae.py               # Sparse Autoencoder
 │   ├── evals/               # Evaluation metrics and probes
-│   └── utils/               # Whitening, normalization, and statistics
+│   └── utils/               # Whitening, normalization, and stats
 ├── datasets/                # Dataset adapters and preprocessing
 ├── orchestration/           # Unlearning workflow orchestration
 │   ├── single_run.py        # Single-class unlearning
 │   ├── multi_run.py         # Multi-class unlearning
-│   ├── build_u_top_analysis.py # Build U top analysis
-│   ├── hyperparameter_analysis.py # Hyperparameter analysis
-│   └── sae_training_loss_analysis.py # SAE training analysis
+│   ├── continual.py         # Continual unlearning
+│   ├── build_u_top_analysis.py # top-r analysis
+│   └── hyperparameter_analysis.py # Hyperparameter analysis
 └── cli/                     # Command-line interfaces
     ├── main.py              # Main CLI
-    └── grid_search.py       # Grid search implementation
+    └── grid_search.py       # Grid search CLI
 ```
 
 <!-- ## Citation
 
-If you use this framework in your research, please cite:
+If you use our method, please consider citing:
 
 ```bibtex
 @article{sae-guided-unlearning-audio,
@@ -107,4 +118,4 @@ If you use this framework in your research, please cite:
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the Apache License.

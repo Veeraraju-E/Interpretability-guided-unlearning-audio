@@ -13,14 +13,29 @@ def prune_and_normalize_decoder(dec_weight: np.ndarray, prune_threshold: float =
     return cols_kept.T
 
 def build_U_from_decoder(dec_weight: np.ndarray, feat_idx: list[int]) -> np.ndarray:
+    """
+    Build subspace U from decoder weights and selected feature indices.   
+    """
     if len(feat_idx) == 0:
         return np.zeros((dec_weight.shape[0], 0))
+    
+    r = len(feat_idx)
+    d = dec_weight.shape[0]
+    m = dec_weight.shape[1]
+    
+    if max(feat_idx) >= m or min(feat_idx) < 0:
+        raise ValueError(f"Feature indices must be in [0, {m-1}] for SAE latent space, got indices in [{min(feat_idx)}, {max(feat_idx)}]")
+        
     D = dec_weight.copy()
     norms = np.linalg.norm(D, axis=0, keepdims=True)
     D = D / (norms + 1e-12)
     D_S = D[:, feat_idx]
-    Uu, svals, _ = np.linalg.svd(D_S, full_matrices=False)
-    rank = (svals > 1e-12).sum()
-    if rank == 0:
-        return np.zeros((D_S.shape[0], 0))
-    return Uu[:, :rank]
+    Uu, _, _ = np.linalg.svd(D_S, full_matrices=False)
+    
+    if Uu.shape[1] >= r:
+        U = Uu[:, :r]
+    else:
+        # NOTE: this should not happen in practice.
+        raise ValueError(f"bad things happening with build_U_from_decoder, r: {r} < rank(D_S): {Uu.shape[1]}...")
+    
+    return U

@@ -27,17 +27,15 @@ def leace_projector_in_U(Z: np.ndarray, U: np.ndarray, Y: np.ndarray, ridge: flo
     N = ZU.shape[0]
     Sig = (ZUc.T @ ZUc) / max(1, N - 1)  # empirical covariance of ZUc
     Sig_ZY = (ZUc.T @ Yc) / max(1, N - 1)  # empirical cross-covariance between ZUc and Yc
-    evals, evecs = np.linalg.eigh(Sig + ridge * np.eye(Sig.shape[0]))
+    Sig_gamma = Sig + ridge * np.eye(Sig.shape[0])
+    evals, evecs = np.linalg.eigh(Sig_gamma)
     evals = np.clip(evals, 1e-12, None)
-    W_r = evecs @ np.diag(1.0 / np.sqrt(evals)) @ evecs.T
-    W_r_pinv = evecs @ np.diag(np.sqrt(evals)) @ evecs.T
+    W_r = evecs @ np.diag(1.0 / np.sqrt(evals)) @ evecs.T   # Sig_gamma^{-1/2} using moore-penrose pseudo-inverse
+    W_r_pinv = evecs @ np.diag(np.sqrt(evals)) @ evecs.T    # Sig_gamma^{1/2}
     M = W_r @ Sig_ZY
-    U_M, _, _ = np.linalg.svd(M, full_matrices=False)
-    if U_M.size == 0:
-        P = np.zeros((Sig.shape[0], Sig.shape[0]))
-    else:
-        P = U_M @ U_M.T
-    P_r = np.eye(U.shape[1]) - (W_r_pinv @ P @ W_r) # LEACE editor
+    U_M, _, _ = np.linalg.svd(M, full_matrices=False)   # SVD equivalent for P_c = M * (M^T M)^{-1} * M^T
+    P_c = U_M @ U_M.T if U_M.size > 0 else np.zeros((Sig.shape[0], Sig.shape[0]))
+    P_r = np.eye(U.shape[1]) - (W_r_pinv @ P_c @ W_r) # LEACE editor
     return P_r, mu_r
 
 
