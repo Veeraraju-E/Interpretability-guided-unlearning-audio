@@ -10,3 +10,4 @@ pretrained_models
 *.pdf
 *.npy
 visualization
+visuals

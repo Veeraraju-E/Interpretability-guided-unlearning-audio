@@ -7,8 +7,7 @@ import pandas as pd
 from typing import Dict, Tuple
 import argparse
 
-# Add src to path for imports
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from src.datasets.voxceleb_adapter import VoxCelebAdapter
 from src.core.utils.seed import seed_all
@@ -18,11 +17,11 @@ from src.core.utils.subspace import build_U_from_decoder
 from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
 from src.core.edits import apply_edits
+from src.core.visualization.plot_hyperparameter_analysis import create_hyperparameter_plot
 
 
 def load_config(config_path: str) -> Dict:
     with open(config_path, 'r') as f: return yaml.safe_load(f)
-
 
 def cache_embeddings(adapter, cfg: Dict, device: str) -> Tuple:
     base_save_dir = cfg['experiment']['save_dir']
@@ -144,12 +143,20 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
             'linear_probe_auc_before': float('nan'),
             'linear_probe_auc_after': float('nan'),
             'forget_label': forget_label,
+            'dead_latents_pct': float('nan'),
             'error': 'Insufficient samples for feature selection'
         }
     
     # Get statistical method from config, default to cohens_d
     method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
     stats = compute_feature_stats(A_fgt, A_ret, method=method)
+    
+    # Compute percentage of dead latents (AUC = 0.5 or discriminability = 0)
+    auc_scores = stats['auc']
+    cohens_d_scores = stats['cohens_d']
+    dead_latents = (np.abs(auc_scores - 0.5) < 1e-6) | (np.abs(cohens_d_scores) < 1e-6)
+    dead_latents_pct = 100.0 * dead_latents.sum() / len(dead_latents)
+    
     feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
     
     if len(feat_idx) == 0:
@@ -164,6 +171,7 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
             'linear_probe_auc_before': float('nan'),
             'linear_probe_auc_after': float('nan'),
             'forget_label': forget_label,
+            'dead_latents_pct': dead_latents_pct,
             'error': 'No discriminative features found'
         }
     
@@ -177,7 +185,7 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
     Y_all = np.array([1 if str(all_labels[i]) == forget_label_str else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
     
     # Apply edits
-    E_edit, info = apply_edits(
+    E_edit, _ = apply_edits(
         pre.Z_all, sae, feat_idx, U, pre.mu, pre.W,
         cfg['edits']['beta'], cfg['edits']['leace'], 
         {'Y_dev': Y_all, 'ridge': cfg['edits']['leace_ridge']}, 
@@ -197,12 +205,10 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
     E_fgt_test_edit = E_all_norm2[M_fgt_test]
     
     # Calculate FA and RA using baseline classifier
-    acc_ret_before = baseline_RA  # Use precomputed baseline
-    acc_fgt_before = baseline_FA  # Use precomputed baseline
+    acc_ret_before = baseline_RA
+    acc_fgt_before = baseline_FA
     acc_ret_after = evaluate_classifier(baseline_clf, E_ret_test_edit, L_ret_test, device=device)
     acc_fgt_after = evaluate_classifier(baseline_clf, E_fgt_test_edit, L_fgt_test, device=device)
-    
-    # Additional metrics for completeness
     split_mask_dict = {'dev': mask_dev, 'test': mask_test}
     _, auc_before = safe_linear_probe(E_all_norm, all_labels, U, split_mask_dict, [forget_label_str])
     _, auc_after = safe_linear_probe(E_all_norm2, all_labels, U, split_mask_dict, [forget_label_str])
@@ -216,27 +222,19 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
         'RA_after': acc_ret_after,
         'linear_probe_auc_before': auc_before,
         'linear_probe_auc_after': auc_after,
-        'forget_label': forget_label
+        'forget_label': forget_label,
+        'dead_latents_pct': dead_latents_pct
     }
 
 
-def run_hyperparameter_analysis(cfg: Dict) -> pd.DataFrame:
+def run_hyperparameter_analysis(cfg: Dict) -> None:
     device = cfg['experiment']['device']
     seed_all(cfg['experiment']['seed'])
     
-    # Define hyperparameter combinations
+    # Define combinations
     expansion_factors = [2, 4, 8, 16]
     topk_values = [1, 2, 4, 8, 16, 32, 64, 128]
-    
-    print(f"Hyperparameter Analysis Configuration:")
-    print(f"  - Expansion factors: {expansion_factors}")
-    print(f"  - TopK values: {topk_values}")
-    print(f"  - Total combinations: {len(expansion_factors) * len(topk_values)}")
-    print(f"  - Device: {device}")
-    print(f"  - Dataset: {cfg['dataset']['name']}")
-    print(f"  - Encoder: {cfg['encoder']['name']}")
-    print(f"  - Forget label: {cfg['dataset']['forget_labels'][0]}")
-    
+      
     # Initialize adapter and cache embeddings
     adapter = VoxCelebAdapter()
     pre, classes = cache_embeddings(adapter, cfg, device)
@@ -297,6 +295,7 @@ def run_hyperparameter_analysis(cfg: Dict) -> pd.DataFrame:
                     'linear_probe_auc_before': float('nan'),
                     'linear_probe_auc_after': float('nan'),
                     'forget_label': cfg['dataset']['forget_labels'][0],
+                    'dead_latents_pct': float('nan'),
                     'error': str(e)
                 })
     
@@ -308,26 +307,36 @@ def run_hyperparameter_analysis(cfg: Dict) -> pd.DataFrame:
     output_path = os.path.join(output_dir, 'hyperparameter_analysis_results.csv')
     results_df.to_csv(output_path, index=False)
     
-    print(f"\nHyperparameter analysis completed!")
-    print(f"Results saved to: {output_path}")
-    print(f"Total combinations tested: {len(results_df)}")
+    print(f"\nHyperparameter analysis completed, results are saved to: {output_path}")
+
+def create_visualization(cfg: Dict) -> None:
+    output_dir = cfg['experiment']['save_dir']
+    results_path = os.path.join(output_dir, 'hyperparameter_analysis_results.csv')
     
-    # Print summary
-    print(f"\nSummary of results:")
-    print(results_df[['expansion_factor', 'topk', 'FA_after', 'RA_after']].to_string(index=False))
+    if not os.path.exists(results_path):
+        raise FileNotFoundError(f"Results file not found: {results_path}. Run analysis first.")
     
-    return results_df
+    create_hyperparameter_plot(results_path, output_dir)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Hyperparameter Analysis for TopK SAE Module')
     parser.add_argument('--config', '-c', type=str, required=True, help='Path to YAML configuration file')
+    parser.add_argument('--mode', type=str, choices=['analyze', 'plot', 'all'], default='all', help='Mode: analyze (run analysis only), plot (generate plot only), all (both)')
     
     args = parser.parse_args()
-    cfg = load_config(args.config)    
-    _ = run_hyperparameter_analysis(cfg)
+    cfg = load_config(args.config)
     
-    print(f"\nAnalysis complete! Check the results in: {cfg['experiment']['save_dir']}/hyperparameter_analysis_results.csv")
+    
+    # Run analysis if requested
+    if args.mode in ['analyze', 'all']:
+        print("RUN mode")
+        run_hyperparameter_analysis(cfg)
+    
+    # Generate visualization if requested
+    if args.mode in ['plot', 'all']:
+        print("PLOT mode")
+        create_visualization(cfg)
 
 
 if __name__ == "__main__":

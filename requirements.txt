@@ -1,4 +1,3 @@
-# Visualization dependencies for embedding analysis
 matplotlib
 seaborn
 pandas
