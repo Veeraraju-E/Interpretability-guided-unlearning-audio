@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Build_U_top Percentage Analysis for Single-Class Unlearning
-"""
-
 import os
 import sys
 import yaml
@@ -42,11 +37,7 @@ def calculate_erb_score(fa_after: float, ra_after: float) -> float:
     return Nr / Dr if Dr else 0.0
 
 def get_encoder_dimensions() -> Dict[str, int]:
-    return {
-        'ecapa': 192,
-        'wav2vec2': 768,
-        'hubert': 768
-    }
+    return {'ecapa': 192, 'wav2vec2': 768, 'hubert': 768}
 
 
 def calculate_build_u_top_values(encoder: str, multiplier: float = 8.0) -> Dict[str, int]:
@@ -58,11 +49,7 @@ def calculate_build_u_top_values(encoder: str, multiplier: float = 8.0) -> Dict[
 
 
 def cache_embeddings(adapter, encoder: str, cfg: Dict, device: str, cache_dir: str) -> Tuple:
-    """
-    Cache embeddings to avoid recomputation across build_U_top values.
-    Returns (pre, classes) where pre contains all precomputed data.
-    """
-    # Create cache key that includes model name to avoid using wrong cached embeddings
+    # Create cache key (w model name)
     encoder_cfg = cfg['encoder'].copy()
     if encoder == 'wav2vec2':
         model_name = encoder_cfg.get('wav2vec2_model', 'facebook/wav2vec2-base').replace('/', '_').replace('-', '_')
@@ -152,11 +139,7 @@ def cache_embeddings(adapter, encoder: str, cfg: Dict, device: str, cache_dir: s
 
 
 def cache_sae_and_activations(pre, encoder: str, cfg: Dict, device: str, cache_dir: str) -> Tuple:
-    """
-    Cache SAE model and activations to avoid retraining.
-    Returns (sae, A_all, dec_w).
-    """
-    # Create cache key that includes model name for consistency
+    # Create cache key (with model name)
     encoder_cfg = cfg['encoder'].copy()
     if encoder == 'wav2vec2':
         model_name = encoder_cfg.get('wav2vec2_model', 'facebook/wav2vec2-base').replace('/', '_').replace('-', '_')
@@ -269,7 +252,7 @@ def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, sae, encoder: str, b
     # Check minimum sample requirement
     forget_count = M_fgt_dev.sum()
     if forget_count < 5:
-        print(f"    WARNING: Forget class has only {forget_count} samples, minimum 5 required. Skipping.")
+        print(f"[ERROR]: Forget class has only {forget_count} samples, minimum 5 required. Skipping.")
         return {
             'encoder': encoder,
             'build_U_top_pct': build_u_top_pct,
@@ -292,7 +275,7 @@ def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, sae, encoder: str, b
     feat_idx = select_features(stats, method=method, top_k=build_u_top_value, fdr=0.05)
     
     if len(feat_idx) == 0:
-        print(f"    ERROR: No discriminative features found. Cannot proceed with editing.")
+        print(f"[ERROR] No discriminative features found. Cannot proceed with editing.")
         return {
             'encoder': encoder,
             'build_U_top_pct': build_u_top_pct,
@@ -313,7 +296,7 @@ def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, sae, encoder: str, b
     # Use string comparison to match the label matching logic used elsewhere
     Y_all = np.array([1 if str(all_labels[i]) == forget_label_str else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
     
-    E_edit, info = apply_edits(
+    E_edit, _ = apply_edits(
         pre.Z_all, sae, feat_idx, U, pre.mu, pre.W,
         cfg['edits']['beta'], 
         cfg['edits']['leace'], 
@@ -330,22 +313,17 @@ def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, sae, encoder: str, b
     
     # Ensure label types match - convert all_labels to strings for consistent lookup
     all_labels_str = [str(lbl) for lbl in all_labels]
-    E_ret_test = E_all_norm[M_ret_test]
-    L_ret_test = [cls2id[str(d)] for d in np.array(all_labels)[M_ret_test]]
-    E_fgt_test = E_all_norm[M_fgt_test]
-    L_fgt_test = [cls2id[str(d)] for d in np.array(all_labels)[M_fgt_test]]
-    E_ret_test_edit = E_all_norm2[M_ret_test]
-    E_fgt_test_edit = E_all_norm2[M_fgt_test]
+    E_ret_test, E_fgt_test = E_all_norm[M_ret_test], E_all_norm[M_fgt_test]
+    L_ret_test, L_fgt_test = [cls2id[str(d)] for d in np.array(all_labels)[M_ret_test]], [cls2id[str(d)] for d in np.array(all_labels)[M_fgt_test]]
+    E_ret_test_edit, E_fgt_test_edit = E_all_norm2[M_ret_test], E_all_norm2[M_fgt_test]
     
-    acc_ret_before = evaluate_classifier(clf, E_ret_test, L_ret_test, device=device)
-    acc_fgt_before = evaluate_classifier(clf, E_fgt_test, L_fgt_test, device=device)
-    acc_ret_after = evaluate_classifier(clf, E_ret_test_edit, L_ret_test, device=device)
-    acc_fgt_after = evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=device)
+    acc_ret_before, acc_fgt_before = evaluate_classifier(clf, E_ret_test, L_ret_test, device=device), evaluate_classifier(clf, E_fgt_test, L_fgt_test, device=device)
+    acc_ret_after, acc_fgt_after = evaluate_classifier(clf, E_ret_test_edit, L_ret_test, device=device), evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=device)
     
     # Calculate ERB score
     erb_score = calculate_erb_score(acc_fgt_after, acc_ret_after)
     
-    print(f"    FA: {acc_fgt_before:.4f} → {acc_fgt_after:.4f}, RA: {acc_ret_before:.4f} → {acc_ret_after:.4f}, ERB: {erb_score:.2f}")
+    print(f"[INFO] FA: {acc_fgt_before:.4f} → {acc_fgt_after:.4f}, RA: {acc_ret_before:.4f} → {acc_ret_after:.4f}, ERB: {erb_score:.2f}")
     
     return {
         'encoder': encoder,
@@ -360,14 +338,10 @@ def run_single_build_u_top_analysis(pre, A_all, dec_w, clf, sae, encoder: str, b
 
 
 def run_build_u_top_analysis(cfg: Dict) -> pd.DataFrame:
-    """
-    Run build_U_top percentage analysis for all encoders and percentages.
-    """
     device = cfg['experiment']['device']
     seed_all(cfg['experiment']['seed'])
     
-    # Define encoders based on dataset
-    # For non-English datasets (lahaja, mls_spanish), only use wav2vec2 with specialized models
+    # Define encoders based on dataset (for non-English datasets, only use wav2vec2 with specialized models)
     dataset_name = cfg['dataset']['name']
     if dataset_name in ['lahaja', 'mls_spanish']:
         encoders = ['wav2vec2']
@@ -376,7 +350,7 @@ def run_build_u_top_analysis(cfg: Dict) -> pd.DataFrame:
     
     build_u_top_percentages = ['1%', '2%', '5%', '10%', '25%']
     
-    print(f"Build_U_top Analysis Configuration:")
+    print(f"[INFO] Build_U_top Analysis Configuration:")
     print(f"  - Encoders: {encoders}")
     print(f"  - Build_U_top percentages: {build_u_top_percentages}")
     print(f"  - Total combinations: {len(encoders) * len(build_u_top_percentages)}")
@@ -419,10 +393,7 @@ def run_build_u_top_analysis(cfg: Dict) -> pd.DataFrame:
             writer.writeheader()
         
         for encoder in encoders:
-            print(f"\n{'='*60}")
-            print(f"Processing encoder: {encoder.upper()}")
-            print(f"{'='*60}")
-            
+            print(f"\n[INFO] Processing encoder: {encoder.upper()}")            
             try:
                 # Cache embeddings, SAE, and classifier for this encoder
                 pre, classes = cache_embeddings(adapter, encoder, cfg, device, cache_dir)
@@ -431,7 +402,7 @@ def run_build_u_top_analysis(cfg: Dict) -> pd.DataFrame:
                 
                 # Calculate build_U_top values for this encoder
                 build_u_top_values = calculate_build_u_top_values(encoder, cfg['sae']['multiplier'])
-                print(f"Build_U_top values for {encoder}: {build_u_top_values}")
+                print(f"[INFO] Build_U_top values for {encoder}: {build_u_top_values}")
                 
                 # Run analysis for each build_U_top percentage
                 for build_u_top_pct in build_u_top_percentages:
@@ -447,7 +418,7 @@ def run_build_u_top_analysis(cfg: Dict) -> pd.DataFrame:
                         fh.flush()
                         
                     except Exception as e:
-                        print(f"    ERROR: {str(e)}")
+                        print(f"[ERROR] {str(e)}")
                         error_result = {
                             'encoder': encoder,
                             'build_U_top_pct': build_u_top_pct,
@@ -464,7 +435,7 @@ def run_build_u_top_analysis(cfg: Dict) -> pd.DataFrame:
                         fh.flush()
                         
             except Exception as e:
-                print(f"Encoder-level failure for {encoder}: {e}")
+                print(f"[ERROR] Encoder-level failure for {encoder}: {e}")
                 for build_u_top_pct in build_u_top_percentages:
                     error_result = {
                         'encoder': encoder,
@@ -486,25 +457,23 @@ def run_build_u_top_analysis(cfg: Dict) -> pd.DataFrame:
     summary_path = os.path.join(base_save_dir, "build_u_top_analysis_summary.csv")
     results_df.to_csv(summary_path, index=False)
     
-    print(f"\n{'='*60}")
-    print(f"Analysis completed!")
+    print(f"\n[INFO] Analysis completed!")
     print(f"Results saved to: {results_path}")
-    print(f"Summary saved to: {summary_path}")
-    print(f"Total combinations tested: {len(results_df)}")
+    print(f"[INFO] Summary saved to: {summary_path}")
+    print(f"[INFO] Total combinations tested: {len(results_df)}")
     
     # Print summary
-    print(f"\nSummary of results:")
+    print(f"\n[INFO] Summary of results:")
     valid_results = results_df.dropna(subset=['ERB_score'])
     if len(valid_results) > 0:
-        print(valid_results[['encoder', 'build_U_top_pct', 'ERB_score']].to_string(index=False))
+        print(f"[INFO] {valid_results[['encoder', 'build_U_top_pct', 'ERB_score']].to_string(index=False)}")
     else:
-        print("No valid results found.")
+        print(f"[ERROR] No valid results found.")
     
     return results_df
 
 
 def main():
-    """Main function to run build_U_top analysis."""
     import argparse
     
     parser = argparse.ArgumentParser(description='Build_U_top Percentage Analysis')
@@ -512,13 +481,10 @@ def main():
     
     args = parser.parse_args()
     cfg = load_config(args.config)
-    
-    # Update save directory for this analysis
     cfg['experiment']['save_dir'] = os.path.join(cfg['experiment']['save_dir'], 'build_u_top_analysis')
+    run_build_u_top_analysis(cfg)
     
-    results_df = run_build_u_top_analysis(cfg)
-    
-    print(f"\nAnalysis complete! Check the results in: {cfg['experiment']['save_dir']}")
+    print(f"\n[INFO] Analysis complete! Check the results in: {cfg['experiment']['save_dir']}")
 
 
 if __name__ == "__main__":
