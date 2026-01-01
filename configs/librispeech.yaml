@@ -27,7 +27,7 @@ sae:
   hidden_dim: 0
   
 feature_mining:
-  build_U_top: 307 # 5% of 6144
+  build_U_top: 153 # 10% of 1536
   statistical_method: cohens_d  # Only cohens_d supported
 
 edits:

@@ -11,7 +11,7 @@ dataset:
   forget_labels: ["yes"]
 
 encoder:
-  name: ecapa
+  name: hubert
   wav2vec2_model: facebook/wav2vec2-base
   hubert_model: facebook/hubert-base-ls960
   conformer_model: facebook/wav2vec2-conformer-rel-pos-large
@@ -19,7 +19,7 @@ encoder:
 
 sae:
   variant: topk
-  multiplier: 10.0
+  multiplier: 8.0
   topk: 128
   lambda_sparsity: 0.0
   epochs: 250
@@ -27,7 +27,7 @@ sae:
   hidden_dim: 0
 
 feature_mining:
-  build_U_top: 200
+  build_U_top: 1536 # 25% of 6144
   statistical_method: cohens_d  # Only cohens_d supported
 
 edits:
