@@ -22,20 +22,18 @@ def build_U_from_decoder(dec_weight: np.ndarray, feat_idx: list[int]) -> np.ndar
     r = len(feat_idx)
     d = dec_weight.shape[0]
     m = dec_weight.shape[1]
-    
+    print(f"Debug: build_U_from_decoder - dec_weight.shape: {dec_weight.shape}, length of feat_idx: {len(feat_idx)}, r: {r}, d: {d}, m: {m}")
     if max(feat_idx) >= m or min(feat_idx) < 0:
         raise ValueError(f"Feature indices must be in [0, {m-1}] for SAE latent space, got indices in [{min(feat_idx)}, {max(feat_idx)}]")
         
     D = dec_weight.copy()
-    norms = np.linalg.norm(D, axis=0, keepdims=True)
-    D = D / (norms + 1e-12)
     D_S = D[:, feat_idx]
-    Uu, _, _ = np.linalg.svd(D_S, full_matrices=False)
+    U, _, _ = np.linalg.svd(D_S, full_matrices=False)
     
-    if Uu.shape[1] >= r:
-        U = Uu[:, :r]
-    else:
-        # NOTE: this should not happen in practice.
-        raise ValueError(f"bad things happening with build_U_from_decoder, r: {r} < rank(D_S): {Uu.shape[1]}...")
+    # if Uu.shape[1] >= r:
+    #     U = Uu[:, :r]
+    # else:
+    #     # NOTE: this should not happen in practice.
+    #     raise ValueError(f"bad things happening with build_U_from_decoder, r: {r} < rank(D_S): {Uu.shape[1]}...")
     
     return U
