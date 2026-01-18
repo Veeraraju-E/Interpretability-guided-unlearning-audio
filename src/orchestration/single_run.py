@@ -2,9 +2,10 @@ from typing import Dict
 import os
 import json
 import numpy as np
+import torch
 from src.core.utils.seed import seed_all
 from src.core.sae import SAE, train_sae, sae_encode_batch
-from src.core.utils.stats import compute_feature_stats, select_features
+from src.core.utils.stats import compute_feature_stats, select_features, apply_fdr, compute_bootstrap_cis
 from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
 from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
@@ -99,7 +100,6 @@ def run_single(adapter, cfg: Dict):
     console = Console()
     console.print(f"Forget list: {forget_list}", style="yellow")
     
-    # Debug: Print label types and values
     # Debug: Count samples per class
     from collections import Counter
     label_counts = Counter(all_labels)
@@ -124,7 +124,6 @@ def run_single(adapter, cfg: Dict):
         forget_label_str = str(forget_label)
         sets = [f"{'forget' if str(lbl) == forget_label_str else 'retain'}:{'dev' if pre.mask_dev[i] else 'test'}" for i, lbl in enumerate(all_labels)]
         
-        # Debug: Count forget/retain samples
         forget_count = sum(1 for s in sets if s.startswith('forget'))
         retain_count = sum(1 for s in sets if s.startswith('retain'))
         # Check minimum sample requirement
@@ -132,20 +131,15 @@ def run_single(adapter, cfg: Dict):
             console.print(f"WARNING: Forget class '{forget_label_str}' has only {forget_count} samples, minimum 5 required. Skipping this class.", style="red")
             continue
             
-        M_ret_dev = np.array([s == 'retain:dev' for s in sets], dtype=bool)
-        M_fgt_dev = np.array([s == 'forget:dev' for s in sets], dtype=bool)
-        M_ret_test = np.array([s == 'retain:test' for s in sets], dtype=bool)
-        M_fgt_test = np.array([s == 'forget:test' for s in sets], dtype=bool)
+        M_ret_dev, M_fgt_dev = np.array([s == 'retain:dev' for s in sets], dtype=bool), np.array([s == 'forget:dev' for s in sets], dtype=bool)
+        M_ret_test, M_fgt_test = np.array([s == 'retain:test' for s in sets], dtype=bool), np.array([s == 'forget:test' for s in sets], dtype=bool)
 
         # Feature mining
-        A_ret = A_all[M_ret_dev]
-        A_fgt = A_all[M_fgt_dev]
-        
+        A_ret, A_fgt = A_all[M_ret_dev], A_all[M_fgt_dev]
         # Check for dead features (never activated)
-        ret_active_features = (A_ret > 1e-6).sum(axis=0)
-        fgt_active_features = (A_fgt > 1e-6).sum(axis=0)
+        ret_active_features, fgt_active_features = (A_ret > 1e-6).sum(axis=0), (A_fgt > 1e-6).sum(axis=0)
         dead_features = (ret_active_features == 0) & (fgt_active_features == 0)
-        # Get statistical method from config, default to cohens_d
+
         method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
         balance_negs = cfg['feature_mining'].get('balance_negatives', False)
         if balance_negs and A_ret.shape[0] > 0 and A_fgt.shape[0] > 0 and A_ret.shape[0] != A_fgt.shape[0]:
@@ -159,7 +153,7 @@ def run_single(adapter, cfg: Dict):
         feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=fdr_thresh)
         
         if len(feat_idx) == 0:
-            print(f"ERROR: No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
+            print(f"[ERROR] No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
             continue
             
         prune_and_normalize_decoder(dec_w)
@@ -180,11 +174,9 @@ def run_single(adapter, cfg: Dict):
         max_pairs = cfg['orchestration'].get('max_pairs_per_class', 0)
         trials, tlabels = build_verification_trials(all_labels, [forget_label_str], test_mask_for_trials, seed=seed, max_pairs_per_class=max_pairs)
         pos_count = sum(1 for t in trials if all_labels[t[0]] == all_labels[t[1]] == forget_label_str)
-        neg_count = len(trials) - pos_count
-        scores_before = compute_scores(E_all_norm, trials)
-        scores_after = compute_scores(E_all_norm2, trials)
-        eer_before = eer_from_scores(scores_before, tlabels)
-        eer_after = eer_from_scores(scores_after, tlabels)
+        # neg_count = len(trials) - pos_count
+        scores_before, scores_after = compute_scores(E_all_norm, trials), compute_scores(E_all_norm2, trials)
+        # eer_before, eer_after = eer_from_scores(scores_before, tlabels), eer_from_scores(scores_after, tlabels)
         per_class = per_class_eers(E_all_norm, E_all_norm2, all_labels, mask=test_mask_for_trials, rng_seed=seed)
         per_class_ret = {c: vals for c, vals in per_class.items() if str(c) != forget_label_str}
         per_class_fgt = {c: vals for c, vals in per_class.items() if str(c) == forget_label_str}
@@ -192,16 +184,12 @@ def run_single(adapter, cfg: Dict):
         forget_avg_before, forget_avg_after = avg_eers(per_class_fgt)
 
         # Classifier acc
-        E_ret_test = E_all_norm[M_ret_test]
+        E_ret_test, E_fgt_test = E_all_norm[M_ret_test], E_all_norm[M_fgt_test]
         L_ret_test = [cls2id[d] for d in np.array(all_labels)[M_ret_test]]
-        E_fgt_test = E_all_norm[M_fgt_test]
-        L_fgt_test = [cls2id[d] for d in np.array(all_labels)[M_fgt_test]]
-        E_ret_test_edit = E_all_norm2[M_ret_test]
-        E_fgt_test_edit = E_all_norm2[M_fgt_test]
-        acc_ret_before = evaluate_classifier(clf, E_ret_test, L_ret_test, device=device)
-        acc_fgt_before = evaluate_classifier(clf, E_fgt_test, L_fgt_test, device=device)
-        acc_ret_after = evaluate_classifier(clf, E_ret_test_edit, L_ret_test, device=device)
-        acc_fgt_after = evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=device)
+        L_ret_test, L_fgt_test = [cls2id[d] for d in np.array(all_labels)[M_ret_test]], [cls2id[d] for d in np.array(all_labels)[M_fgt_test]]
+        E_ret_test_edit, E_fgt_test_edit = E_all_norm2[M_ret_test], E_all_norm2[M_fgt_test]
+        acc_ret_before, acc_fgt_before = evaluate_classifier(clf, E_ret_test, L_ret_test, device=device), evaluate_classifier(clf, E_fgt_test, L_fgt_test, device=device)
+        acc_ret_after, acc_fgt_after = evaluate_classifier(clf, E_ret_test_edit, L_ret_test, device=device), evaluate_classifier(clf, E_fgt_test_edit, L_fgt_test, device=device)
 
         # Probe AUC
         split_mask_dict = {'dev': pre.mask_dev, 'test': pre.mask_test}
@@ -214,7 +202,7 @@ def run_single(adapter, cfg: Dict):
             "forget_EER_before": forget_avg_before, "forget_EER_after": forget_avg_after,
             "retain_EER_before": retain_avg_before, "retain_EER_after": retain_avg_after,
             "linear_probe_auc_before": auc_before, "linear_probe_auc_after": auc_after,
-            "EER_before_raw": eer_before, "EER_after_raw": eer_after,
+            # "EER_before_raw": eer_before, "EER_after_raw": eer_after,
         }
         results_all[forget_label] = res
 
@@ -223,7 +211,6 @@ def run_single(adapter, cfg: Dict):
         os.makedirs(run_save_dir, exist_ok=True)
         with open(os.path.join(run_save_dir, "verification_eer_summary.json"), "w") as fh:
             json.dump(res, fh, indent=2)
-        # interpretability dump: Z_all, Z_edit, U, labels, sets, manifest, forget_labels
         sets_np = np.array(sets)
         np.savez_compressed(
             os.path.join(run_save_dir, "interpretability_data.npz"),
@@ -231,9 +218,32 @@ def run_single(adapter, cfg: Dict):
             labels=np.array(all_labels), sets=sets_np, manifest=np.array(pre.manifest, dtype=object), forget_spks=np.array([forget_label])
         )
         # SAE and whitener
-        import torch
         torch.save(sae.state_dict(), os.path.join(run_save_dir, "sae_state_dict.pt"))
         np.savez_compressed(os.path.join(run_save_dir, "whitener.npz"), mu=pre.mu, W=pre.W)
+        
+        # Save feature mining statistics (ICLR-level artifacts)
+        apply_fdr(stats, fdr_thresh)
+        np.savez_compressed(
+            os.path.join(run_save_dir, "feature_mining_stats.npz"),
+            **{k: v for k, v in stats.items() if isinstance(v, np.ndarray)}
+        )
+        selected_meta = {
+            "feat_idx": [int(i) for i in feat_idx],
+            "top_k": int(cfg['feature_mining']['build_U_top']),
+            "fdr_alpha": float(fdr_thresh),
+            "n_tested": int(stats["n_pos"][0]) + int(stats["n_neg"][0]),
+            "n_significant": int((stats["qval"] <= fdr_thresh).sum()),
+            "n_selected": len(feat_idx),
+        }
+        with open(os.path.join(run_save_dir, "selected_features.json"), "w") as fh:
+            json.dump(selected_meta, fh, indent=2)
+        
+        # Optional bootstrap CIs for selected features
+        if cfg['feature_mining'].get('compute_ci', False):
+            ci_iters = cfg['feature_mining'].get('ci_bootstrap_iters', 1000)
+            ci_alpha = cfg['feature_mining'].get('ci_alpha', 0.05)
+            cis = compute_bootstrap_cis(A_fgt, A_ret_bal, feat_idx, n_boot=ci_iters, alpha=ci_alpha, seed=seed)
+            np.savez_compressed(os.path.join(run_save_dir, "feature_mining_cis.npz"), **cis)
         
         # Create embedding visualizations
         print(f"[VIZ] Creating embedding visualizations for forget label: {forget_label}")

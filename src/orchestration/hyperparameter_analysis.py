@@ -160,7 +160,7 @@ def evaluate_hyperparameter_combination(pre, classes, cfg: Dict, expansion_facto
     feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
     
     if len(feat_idx) == 0:
-        print(f"    ERROR: No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
+        print(f"    [ERROR] No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
         return {
             'expansion_factor': expansion_factor,
             'topk': topk,
@@ -284,7 +284,7 @@ def run_hyperparameter_analysis(cfg: Dict) -> None:
                 results.append(result)
                 
             except Exception as e:
-                print(f"    ERROR: {str(e)}")
+                print(f"    [ERROR] {str(e)}")
                 results.append({
                     'expansion_factor': expansion_factor,
                     'topk': topk,

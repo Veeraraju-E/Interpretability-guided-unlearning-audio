@@ -13,3 +13,6 @@ pandas
 transformers
 typer
 rich
+scipy
+statsmodels
+librosa

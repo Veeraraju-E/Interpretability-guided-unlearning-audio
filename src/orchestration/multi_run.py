@@ -3,7 +3,8 @@ import os, csv, pickle
 import numpy as np
 from src.core.utils.seed import seed_all
 from src.core.sae import SAE, train_sae, sae_encode_batch
-from src.core.utils.stats import compute_feature_stats, select_features
+import json
+from src.core.utils.stats import compute_feature_stats, select_features, apply_fdr, compute_bootstrap_cis
 from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
 from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
@@ -134,7 +135,7 @@ def run_multi(adapter, cfg: Dict):
                 for forget in classes:
                     try:
                         print(f"[INFO] Processing seed {seed}, forget class: {forget}")
-                        res = run_single_class_unlearning(pre, A_all, dec_w, forget, classes, cfg, device)
+                        res = run_single_class_unlearning(pre, A_all, dec_w, forget, classes, cfg, device, seed, base_save_dir)
                         row = {"seed": seed, "forget_label": forget, **res, "error": ""}
                         writer.writerow(row)
                         fh.flush()
@@ -150,7 +151,7 @@ def run_multi(adapter, cfg: Dict):
                 fh.flush()
 
 
-def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, device):
+def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, device, seed, save_dir):
     from rich.console import Console
     console = Console()
     
@@ -187,8 +188,9 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     
     # Feature mining (statistical method: cohens_d)
     method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
+    fdr_thresh = cfg['feature_mining'].get('fdr', 0.05)
     stats = compute_feature_stats(A_fgt, A_ret, method=method)
-    feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
+    feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=fdr_thresh)
     
     if len(feat_idx) == 0:
         console.print(f"[ERROR] No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.", style="red")
@@ -233,6 +235,32 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     split_mask_dict = {'dev': pre.mask_dev, 'test': pre.mask_test}
     _, auc_before = safe_linear_probe(E_all_norm, all_labels, U, split_mask_dict, [forget_label_str])
     _, auc_after = safe_linear_probe(E_all_norm2, all_labels, U, split_mask_dict, [forget_label_str])
+    
+    # Save feature mining statistics (ICLR-level artifacts)
+    run_save_dir = os.path.join(save_dir, f"seed{seed}_forget_{forget_label_str}")
+    os.makedirs(run_save_dir, exist_ok=True)
+    apply_fdr(stats, fdr_thresh)
+    np.savez_compressed(
+        os.path.join(run_save_dir, "feature_mining_stats.npz"),
+        **{k: v for k, v in stats.items() if isinstance(v, np.ndarray)}
+    )
+    selected_meta = {
+        "feat_idx": [int(i) for i in feat_idx],
+        "top_k": int(cfg['feature_mining']['build_U_top']),
+        "fdr_alpha": float(fdr_thresh),
+        "n_tested": int(stats["n_pos"][0]) + int(stats["n_neg"][0]),
+        "n_significant": int((stats["qval"] <= fdr_thresh).sum()),
+        "n_selected": len(feat_idx),
+    }
+    with open(os.path.join(run_save_dir, "selected_features.json"), "w") as fh:
+        json.dump(selected_meta, fh, indent=2)
+    
+    # Optional bootstrap CIs for selected features
+    if cfg['feature_mining'].get('compute_ci', False):
+        ci_iters = cfg['feature_mining'].get('ci_bootstrap_iters', 1000)
+        ci_alpha = cfg['feature_mining'].get('ci_alpha', 0.05)
+        cis = compute_bootstrap_cis(A_fgt, A_ret, feat_idx, n_boot=ci_iters, alpha=ci_alpha, seed=seed)
+        np.savez_compressed(os.path.join(run_save_dir, "feature_mining_cis.npz"), **cis)
     
     return {
         "FA_before": acc_fgt_before,

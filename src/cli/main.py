@@ -22,6 +22,7 @@ from src.datasets.mls_spanish_adapter import MLSSpanishAdapter
 from src.orchestration.single_run import run_single
 from src.orchestration.multi_run import run_multi
 from src.orchestration.continual import run_continual
+from src.core.interpretation import run_interpretation_protocol
 
 # Initialize Typer app and console
 app = typer.Typer(
@@ -197,7 +198,23 @@ def interpret(
             console.print("[red]Error: Provide either --run-dir or --config[/red]")
             raise typer.Exit(1)
         cfg = load_config(str(config))
-        run_dir = Path(cfg['experiment']['save_dir'])
+        save_dir = Path(cfg['experiment']['save_dir'])
+        
+        # Find run directories (seed*_forget_*)
+        run_dirs = sorted(save_dir.glob("seed*_forget_*"))
+        if len(run_dirs) == 0:
+            console.print(f"[red]Error: No run directories found in '{save_dir}'[/red]")
+            console.print("[yellow]Expected directories named like 'seed42_forget_speaker_id'[/yellow]")
+            raise typer.Exit(1)
+        elif len(run_dirs) == 1:
+            run_dir = run_dirs[0]
+            console.print(f"[yellow]Found single run directory: {run_dir.name}[/yellow]")
+        else:
+            console.print(f"[yellow]Found {len(run_dirs)} run directories. Using first: {run_dirs[0].name}[/yellow]")
+            console.print("[yellow]To analyze a specific run, use --run-dir[/yellow]")
+            run_dir = run_dirs[0]
+    else:
+        run_dir = Path(run_dir)
     
     if not run_dir.exists():
         console.print(f"[red]Error: Run directory '{run_dir}' does not exist[/red]")
@@ -207,13 +224,44 @@ def interpret(
     console.print(f"[green]Using device: {device}[/green]")
     
     try:
-        # Import and run the interpretability module
-        from src import interp as interpret_module
-        interpret_module.main(run_dir=str(run_dir), device=device)
-        console.print("[green] Interpretability analysis completed[/green]")
+        # Try to determine adapter from config if provided
+        adapter_name = 'voxceleb'
+        encoder_name = 'ecapa'
+        if config is not None:
+            cfg = load_config(str(config))
+            adapter_name = cfg.get('dataset', {}).get('name', 'voxceleb')
+            encoder_name = cfg.get('encoder', {}).get('name', 'ecapa')
+        
+        adapter = ADAPTERS.get(adapter_name, VoxCelebAdapter())
+        encoder_cfg = {'encoder': encoder_name, 'label_key': adapter.label_key}
+        
+        results = run_interpretation_protocol(
+            str(run_dir),
+            adapter,
+            encoder_cfg,
+            device=device
+        )
+        
+        console.print("[green]✓ Interpretability analysis completed[/green]")
+        console.print(f"[green]Results saved to: {run_dir}/interpretation/[/green]")
+        
+        # Print summary
+        console.print("\n[bold]Interpretation Protocol Results[/bold]")
+        console.print(f"Forget speaker: {results['forget_speaker']}")
+        console.print(f"Number of traits: {len(results['trait_names'])}")
+        console.print(f"\n[bold]Leakage ratios (lower is better):[/bold]")
+        for name, ratio in zip(results['trait_names'], results['leakage_ratios']):
+            console.print(f"  {name}: {ratio:.4f}")
+        console.print(f"\n[bold]Wasserstein distances (forget vs retain):[/bold]")
+        for name, w_f, w_r in zip(results['trait_names'], 
+                                   results['wasserstein_distances']['forget'],
+                                   results['wasserstein_distances']['retain_test']):
+            console.print(f"  {name}: forget={w_f:.4f}, retain={w_r:.4f}")
         
     except Exception as e:
         console.print(f"[red]Error during interpretability analysis: {e}[/red]")
+        import traceback
+        console.print(traceback.format_exc())
         raise typer.Exit(1)
 
 @app.command()

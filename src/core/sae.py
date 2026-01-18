@@ -25,6 +25,7 @@ class SAE(nn.Module):
         nn.init.xavier_uniform_(self.enc.weight)
         nn.init.zeros_(self.enc.bias)
         nn.init.xavier_uniform_(self.dec.weight)
+        print(f"Debug from sae.py: enc.weight.shape: {self.enc.weight.shape}, dec.weight.shape: {self.dec.weight.shape}")
 
     def _ensure_2d(self, z: torch.Tensor) -> torch.Tensor:
         if z.ndim == 3 and z.size(1) == 1:
