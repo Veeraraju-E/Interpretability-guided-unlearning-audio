@@ -189,7 +189,7 @@ def run_training_analysis(cfg: Dict) -> Dict:
                 }
                 
             except Exception as e:
-                print(f"    ERROR: {str(e)}")
+                print(f"    [ERROR] {str(e)}")
                 results[alpha][k] = {
                     'epochs': [],
                     'val_mse': [],

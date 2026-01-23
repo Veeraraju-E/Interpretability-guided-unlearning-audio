@@ -7,7 +7,7 @@ import torch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.core.sae import SAE, train_sae, sae_encode_batch
 from src.core.utils.seed import seed_all
-from src.core.utils.stats import compute_feature_stats, select_features, apply_fdr, compute_bootstrap_cis
+from src.core.utils.stats import compute_feature_stats, select_features
 from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
 from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
@@ -162,30 +162,6 @@ def run_single_continual_step(pre: Precomp, sae: SAE, forget_label: str, cfg: Di
     # SAE and whitener
     torch.save(sae.state_dict(), os.path.join(run_save_dir, "sae_state_dict.pt"))
     np.savez_compressed(os.path.join(run_save_dir, "whitener.npz"), mu=pre.mu, W=pre.W)
-    
-    # Save feature mining statistics (ICLR-level artifacts)
-    apply_fdr(stats, fdr_thresh)
-    np.savez_compressed(
-        os.path.join(run_save_dir, "feature_mining_stats.npz"),
-        **{k: v for k, v in stats.items() if isinstance(v, np.ndarray)}
-    )
-    selected_meta = {
-        "feat_idx": [int(i) for i in feat_idx],
-        "top_k": int(cfg['feature_mining']['build_U_top']),
-        "fdr_alpha": float(fdr_thresh),
-        "n_tested": int(stats["n_pos"][0]) + int(stats["n_neg"][0]),
-        "n_significant": int((stats["qval"] <= fdr_thresh).sum()),
-        "n_selected": len(feat_idx),
-    }
-    with open(os.path.join(run_save_dir, "selected_features.json"), "w") as fh:
-        json.dump(selected_meta, fh, indent=2)
-    
-    # Optional bootstrap CIs for selected features
-    if cfg['feature_mining'].get('compute_ci', False):
-        ci_iters = cfg['feature_mining'].get('ci_bootstrap_iters', 1000)
-        ci_alpha = cfg['feature_mining'].get('ci_alpha', 0.05)
-        cis = compute_bootstrap_cis(A_fgt, A_ret_bal, feat_idx, n_boot=ci_iters, alpha=ci_alpha, seed=seed)
-        np.savez_compressed(os.path.join(run_save_dir, "feature_mining_cis.npz"), **cis)
     
     return res
 

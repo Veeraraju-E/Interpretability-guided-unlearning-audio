@@ -1,6 +1,6 @@
 experiment:
   name: libri_exp
-  save_dir: ./runs/librispeech
+  save_dir: ./runs/librispeech_seed1337
   device: cuda
   seed: 1337
 
@@ -8,13 +8,13 @@ dataset:
   name: librispeech
   root_or_manifest: /data/veer/testing/new/datasets/librispeech_data_dev/LibriSpeech
   dev_frac: 0.7
-  forget_labels: ['6319']
+  forget_labels: ['6319', '2412', '1673', '2086', '1993', '2078', '251', '2428', '3081', '3000', '3170', '3576', '8842']
 
 encoder:
   name: ecapa
   wav2vec2_model: facebook/wav2vec2-base
   hubert_model: facebook/hubert-base-ls960
-  conformer_model: facebook/wav2vec2-conformer-rel-pos-large
+  conformer_model: facebook/wav2vec2-conformer-rel-pos-large 
   embeddings_path: null
 
 sae:
@@ -37,6 +37,6 @@ edits:
   noise_sigma: 0.02
 
 orchestration:
-  mode: single
+  mode: continual
   seeds: [1337, 1338, 1339]
   classifier_epochs: 20

@@ -8,7 +8,7 @@ dataset:
   name: lahaja
   root_or_manifest: test  # HF split: train|validation|test
   dev_frac: 0.7
-  forget_labels: ['6012000339299']  # Using actual speaker IDs from the dataset
+  forget_labels: ['6012000339299', '6052300306044', '6099600302192', '6695900330902', '6718400334883', '6733800330307', '6834000331270', '7021900308774', '7028700306484', '7037000306250']  # Using actual speaker IDs from the dataset
 
 encoder:
   name: wav2vec2
@@ -37,6 +37,6 @@ edits:
   noise_sigma: 0.02
 
 orchestration:
-  mode: single
+  mode: continual
   seeds: [1337, 1338, 1339]
   classifier_epochs: 20
