@@ -26,77 +26,69 @@ The framework supports multiple datasets with pre-configured settings:
 - `configs/lahaja.yaml` - Lahaja speech recognition
 - `configs/mls_spanish.yaml` - MLS Spanish speech recognition
 
-### 2. CLI Commands
+### 2. Run Unlearning Experiments
 
-#### Run Unlearning Experiments
+#### CLI
 
 ```bash
-# Run unlearning experiments (mode determined by config)
-python -m src.cli.main run --config path/to/config.yaml
+# Single-class unlearning
+python -m src.cli.main run --config path/to/config
 
-# Show configuration summary before running
-python -m src.cli.main run --config path/to/config.yaml --show-config
+# Multi-class unlearning (all classes)
+python -m src.cli.main run --config path/to/config --show-config
+
+# Continual unlearning (sequential forgetting)
+python -m src.cli.main run --config path/to/config
+
+# Grid search over SAE parameters
+python -m src.cli.main grid --config path/to/hyperparam/config
+
+# List available configurations
+python -m src.cli.main list-configs
 ```
 
-The `run` command supports three modes (set via `orchestration.mode` in config):
+#### Additional Analysis Scripts
+
+The framework also includes standalone analysis scripts that can be run directly:
+
+```bash
+# Hyperparameter analysis
+python -m src.orchestration.hyperparameter_analysis --config path/to/config [--mode analyze|plot|all]
+
+# Build U top analysis
+python -m src.orchestration.build_u_top_analysis --config path/to/config
+
+# SAE training loss analysis
+python -m src.orchestration.sae_training_loss_analysis --config path/to/config [--mode train|plot|all]
+```
+
+### 3. Configuration Modes
+
+Set the `orchestration.mode` in your config file:
+
 - `single`: Unlearn specific classes (default)
 - `multi`: Unlearn all classes sequentially  
 - `continual`: Sequential forgetting with cumulative effects
-
-#### Interpretability Analysis
-
-```bash
-# Run interpretability analysis using config (auto-finds run directories)
-python -m src.cli.main interpret --config path/to/config.yaml
-
-# Run interpretability analysis on specific run directory
-python -m src.cli.main interpret --run-dir path/to/seed42_forget_speaker123
-
-# Specify device
-python -m src.cli.main interpret --config path/to/config.yaml --device cpu
-```
-
-#### Grid Search
-
-```bash
-# Run grid search over SAE parameters
-python -m src.cli.main grid --config path/to/config.yaml
-
-# Show config before running
-python -m src.cli.main grid --config path/to/config.yaml --show-config
-```
-
-#### Configuration Utilities
-
-```bash
-# List available configuration files
-python -m src.cli.main list-configs
-
-# Validate a configuration file
-python -m src.cli.main validate-config --config path/to/config.yaml
-```
 
 ## Architecture
 
 ```
 src/
 ├── core/
-│   ├── edits.py             # LEACE and noise injection
-│   ├── encoders.py          # Audio encoders (ECAPA, wav2vec2, etc.)
-│   ├── sae.py               # Sparse Autoencoder
-│   ├── interpretation.py   # Interpretation protocol (Steps 1-6)
-│   ├── acoustic_features.py # Acoustic feature extraction
-│   ├── evals/               # Evaluation metrics, probes, and attribute directions
-│   └── utils/               # Whitening, normalization, and stats
-├── datasets/                # Dataset adapters and preprocessing
-├── orchestration/           # Unlearning workflow orchestration
-│   ├── single_run.py        # Single-class unlearning
-│   ├── multi_run.py         # Multi-class unlearning
-│   └── continual.py         # Continual unlearning
+│   ├── edits.py                   # LEACE
+│   ├── encoders.py                # Audio encoders
+│   ├── sae.py                     # Sparse Autoencoder
+│   ├── evals/                     # Evaluation metrics and probes
+│   └── utils/                     # Whitening, normalization, and stats
+├── datasets/                      # Dataset adapters and preprocessing
+├── orchestration/                 # Unlearning workflow orchestration
+│   ├── single_run.py              # Single-class unlearning
+│   ├── multi_run.py               # Multi-class unlearning
+│   ├── continual.py               # Continual unlearning
+│   └── hyperparameter_analysis.py # Hyperparameter analysis
 └── cli/                     # Command-line interfaces
-    ├── main.py              # Main CLI (run, interpret, grid, list-configs, validate-config)
-    ├── grid_search.py       # Grid search implementation
-    └── aggregate_stats.py    # Statistics aggregation utilities
+    ├── main.py              # Main CLI
+    └── grid_search.py       # Grid search CLI
 ```
 
 <!-- ## Citation
@@ -108,7 +100,7 @@ If you use our method, please consider citing:
   title={sae-guided Unlearning for Audio Models},
   author={Your Name},
   journal={Your Journal},
-  year={2024}
+  year={2026}
 }
 ``` -->
 

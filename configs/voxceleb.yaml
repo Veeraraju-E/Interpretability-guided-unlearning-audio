@@ -1,6 +1,6 @@
 experiment:
   name: voxceleb_exp
-  save_dir: ./runs/voxceleb_seed1338
+  save_dir: ./runs/voxceleb
   device: cuda
   seed: 1337
 
@@ -8,7 +8,7 @@ dataset:
   name: voxceleb
   root_or_manifest: /data/veer/testing/new/datasets/voxceleb2/manifest.csv
   dev_frac: 0.7
-  forget_labels: ['id00017', 'id01224', 'id02019', 'id02745', 'id03980', 'id04627', 'id05816', 'id07414', 'id00061', 'id01228', 'id02057', 'id03030', 'id03981', 'id04656']
+  forget_labels: ['id00017']
 
 encoder:
   name: ecapa
@@ -22,7 +22,7 @@ sae:
   multiplier: 8.0
   topk: 128
   lambda_sparsity: 0.0
-  epochs: 100
+  epochs: 500
   batch_size: 64
   hidden_dim: 0
 
@@ -37,6 +37,6 @@ edits:
   noise_sigma: 0.02
 
 orchestration:
-  mode: continual
+  mode: single
   seeds: [1337]
   classifier_epochs: 20

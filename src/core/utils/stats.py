@@ -1,207 +1,175 @@
 import math
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict   
 from rich.console import Console
 from sklearn.metrics import roc_auc_score
-from scipy.stats import mannwhitneyu
-from statsmodels.stats.multitest import multipletests
+try:
+    from statsmodels.stats.multitest import multipletests as _multipletests
+    multipletests = _multipletests
+except Exception:
+    multipletests = None
 
 
 def cohens_d(x_pos: np.ndarray, x_neg: np.ndarray) -> float:
-    """Cohen's d effect size for two independent samples."""
     n1, n2 = len(x_pos), len(x_neg)
+    if n1 == 0 or n2 == 0:
+        raise ValueError("Cannot compute Cohen's d: positive samples array is empty. This suggests a data filtering or sampling issue.")
     m1, m2 = x_pos.mean(), x_neg.mean()
     s1, s2 = x_pos.var(ddof=1), x_neg.var(ddof=1)
     s_pooled = math.sqrt(((n1-1)*s1 + (n2-1)*s2) / max(1, n1+n2-2))
+    
     if s_pooled == 0:
-        return 0.0
+        print(f"  Positive samples (n={n1}): mean={m1:.6f}, var={s1:.6f}, std={math.sqrt(s1):.6f}")
+        print(f"  Negative samples (n={n2}): mean={m2:.6f}, var={s2:.6f}, std={math.sqrt(s2):.6f}")
+        print(f"  Positive sample values: {x_pos[:min(10, len(x_pos))]}")
+        print(f"  Negative sample values: {x_neg[:min(10, len(x_neg))]}")
+        print(f"  All positive values unique: {len(np.unique(x_pos)) == 1}")
+        print(f"  All negative values unique: {len(np.unique(x_neg)) == 1}")
+        raise ValueError("Cannot compute Cohen's d: pooled standard deviation is zero. This indicates no variance in the data.")
     return float((m1 - m2) / s_pooled)
 
-
-def hedges_g(x_pos: np.ndarray, x_neg: np.ndarray) -> float:
-    """Hedges' g: bias-corrected Cohen's d for small samples (Hedges, 1981)."""
-    d = cohens_d(x_pos, x_neg)
+def mann_whitney_u_p(x_pos: np.ndarray, x_neg: np.ndarray) -> tuple[float,float]:
     n1, n2 = len(x_pos), len(x_neg)
-    df = n1 + n2 - 2
-    if df <= 0:
-        return d
-    # Hedges correction factor J
-    J = 1 - 3 / (4 * df - 1)
-    return d * J
+    if n1 == 0 or n2 == 0:
+        raise ValueError("Cannot compute Mann-Whitney U: samples array is empty. This suggests a data filtering or sampling issue.")
 
-
-def rank_biserial(u_stat: float, n1: int, n2: int) -> float:
-    """Rank-biserial correlation (equivalent to Cliff's delta) from Mann-Whitney U."""
-    # r_rb = 1 - 2U / (n1 * n2)
-    denom = n1 * n2
-    if denom == 0:
-        return 0.0
-    return 1 - 2 * u_stat / denom
-
-
-def bootstrap_ci(x_pos: np.ndarray, x_neg: np.ndarray, stat_fn, n_boot: int = 1000, alpha: float = 0.05, seed: int = 42) -> tuple:
-    """Bootstrap confidence interval for a two-sample statistic."""
-    rng = np.random.default_rng(seed)
-    n1, n2 = len(x_pos), len(x_neg)
-    boot_stats = np.empty(n_boot)
-    for i in range(n_boot):
-        idx1 = rng.choice(n1, size=n1, replace=True)
-        idx2 = rng.choice(n2, size=n2, replace=True)
-        boot_stats[i] = stat_fn(x_pos[idx1], x_neg[idx2])
-    lo = np.percentile(boot_stats, 100 * alpha / 2)
-    hi = np.percentile(boot_stats, 100 * (1 - alpha / 2))
-    return float(lo), float(hi)
+    x = np.concatenate([x_pos, x_neg])
+    labels = np.concatenate([np.ones(len(x_pos)), np.zeros(len(x_neg))])
+    ranks = np.argsort(np.argsort(x)) + 1
+    r1 = ranks[labels==1].sum()
+    U1 = r1 - n1*(n1+1)/2
+    auc = U1 / (n1*n2 + 1e-12)
+    mu = n1*n2/2
+    sigma = math.sqrt(n1*n2*(n1+n2+1)/12)
+    z = (U1 - mu) / (sigma + 1e-12)
+    from math import erf, sqrt
+    p = 2*(1 - 0.5*(1+erf(abs(z)/sqrt(2))))
+    return auc, p
 
 
 def feature_stats(A_pos: np.ndarray, A_neg: np.ndarray) -> Dict:
-    """
-    Compute per-latent statistics for ICLR-level reporting.
-    
-    Returns dict with arrays of length m (number of latents):
-      - n_pos, n_neg: sample counts
-      - mean_pos, mean_neg, std_pos, std_neg: group summaries
-      - u_stat: Mann-Whitney U statistic
-      - pval: two-sided p-value from MWU (with tie correction)
-      - cohens_d, hedges_g: parametric effect sizes
-      - rank_biserial: nonparametric effect size (Cliff's delta)
-      - auc: ROC-AUC (equivalent to U / (n1*n2))
-    """
-    n_pos, n_neg = A_pos.shape[0], A_neg.shape[0]
+    # Validate input arrays
+    if A_pos.shape[0] == 0 or A_neg.shape[0] == 0:
+        raise ValueError("Cannot compute feature statistics: positive samples array is empty. This suggests a data filtering or sampling issue.")
     m = A_pos.shape[1]
-    
-    stats = {
-        "n_pos": np.full(m, n_pos, dtype=int),
-        "n_neg": np.full(m, n_neg, dtype=int),
-        "mean_pos": np.zeros(m),
-        "mean_neg": np.zeros(m),
-        "std_pos": np.zeros(m),
-        "std_neg": np.zeros(m),
-        "u_stat": np.zeros(m),
-        "pval": np.ones(m),
-        "cohens_d": np.zeros(m),
-        "hedges_g": np.zeros(m),
-        "rank_biserial": np.zeros(m),
-        "auc": np.full(m, 0.5),
-    }
-    
-    # Identify dead latents (never activated in either group)
     pos_activity = (A_pos > 1e-6).sum(axis=0)
     neg_activity = (A_neg > 1e-6).sum(axis=0)
-    dead = (pos_activity == 0) & (neg_activity == 0)
+    dead_latents = (pos_activity == 0) & (neg_activity == 0)    
     
+    
+    stats = {"cohens_d": np.zeros(m), "auc": np.zeros(m), "pval": np.ones(m)}
+    
+    # Only compute statistics for active features
     for j in range(m):
-        if dead[j]:
+        if dead_latents[j]:
+            stats["cohens_d"][j] = 0.0
+            stats["auc"][j] = 0.5
+            stats["pval"][j] = 1.0 
             continue
-        x_pos, x_neg = A_pos[:, j], A_neg[:, j]
+            
+        x_pos = A_pos[:, j]; x_neg = A_neg[:, j]
         
-        stats["mean_pos"][j] = x_pos.mean()
-        stats["mean_neg"][j] = x_neg.mean()
-        stats["std_pos"][j] = x_pos.std(ddof=1) if n_pos > 1 else 0.0
-        stats["std_neg"][j] = x_neg.std(ddof=1) if n_neg > 1 else 0.0
-        
-        # Skip if zero variance in both
-        if stats["std_pos"][j] == 0 and stats["std_neg"][j] == 0:
+        # Check for zero variance before computing Cohen's d
+        pos_var = x_pos.var(ddof=1)
+        neg_var = x_neg.var(ddof=1)
+        if pos_var == 0 and neg_var == 0:
+            stats["cohens_d"][j] = 0.0
+            stats["auc"][j] = 0.5
+            stats["pval"][j] = 1.0
             continue
         
-        # Mann-Whitney U (scipy, with tie correction)
-        U, p = mannwhitneyu(x_pos, x_neg, alternative='two-sided')
-        stats["u_stat"][j] = U
-        stats["pval"][j] = p
+        try:
+            stats["cohens_d"][j] = cohens_d(x_pos, x_neg)
+        except ValueError as e:
+            stats["cohens_d"][j] = 0.0
         
-        # Effect sizes
-        stats["cohens_d"][j] = cohens_d(x_pos, x_neg)
-        stats["hedges_g"][j] = hedges_g(x_pos, x_neg)
-        stats["rank_biserial"][j] = rank_biserial(U, n_pos, n_neg)
-        
-        # AUC (from sklearn for consistency; equivalent to U/(n1*n2) for positive class)
-        y_true = np.concatenate([np.ones(n_pos), np.zeros(n_neg)])
-        y_scores = np.concatenate([x_pos, x_neg])
-        if len(np.unique(y_scores)) > 1:
-            stats["auc"][j] = roc_auc_score(y_true, y_scores)
+        # ROC AUC computation
+        try:
+            y_true = np.concatenate([np.ones(len(x_pos)), np.zeros(len(x_neg))])
+            y_scores = np.concatenate([x_pos, x_neg])
+            stats["auc"][j] = float(roc_auc_score(y_true, y_scores))
+        except Exception:
+            stats["auc"][j] = 0.5
+            
+        try:
+            _, p = mann_whitney_u_p(x_pos, x_neg)
+            stats["pval"][j] = p
+        except Exception:
+            stats["pval"][j] = 1.0
     
     return stats
 
-
-def apply_fdr(stats: Dict, fdr: float = 0.05) -> Dict:
-    """Apply Benjamini-Hochberg FDR correction, add qval to stats dict."""
+def select_features_from_stats(stats: dict, top_k: int = 200, fdr: float = 0.05):
     pvals = stats["pval"]
-    _, qvals, _, _ = multipletests(pvals, alpha=fdr, method='fdr_bh')
-    stats["qval"] = qvals
-    stats["fdr_alpha"] = fdr
-    return stats
-
-
-def select_features_from_stats(stats: Dict, top_k: int = 200, fdr: float = 0.05) -> List[int]:
-    """
-    Select features passing FDR threshold, ranked by discriminability |AUC - 0.5|.
-    Falls back to top-k by AUC if none pass FDR.
-    """
+    
+    # Filter out features with AUC = 0.5 (random performance)
+    auc_scores = np.abs(stats["auc"] - 0.5)
+    valid_features = auc_scores > 1e-6
+    
     console = Console()
+    console.print(f"Features with discriminative power (AUC != 0.5): {valid_features.sum()} out of {len(valid_features)}", style="yellow")
     
-    # Ensure qval is computed
-    if "qval" not in stats:
-        apply_fdr(stats, fdr)
-    
-    auc_disc = np.abs(stats["auc"] - 0.5)
-    valid = auc_disc > 1e-6
-    console.print(f"Features with discriminative power (AUC != 0.5): {valid.sum()} / {len(valid)}", style="yellow")
-    
-    if valid.sum() == 0:
+    if valid_features.sum() == 0:
         console.print("WARNING: No features with discriminative power found!", style="red")
         return []
     
-    # Significant features (q <= fdr and valid)
-    sig = (stats["qval"] <= fdr) & valid
-    sig_idx = np.where(sig)[0]
-    
-    if len(sig_idx) == 0:
-        console.print(f"No features pass FDR q<={fdr}, falling back to top-{top_k} by AUC", style="yellow")
-        idx = np.argsort(-auc_disc)
-        idx = [i for i in idx if valid[i]][:top_k]
+    if multipletests is not None:
+        # Only apply FDR correction to valid features
+        valid_pvals = pvals[valid_features]
+        print(f"[INFO]: Valid pvals: {valid_pvals}")
+        rej, _, _, _ = multipletests(valid_pvals, alpha=fdr, method='fdr_bh')
+        
+        # Map back to original indices
+        valid_indices = np.where(valid_features)[0]
+        significant_indices = valid_indices[rej]
+        
+        if len(significant_indices) == 0:
+            # Fallback: select top features by AUC
+            idx = np.argsort(-auc_scores)[:top_k]
+            idx = idx[valid_features[idx]]
+        else:
+            # Sort significant features by AUC
+            idx = sorted(significant_indices, key=lambda j: -auc_scores[j])
+            idx = idx[:top_k]
     else:
-        # Sort significant by AUC discriminability
-        idx = sorted(sig_idx, key=lambda j: -auc_disc[j])[:top_k]
+        # Select top features by AUC, but only from valid features
+        idx = np.argsort(-auc_scores)[:top_k]
+        idx = idx[valid_features[idx]]
     
     return list(idx)
 
 
-def compute_bootstrap_cis(A_pos: np.ndarray, A_neg: np.ndarray, feat_idx: List[int],
-                          n_boot: int = 1000, alpha: float = 0.05, seed: int = 42) -> Dict:
-    """
-    Compute bootstrap 95% CIs for selected features only (for paper reporting).
-    Returns dict with arrays indexed by position in feat_idx.
-    """
-    n = len(feat_idx)
-    cis = {
-        "feat_idx": np.array(feat_idx),
-        "cohens_d_ci_lo": np.zeros(n),
-        "cohens_d_ci_hi": np.zeros(n),
-        "hedges_g_ci_lo": np.zeros(n),
-        "hedges_g_ci_hi": np.zeros(n),
-        "auc_ci_lo": np.zeros(n),
-        "auc_ci_hi": np.zeros(n),
-    }
-    
-    def auc_fn(xp, xn):
-        y = np.concatenate([np.ones(len(xp)), np.zeros(len(xn))])
-        s = np.concatenate([xp, xn])
-        if len(np.unique(s)) < 2:
-            return 0.5
-        return roc_auc_score(y, s)
-    
-    for i, j in enumerate(feat_idx):
-        x_pos, x_neg = A_pos[:, j], A_neg[:, j]
-        cis["cohens_d_ci_lo"][i], cis["cohens_d_ci_hi"][i] = bootstrap_ci(x_pos, x_neg, cohens_d, n_boot, alpha, seed)
-        cis["hedges_g_ci_lo"][i], cis["hedges_g_ci_hi"][i] = bootstrap_ci(x_pos, x_neg, hedges_g, n_boot, alpha, seed)
-        cis["auc_ci_lo"][i], cis["auc_ci_hi"][i] = bootstrap_ci(x_pos, x_neg, auc_fn, n_boot, alpha, seed)
-    
-    return cis
-
 def compute_feature_stats(A_pos: np.ndarray, A_neg: np.ndarray, method: str = "cohens_d") -> Dict:
-    """Compute feature statistics. Returns dict with per-latent arrays."""
-    return feature_stats(A_pos, A_neg)
+    """
+    Compute feature statistics using Cohen's d method.
+    
+    Args:
+        A_pos: Positive class activations (N_pos x m)
+        A_neg: Negative class activations (N_neg x m)
+        method: Statistical method to use (only "cohens_d" supported)
+    
+    Returns:
+        Dictionary with computed statistics
+    """
+    if method == "cohens_d":
+        return feature_stats(A_pos, A_neg)
+    else:
+        raise ValueError(f"Unknown statistical method: {method}. Only 'cohens_d' is supported.")
 
-
-def select_features(stats: Dict, method: str = "cohens_d", top_k: int = 200, fdr: float = 0.05) -> List[int]:
-    """Select discriminative features using FDR correction and AUC ranking."""
-    return select_features_from_stats(stats, top_k=top_k, fdr=fdr)
+def select_features(stats: dict, method: str = "cohens_d", top_k: int = 200, fdr: float = 0.05):
+    """
+    Select features using Cohen's d method.
+    
+    Args:
+        stats: Dictionary with computed statistics
+        method: Statistical method to use (only "cohens_d" supported)
+        top_k: Maximum number of features to select
+        fdr: False Discovery Rate threshold
+    
+    Returns:
+        List of selected feature indices
+    """
+    if method == "cohens_d":
+        return select_features_from_stats(stats, top_k=top_k, fdr=fdr)
+    else:
+        raise ValueError(f"Unknown statistical method: {method}. Only 'cohens_d' is supported.")

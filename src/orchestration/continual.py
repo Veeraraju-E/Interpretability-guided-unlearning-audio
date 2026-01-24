@@ -5,14 +5,15 @@ import sys
 import json
 import torch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.core.sae import SAE, train_sae, sae_encode_batch
-from src.core.utils.seed import seed_all
-from src.core.utils.stats import compute_feature_stats, select_features, apply_fdr, compute_bootstrap_cis
-from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
 from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
 from src.core.evals.verification import *
 from src.core.edits import apply_edits
+from src.core.sae import SAE, train_sae, sae_encode_batch
+from src.core.utils.seed import seed_all
+from src.core.utils.stats import compute_feature_stats, select_features
+from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
+from src.core.visualization.latent_selection import plot_discriminability_landscape
 from src.datasets.adapter_base import Precomp
 
 def filter_precomp_by_forgotten(pre: Precomp, forgotten: List[str]) -> Precomp:
@@ -92,6 +93,28 @@ def run_single_continual_step(pre: Precomp, sae: SAE, forget_label: str, cfg: Di
         print(f"[ERROR] No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
         return {"error": "No discriminative features found"}
     
+    # Create discriminability landscape plot (|AUC - 0.5|)
+    run_save_dir = os.path.join(save_dir, f"seed{seed}_forget_{str(forget_label)}")
+    os.makedirs(run_save_dir, exist_ok=True)
+    viz_dir = os.path.join(run_save_dir, "visualizations")
+    os.makedirs(viz_dir, exist_ok=True)
+    
+    disc_pdf_path = os.path.join(viz_dir, "discriminability_landscape.pdf")
+    disc_png_path = os.path.join(viz_dir, "discriminability_landscape.png")
+    disc_title = f"Discriminability Landscape - Class {forget_label_str}"
+    
+    plot_discriminability_landscape(
+        stats=stats,
+        selected_idx=feat_idx,
+        fdr_alpha=fdr_thresh,
+        auc_eps=1e-6,
+        out_path_pdf=disc_pdf_path,
+        out_path_png=disc_png_path,
+        title=disc_title,
+        highlight_top_n=20
+    )
+    print(f"[VIZ] Discriminability landscape plot saved to: {disc_pdf_path}")
+    
     prune_and_normalize_decoder(dec_w)
     U = build_U_from_decoder(dec_w, feat_idx)
     
@@ -146,8 +169,7 @@ def run_single_continual_step(pre: Precomp, sae: SAE, forget_label: str, cfg: Di
     }
     
     # Save full artifacts for interpretability and downstream analyses
-    run_save_dir = os.path.join(save_dir, f"seed{seed}_forget_{str(forget_label)}")
-    os.makedirs(run_save_dir, exist_ok=True)
+    # (run_save_dir already created above for visualization)
     with open(os.path.join(run_save_dir, "verification_eer_summary.json"), "w") as fh:
         json.dump(res, fh, indent=2)
     
@@ -162,30 +184,6 @@ def run_single_continual_step(pre: Precomp, sae: SAE, forget_label: str, cfg: Di
     # SAE and whitener
     torch.save(sae.state_dict(), os.path.join(run_save_dir, "sae_state_dict.pt"))
     np.savez_compressed(os.path.join(run_save_dir, "whitener.npz"), mu=pre.mu, W=pre.W)
-    
-    # Save feature mining statistics (ICLR-level artifacts)
-    apply_fdr(stats, fdr_thresh)
-    np.savez_compressed(
-        os.path.join(run_save_dir, "feature_mining_stats.npz"),
-        **{k: v for k, v in stats.items() if isinstance(v, np.ndarray)}
-    )
-    selected_meta = {
-        "feat_idx": [int(i) for i in feat_idx],
-        "top_k": int(cfg['feature_mining']['build_U_top']),
-        "fdr_alpha": float(fdr_thresh),
-        "n_tested": int(stats["n_pos"][0]) + int(stats["n_neg"][0]),
-        "n_significant": int((stats["qval"] <= fdr_thresh).sum()),
-        "n_selected": len(feat_idx),
-    }
-    with open(os.path.join(run_save_dir, "selected_features.json"), "w") as fh:
-        json.dump(selected_meta, fh, indent=2)
-    
-    # Optional bootstrap CIs for selected features
-    if cfg['feature_mining'].get('compute_ci', False):
-        ci_iters = cfg['feature_mining'].get('ci_bootstrap_iters', 1000)
-        ci_alpha = cfg['feature_mining'].get('ci_alpha', 0.05)
-        cis = compute_bootstrap_cis(A_fgt, A_ret_bal, feat_idx, n_boot=ci_iters, alpha=ci_alpha, seed=seed)
-        np.savez_compressed(os.path.join(run_save_dir, "feature_mining_cis.npz"), **cis)
     
     return res
 

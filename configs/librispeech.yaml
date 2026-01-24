@@ -14,7 +14,7 @@ encoder:
   name: ecapa
   wav2vec2_model: facebook/wav2vec2-base
   hubert_model: facebook/hubert-base-ls960
-  conformer_model: facebook/wav2vec2-conformer-rel-pos-large
+  conformer_model: facebook/wav2vec2-conformer-rel-pos-large 
   embeddings_path: null
 
 sae:

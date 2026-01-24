@@ -1,18 +1,13 @@
 from typing import List, Dict, Optional
 import os, random
 import numpy as np
+from datasets import load_dataset
 from .adapter_base import DatasetAdapter, Precomp
 from src.core.encoders import extract_embeddings
 from src.core.utils.whitening import fit_whitener, apply_whitener
 from rich.console import Console
 
 console = Console()
-
-# Import datasets with explicit import to avoid conflicts
-try:
-    from datasets import load_dataset
-except ImportError:
-    raise ImportError("datasets library not found. Please install with: pip install datasets")
 
 class LahajaAdapter(DatasetAdapter):
     name = "lahaja"
@@ -65,6 +60,7 @@ class LahajaAdapter(DatasetAdapter):
         if embeddings_path is not None:
             data = np.load(embeddings_path, allow_pickle=True)
             labels = data['labels'].tolist() if 'labels' in data else (data['y'].tolist() if 'y' in data else None)
+            print(f"\n[Debug] labels: {labels}")
             ids = data['segment_ids'].tolist() if 'segment_ids' in data else (data['ids'].tolist() if 'ids' in data else None)
             if labels is None:
                 raise RuntimeError("embeddings .npz must contain 'labels' or 'y' array when embeddings_path is used")
@@ -161,5 +157,3 @@ class LahajaAdapter(DatasetAdapter):
         Z_all = apply_whitener(E_all, mu, W)
         classes = sorted(list(set(labels)))
         return Precomp(manifest=manifest_ordered, labels=labels, classes=classes, E_all=E_all, Z_all=Z_all, mu=mu, W=W, mask_dev=mask_dev, mask_test=mask_test)
-
-

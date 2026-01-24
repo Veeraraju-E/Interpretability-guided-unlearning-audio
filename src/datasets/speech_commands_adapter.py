@@ -55,12 +55,10 @@ class SpeechCommandsAdapter(DatasetAdapter):
         if len(manifest) == 0:
             raise RuntimeError("No entries found in manifest")
         
-        # Debug: Print distribution of samples across splits
-        dev_count = sum(1 for m in manifest if m['split'] == 'dev')
-        test_count = sum(1 for m in manifest if m['split'] == 'test')
-        print(f"Debug: Dataset split - dev: {dev_count}, test: {test_count}")
+        # dev_count = sum(1 for m in manifest if m['split'] == 'dev')
+        # test_count = sum(1 for m in manifest if m['split'] == 'test')
+        # print(f"Debug: Dataset split - dev: {dev_count}, test: {test_count}")
         
-        # Debug: Print per-class distribution
         by_label_split = {}
         for m in manifest:
             label = m['label']
@@ -114,5 +112,3 @@ class SpeechCommandsAdapter(DatasetAdapter):
         Z_all = apply_whitener(E_all, mu, W)
         classes = sorted(list(set(labels)))
         return Precomp(manifest=manifest_ordered, labels=labels, classes=classes, E_all=E_all, Z_all=Z_all, mu=mu, W=W, mask_dev=mask_dev, mask_test=mask_test)
-
-
