@@ -3,15 +3,15 @@ import os
 import json
 import numpy as np
 import torch
-from src.core.utils.seed import seed_all
-from src.core.sae import SAE, train_sae, sae_encode_batch
-from src.core.utils.stats import compute_feature_stats, select_features
-from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
 from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
-from src.core.evals.verification import build_verification_trials, compute_scores, eer_from_scores, per_class_eers, avg_eers
+from src.core.evals.verification import build_verification_trials, compute_scores, per_class_eers, avg_eers
 from src.core.edits import apply_edits
-from src.core.visualization import create_embedding_visualizations, create_embedding_summary_stats
+from src.core.sae import SAE, train_sae, sae_encode_batch
+from src.core.utils.seed import seed_all
+from src.core.utils.stats import compute_feature_stats, select_features
+from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
+from src.core.visualization import create_embedding_visualizations, create_embedding_summary_stats, plot_discriminability_landscape
  
 
 def run_single(adapter, cfg: Dict):
@@ -149,13 +149,34 @@ def run_single(adapter, cfg: Dict):
         else:
             A_ret_bal = A_ret
         stats = compute_feature_stats(A_fgt, A_ret_bal, method=method)
-        print(f"[INFO]: Stats: {stats}")
         fdr_thresh = cfg['feature_mining'].get('fdr', 0.05)
         feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=fdr_thresh)
         
         if len(feat_idx) == 0:
             print(f"[ERROR] No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
             continue
+        
+        # Create discriminability landscape plot (|AUC - 0.5|)
+        run_save_dir = os.path.join(save_dir, f"seed{seed}_forget_{str(forget_label)}")
+        os.makedirs(run_save_dir, exist_ok=True)
+        viz_dir = os.path.join(run_save_dir, "visualizations")
+        os.makedirs(viz_dir, exist_ok=True)
+        
+        disc_pdf_path = os.path.join(viz_dir, "discriminability_landscape.pdf")
+        disc_png_path = os.path.join(viz_dir, "discriminability_landscape.png")
+        disc_title = f"Discriminability Landscape - Class {forget_label_str}"
+        
+        plot_discriminability_landscape(
+            stats=stats,
+            selected_idx=feat_idx,
+            fdr_alpha=fdr_thresh,
+            auc_eps=1e-6,
+            out_path_pdf=disc_pdf_path,
+            out_path_png=disc_png_path,
+            title=disc_title,
+            highlight_top_n=20
+        )
+        print(f"[VIZ] Discriminability landscape plot saved to: {disc_pdf_path}")
             
         prune_and_normalize_decoder(dec_w)
         U = build_U_from_decoder(dec_w, feat_idx)
@@ -208,8 +229,7 @@ def run_single(adapter, cfg: Dict):
         results_all[forget_label] = res
 
         # save full artifacts for interpretability and downstream analyses
-        run_save_dir = os.path.join(save_dir, f"seed{seed}_forget_{str(forget_label)}")
-        os.makedirs(run_save_dir, exist_ok=True)
+        # (run_save_dir already created above for visualization)
         with open(os.path.join(run_save_dir, "verification_eer_summary.json"), "w") as fh:
             json.dump(res, fh, indent=2)
         sets_np = np.array(sets)
