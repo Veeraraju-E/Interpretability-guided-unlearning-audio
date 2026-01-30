@@ -116,7 +116,7 @@ def select_features_from_stats(stats: dict, top_k: int = 200, fdr: float = 0.05)
     if multipletests is not None:
         # Only apply FDR correction to valid features
         valid_pvals = pvals[valid_features]
-        print(f"[INFO]: Valid pvals: {valid_pvals}")
+        # print(f"[INFO]: Valid pvals: {valid_pvals}")
         rej, _, _, _ = multipletests(valid_pvals, alpha=fdr, method='fdr_bh')
         
         # Map back to original indices

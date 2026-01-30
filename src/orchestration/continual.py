@@ -14,6 +14,7 @@ from src.core.utils.seed import seed_all
 from src.core.utils.stats import compute_feature_stats, select_features
 from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
 from src.core.visualization.latent_selection import plot_discriminability_landscape
+from src.core.visualization import create_visual_abstract
 from src.datasets.adapter_base import Precomp
 
 def filter_precomp_by_forgotten(pre: Precomp, forgotten: List[str]) -> Precomp:
@@ -85,9 +86,9 @@ def run_single_continual_step(pre: Precomp, sae: SAE, forget_label: str, cfg: Di
     else:
         A_ret_bal = A_ret
     
-    stats = compute_feature_stats(A_fgt, A_ret_bal, method=method)
+    feat_stats = compute_feature_stats(A_fgt, A_ret_bal, method=method)
     fdr_thresh = cfg['feature_mining'].get('fdr', 0.05)
-    feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=fdr_thresh)
+    feat_idx = select_features(feat_stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=fdr_thresh)
     
     if len(feat_idx) == 0:
         print(f"[ERROR] No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
@@ -104,7 +105,7 @@ def run_single_continual_step(pre: Precomp, sae: SAE, forget_label: str, cfg: Di
     disc_title = f"Discriminability Landscape - Class {forget_label_str}"
     
     plot_discriminability_landscape(
-        stats=stats,
+        stats=feat_stats,
         selected_idx=feat_idx,
         fdr_alpha=fdr_thresh,
         auc_eps=1e-6,
@@ -184,6 +185,40 @@ def run_single_continual_step(pre: Precomp, sae: SAE, forget_label: str, cfg: Di
     # SAE and whitener
     torch.save(sae.state_dict(), os.path.join(run_save_dir, "sae_state_dict.pt"))
     np.savez_compressed(os.path.join(run_save_dir, "whitener.npz"), mu=pre.mu, W=pre.W)
+
+    # Visual abstract
+    va_cfg = cfg.get('visual_abstract', {})
+    if va_cfg.get('enabled', True):
+        try:
+            _ = create_visual_abstract(
+                Z_all=pre.Z_all,
+                E_edit=E_all_edited,
+                E_before=E_all_norm,
+                E_after=E_all_norm2,
+                mu=pre.mu,
+                W=pre.W,
+                U=U,
+                labels=all_labels,
+                forget_label=forget_label_str,
+                stats=feat_stats,
+                selected_idx=feat_idx,
+                dec_w=dec_w,
+                A_all=A_all,
+                save_dir=viz_dir,
+                ridge=float(cfg['edits'].get('leace_ridge', 1e-6)),
+                max_points=int(va_cfg.get('max_points', 1500)),
+                k_plot=int(va_cfg.get('k_plot', 5)),
+                seed=seed,
+                overlay_top_n=int(va_cfg.get('overlay_top_n', 8)),
+                hist_top_n=int(va_cfg.get('hist_top_n', 8)),
+                ablation=bool(va_cfg.get('ablation', True)),
+                overlay_xlim=tuple(va_cfg.get('overlay_xlim')) if va_cfg.get('overlay_xlim') is not None else None,
+                overlay_ylim=tuple(va_cfg.get('overlay_ylim')) if va_cfg.get('overlay_ylim') is not None else None,
+                sets=sets,
+                discriminability_path=disc_png_path
+            )
+        except Exception:
+            pass
     
     return res
 

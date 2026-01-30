@@ -3,6 +3,8 @@ import os
 import json
 import numpy as np
 import torch
+from collections import Counter
+from rich.console import Console
 from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
 from src.core.evals.verification import build_verification_trials, compute_scores, per_class_eers, avg_eers
@@ -11,7 +13,7 @@ from src.core.sae import SAE, train_sae, sae_encode_batch
 from src.core.utils.seed import seed_all
 from src.core.utils.stats import compute_feature_stats, select_features
 from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
-from src.core.visualization import create_embedding_visualizations, create_embedding_summary_stats, plot_discriminability_landscape
+from src.core.visualization import create_embedding_visualizations, create_embedding_summary_stats, plot_discriminability_landscape, create_visual_abstract
  
 
 def run_single(adapter, cfg: Dict):
@@ -95,19 +97,12 @@ def run_single(adapter, cfg: Dict):
     forget_list = cfg['dataset']['forget_labels']
     os.makedirs(save_dir, exist_ok=True)
     
-    # Always show key information in yellow
-    from rich.console import Console
+    # Rich Console
     console = Console()
     console.print(f"Forget list: {forget_list}", style="yellow")
     
-    # Debug: Count samples per class
-    from collections import Counter
     label_counts = Counter(all_labels)
-    
-    # Filter out classes with less than 5 samples
-    valid_labels = {label for label, count in label_counts.items() if count >= 5}
-    
-    # Show unique labels (first 20 only) in yellow
+    valid_labels = {label for label, count in label_counts.items() if count >= 5}   # Filter out classes with less than 5 samples
     unique_labels_list = sorted(list(set(all_labels)))
     labels_to_show = unique_labels_list[:20]
     labels_display = labels_to_show + (["..."] if len(unique_labels_list) > 20 else [])
@@ -148,9 +143,9 @@ def run_single(adapter, cfg: Dict):
             A_ret_bal = A_ret[sel]
         else:
             A_ret_bal = A_ret
-        stats = compute_feature_stats(A_fgt, A_ret_bal, method=method)
+        feat_stats = compute_feature_stats(A_fgt, A_ret_bal, method=method)
         fdr_thresh = cfg['feature_mining'].get('fdr', 0.05)
-        feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=fdr_thresh)
+        feat_idx = select_features(feat_stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=fdr_thresh)
         
         if len(feat_idx) == 0:
             print(f"[ERROR] No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.")
@@ -167,7 +162,7 @@ def run_single(adapter, cfg: Dict):
         disc_title = f"Discriminability Landscape - Class {forget_label_str}"
         
         plot_discriminability_landscape(
-            stats=stats,
+            stats=feat_stats,
             selected_idx=feat_idx,
             fdr_alpha=fdr_thresh,
             auc_eps=1e-6,
@@ -244,6 +239,7 @@ def run_single(adapter, cfg: Dict):
         
         # Create embedding visualizations
         print(f"[VIZ] Creating embedding visualizations for forget label: {forget_label}")
+        plot_paths = None
         try:
             viz_dir = os.path.join(run_save_dir, "visualizations")
             os.makedirs(viz_dir, exist_ok=True)
@@ -258,13 +254,20 @@ def run_single(adapter, cfg: Dict):
             
             # Create visualizations using test-only normalized embeddings
             plot_paths = create_embedding_visualizations(embeddings_before=E_test_before, embeddings_after=E_test_after, labels=test_labels, forget_labels=[forget_label], save_dir=viz_dir, title_prefix=f"Class {forget_label}")
+
             
             # Create summary statistics using test-only data
-            stats = create_embedding_summary_stats(embeddings_before=E_test_before, embeddings_after=E_test_after, labels=test_labels, forget_labels=[forget_label], save_dir=viz_dir)
+            emb_stats = create_embedding_summary_stats(
+                embeddings_before=E_test_before,
+                embeddings_after=E_test_after,
+                labels=test_labels,
+                forget_labels=[forget_label],
+                save_dir=viz_dir
+            )
             
             # Add visualization paths to results
             res["visualization_paths"] = plot_paths
-            res["embedding_statistics"] = stats
+            res["embedding_statistics"] = emb_stats
             
             print(f"[VIZ] Visualizations saved to: {viz_dir}")
             for plot_name, plot_path in plot_paths.items():
@@ -273,10 +276,48 @@ def run_single(adapter, cfg: Dict):
             # Print summary information
             if 'summary' in plot_paths:
                 print(f"[VIZ] Summary page: {plot_paths['summary']}")
-            print(f"[VIZ] Statistics: {stats}")
+            print(f"[VIZ] Statistics: {emb_stats}")
                 
         except Exception as e:
             print(f"[VIZ] Warning: Failed to create visualizations: {e}")
             res["visualization_error"] = str(e)
+
+        # Create visual abstract panel
+        va_cfg = cfg.get('visual_abstract', {})
+        if va_cfg.get('enabled', True):
+            try:
+                va_paths = create_visual_abstract(
+                    Z_all=pre.Z_all,
+                    E_edit=E_all_edited,
+                    E_before=E_all_norm,
+                    E_after=E_all_norm2,
+                    mu=pre.mu,
+                    W=pre.W,
+                    U=U,
+                    labels=all_labels,
+                    forget_label=forget_label_str,
+                    stats=feat_stats,
+                    selected_idx=feat_idx,
+                    dec_w=dec_w,
+                    A_all=A_all,
+                    save_dir=viz_dir,
+                    ridge=float(cfg['edits'].get('leace_ridge', 1e-6)),
+                    max_points=int(va_cfg.get('max_points', 1500)),
+                    k_plot=int(va_cfg.get('k_plot', 5)),
+                    seed=seed,
+                    overlay_top_n=int(va_cfg.get('overlay_top_n', 8)),
+                    hist_top_n=int(va_cfg.get('hist_top_n', 8)),
+                    ablation=bool(va_cfg.get('ablation', True)),
+                    overlay_xlim=tuple(va_cfg.get('overlay_xlim')) if va_cfg.get('overlay_xlim') is not None else None,
+                    overlay_ylim=tuple(va_cfg.get('overlay_ylim')) if va_cfg.get('overlay_ylim') is not None else None,
+                    sets=sets,
+                    umap_comparison_path=plot_paths.get('comparison') if plot_paths else None,
+                    discriminability_path=disc_png_path
+                )
+                res["visual_abstract_paths"] = va_paths
+                print(f"[VIZ] Visual abstract saved: {va_paths}")
+            except Exception as e:
+                print(f"[VIZ] Warning: Failed to create visual abstract: {e}")
+                res["visual_abstract_error"] = str(e)
 
     return results_all

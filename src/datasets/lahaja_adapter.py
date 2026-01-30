@@ -60,7 +60,7 @@ class LahajaAdapter(DatasetAdapter):
         if embeddings_path is not None:
             data = np.load(embeddings_path, allow_pickle=True)
             labels = data['labels'].tolist() if 'labels' in data else (data['y'].tolist() if 'y' in data else None)
-            print(f"\n[Debug] labels: {labels}")
+            # print(f"\n[Debug] labels: {labels}")
             ids = data['segment_ids'].tolist() if 'segment_ids' in data else (data['ids'].tolist() if 'ids' in data else None)
             if labels is None:
                 raise RuntimeError("embeddings .npz must contain 'labels' or 'y' array when embeddings_path is used")
