@@ -8,7 +8,7 @@ dataset:
   name: audiomnist
   root_or_manifest: /data/veer/testing/new/datasets/audiomnist_data
   dev_frac: 0.7
-  forget_labels: ["6", "1", "2", "4", "5"]
+  forget_labels: ["6"]
 
 encoder:
   name: ecapa
@@ -37,7 +37,7 @@ edits:
   noise_sigma: 0.02
 
 orchestration:
-  mode: continual
-  seeds: [1337, 1338, 1339]
+  mode: single
+  seeds: [1337]
   classifier_epochs: 20
 

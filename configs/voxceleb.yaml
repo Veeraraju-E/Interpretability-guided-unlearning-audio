@@ -22,7 +22,7 @@ sae:
   multiplier: 8.0
   topk: 128
   lambda_sparsity: 0.0
-  epochs: 500
+  epochs: 350
   batch_size: 64
   hidden_dim: 0
 
@@ -40,3 +40,15 @@ orchestration:
   mode: single
   seeds: [1337]
   classifier_epochs: 20
+
+visual_abstract:
+  overlay_xlim: [-12, 4]
+  overlay_ylim: [-6, 6]
+  enabled: true
+  max_points: 1500
+  k_plot: 5
+  overlay_top_n: 5     # how many SAE directions to overlay on projected panel
+  hist_top_n: 5        # how many SAE features to histogram (forget vs retain)
+
+cka_classical:
+  enabled: true   # set true to run CKA (SAE latents vs classical audio features) when real audio paths in manifest

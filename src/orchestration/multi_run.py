@@ -1,6 +1,7 @@
 from typing import Dict
 import os, csv, pickle
 import numpy as np
+import torch
 from src.core.utils.seed import seed_all
 from src.core.sae import SAE, train_sae, sae_encode_batch
 from src.core.utils.stats import compute_feature_stats, select_features
@@ -10,6 +11,7 @@ from src.core.evals.probes import safe_linear_probe
 from src.core.evals.verification import per_class_eers, avg_eers
 from src.core.edits import apply_edits
 from src.core.visualization import create_embedding_visualizations, create_visual_abstract, plot_discriminability_landscape, create_embedding_summary_stats
+from src.orchestration.cka_classical_analysis import run_cka_classical_analysis
 
 def run_multi(adapter, cfg: Dict):
     base_save_dir = cfg['experiment']['save_dir']
@@ -309,7 +311,27 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
             )
         except Exception:
             pass
-    
+
+    sets_np = np.array(sets)
+    np.savez_compressed(
+        os.path.join(run_save_dir, "interpretability_data.npz"),
+        Z_all=pre.Z_all, Z_edit=E_all_edited, U=U,
+        labels=np.array(all_labels), sets=sets_np, manifest=np.array(pre.manifest, dtype=object), forget_spks=np.array([forget_label_str]),
+        feat_idx=np.array(feat_idx, dtype=np.int64)
+    )
+    torch.save(sae.state_dict(), os.path.join(run_save_dir, "sae_state_dict.pt"))
+    np.savez_compressed(os.path.join(run_save_dir, "whitener.npz"), mu=pre.mu, W=pre.W)
+    if cfg.get("cka_classical", {}).get("enabled", False):
+        try:
+            run_cka_classical_analysis(
+                run_save_dir, cfg,
+                A_all=A_all, feat_idx=feat_idx, labels=all_labels,
+                sets=sets_np, manifest=pre.manifest, Z_all=pre.Z_all,
+                device=device, seed=cfg['experiment']['seed'],
+            )
+        except Exception:
+            pass
+
     return {
         "FA_before": acc_fgt_before,
         "FA_after": acc_fgt_after,

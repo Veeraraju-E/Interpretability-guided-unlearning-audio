@@ -179,12 +179,23 @@ def run_single_continual_step(pre: Precomp, sae: SAE, forget_label: str, cfg: Di
     np.savez_compressed(
         os.path.join(run_save_dir, "interpretability_data.npz"),
         Z_all=pre.Z_all, Z_edit=E_all_edited, U=U,
-        labels=np.array(all_labels), sets=sets_np, manifest=np.array(pre.manifest, dtype=object), forget_spks=np.array([forget_label])
+        labels=np.array(all_labels), sets=sets_np, manifest=np.array(pre.manifest, dtype=object), forget_spks=np.array([forget_label]),
+        feat_idx=np.array(feat_idx, dtype=np.int64)
     )
-    
-    # SAE and whitener
     torch.save(sae.state_dict(), os.path.join(run_save_dir, "sae_state_dict.pt"))
     np.savez_compressed(os.path.join(run_save_dir, "whitener.npz"), mu=pre.mu, W=pre.W)
+
+    if cfg.get("cka_classical", {}).get("enabled", False):
+        try:
+            from src.orchestration.cka_classical_analysis import run_cka_classical_analysis
+            run_cka_classical_analysis(
+                run_save_dir, cfg,
+                A_all=A_all, feat_idx=feat_idx, labels=all_labels,
+                sets=sets_np, manifest=pre.manifest, Z_all=pre.Z_all,
+                device=device, seed=seed,
+            )
+        except Exception:
+            pass
 
     # Visual abstract
     va_cfg = cfg.get('visual_abstract', {})

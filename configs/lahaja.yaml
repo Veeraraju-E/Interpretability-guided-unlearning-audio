@@ -8,8 +8,7 @@ dataset:
   name: lahaja
   root_or_manifest: test  # HF split: train|validation|test
   dev_frac: 0.7
-  forget_labels: ['6012000339299', '6052300306044', '6099600302192', '6695900330902', '6718400334883', '6733800330307', '6834000331270', '7021900308774', '7028700306484', '7037000306250']  # Using actual speaker IDs from the dataset
-
+  forget_labels: ['6012000339299']
 encoder:
   name: wav2vec2
   wav2vec2_model: theainerd/Wav2Vec2-large-xlsr-hindi
@@ -37,6 +36,6 @@ edits:
   noise_sigma: 0.02
 
 orchestration:
-  mode: continual
+  mode: single
   seeds: [1337, 1338, 1339]
   classifier_epochs: 20

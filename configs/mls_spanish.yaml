@@ -8,7 +8,7 @@ dataset:
   name: mls_spanish
   root_or_manifest: /data/veer/testing/new/datasets/mls_spanish/dev/audio
   dev_frac: 0.7
-  forget_labels: ['2592', '10367', '1075', '11670', '3719', '4589', '6223', '6671', '7331', '8630']
+  forget_labels: ['2592']
 
 encoder:
   name: wav2vec2
@@ -38,6 +38,6 @@ edits:
   noise_sigma: 0.02
 
 orchestration:
-  mode: continual
-  seeds: [1337, 1338, 1339]
+  mode: single
+  seeds: [1337]
   classifier_epochs: 20
