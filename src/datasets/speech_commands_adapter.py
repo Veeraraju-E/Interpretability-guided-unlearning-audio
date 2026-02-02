@@ -67,9 +67,9 @@ class SpeechCommandsAdapter(DatasetAdapter):
                 by_label_split[label] = {'dev': 0, 'test': 0}
             by_label_split[label][split] += 1
         
-        print(f"Debug: Per-class distribution:")
-        for label, counts in sorted(by_label_split.items()):
-            print(f"  {label}: dev={counts['dev']}, test={counts['test']}")
+        # print(f"Debug: Per-class distribution:")
+        # for label, counts in sorted(by_label_split.items()):
+            # print(f"  {label}: dev={counts['dev']}, test={counts['test']}")
         
         return manifest
 

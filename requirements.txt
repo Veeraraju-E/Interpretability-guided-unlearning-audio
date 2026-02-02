@@ -13,3 +13,7 @@ pandas
 transformers
 typer
 rich
+librosa
+soundfile
+scipy
+praat-parselmouth

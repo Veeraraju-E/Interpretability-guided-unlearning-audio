@@ -1,6 +1,7 @@
 from typing import Dict
 import os, csv, pickle
 import numpy as np
+import torch
 from src.core.utils.seed import seed_all
 from src.core.sae import SAE, train_sae, sae_encode_batch
 from src.core.utils.stats import compute_feature_stats, select_features
@@ -9,6 +10,8 @@ from src.core.evals.classification import train_classifier, evaluate_classifier
 from src.core.evals.probes import safe_linear_probe
 from src.core.evals.verification import per_class_eers, avg_eers
 from src.core.edits import apply_edits
+from src.core.visualization import create_embedding_visualizations, create_visual_abstract, plot_discriminability_landscape, create_embedding_summary_stats
+from src.orchestration.cka_classical_analysis import run_cka_classical_analysis
 
 def run_multi(adapter, cfg: Dict):
     base_save_dir = cfg['experiment']['save_dir']
@@ -134,7 +137,7 @@ def run_multi(adapter, cfg: Dict):
                 for forget in classes:
                     try:
                         print(f"[INFO] Processing seed {seed}, forget class: {forget}")
-                        res = run_single_class_unlearning(pre, A_all, dec_w, forget, classes, cfg, device)
+                        res = run_single_class_unlearning(pre, A_all, dec_w, forget, classes, cfg, device, seed, base_save_dir)
                         row = {"seed": seed, "forget_label": forget, **res, "error": ""}
                         writer.writerow(row)
                         fh.flush()
@@ -150,7 +153,7 @@ def run_multi(adapter, cfg: Dict):
                 fh.flush()
 
 
-def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, device):
+def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, device, seed, base_save_dir):
     from rich.console import Console
     console = Console()
     
@@ -187,8 +190,8 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     
     # Feature mining (statistical method: cohens_d)
     method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
-    stats = compute_feature_stats(A_fgt, A_ret, method=method)
-    feat_idx = select_features(stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
+    feat_stats = compute_feature_stats(A_fgt, A_ret, method=method)
+    feat_idx = select_features(feat_stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
     
     if len(feat_idx) == 0:
         console.print(f"[ERROR] No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.", style="red")
@@ -233,7 +236,102 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     split_mask_dict = {'dev': pre.mask_dev, 'test': pre.mask_test}
     _, auc_before = safe_linear_probe(E_all_norm, all_labels, U, split_mask_dict, [forget_label_str])
     _, auc_after = safe_linear_probe(E_all_norm2, all_labels, U, split_mask_dict, [forget_label_str])
-    
+
+    # Visualizations and visual abstract
+    run_save_dir = os.path.join(base_save_dir, f"seed{seed}_forget_{forget_label_str}")
+    os.makedirs(run_save_dir, exist_ok=True)
+    viz_dir = os.path.join(run_save_dir, "visualizations")
+    os.makedirs(viz_dir, exist_ok=True)
+    sets = [f"{'forget' if str(lbl) == forget_label_str else 'retain'}:{'dev' if pre.mask_dev[i] else 'test'}" for i, lbl in enumerate(all_labels)]
+
+    try:
+        disc_png_path = os.path.join(viz_dir, "discriminability_landscape.png")
+        plot_discriminability_landscape(
+            stats=feat_stats,
+            selected_idx=feat_idx,
+            fdr_alpha=0.05,
+            auc_eps=1e-6,
+            out_path_pdf=os.path.join(viz_dir, "discriminability_landscape.pdf"),
+            out_path_png=disc_png_path,
+            title=f"Discriminability Landscape - Class {forget_label_str}",
+            highlight_top_n=20
+        )
+    except Exception:
+        disc_png_path = None
+
+    try:
+        plot_paths = create_embedding_visualizations(
+            embeddings_before=E_all_norm[M_ret_test | M_fgt_test],
+            embeddings_after=E_all_norm2[M_ret_test | M_fgt_test],
+            labels=[all_labels[i] for i in range(len(all_labels)) if (M_ret_test | M_fgt_test)[i]],
+            forget_labels=[forget_label_str],
+            save_dir=viz_dir,
+            title_prefix=f"Class {forget_label_str}"
+        )
+        _ = create_embedding_summary_stats(
+            embeddings_before=E_all_norm[M_ret_test | M_fgt_test],
+            embeddings_after=E_all_norm2[M_ret_test | M_fgt_test],
+            labels=[all_labels[i] for i in range(len(all_labels)) if (M_ret_test | M_fgt_test)[i]],
+            forget_labels=[forget_label_str],
+            save_dir=viz_dir
+        )
+    except Exception:
+        plot_paths = {}
+
+    va_cfg = cfg.get('visual_abstract', {})
+    if va_cfg.get('enabled', True):
+        try:
+            _ = create_visual_abstract(
+                Z_all=pre.Z_all,
+                E_edit=E_all_edited,
+                E_before=E_all_norm,
+                E_after=E_all_norm2,
+                mu=pre.mu,
+                W=pre.W,
+                U=U,
+                labels=all_labels,
+                forget_label=forget_label_str,
+                stats=feat_stats,
+                selected_idx=feat_idx,
+                dec_w=dec_w,
+                A_all=A_all,
+                save_dir=viz_dir,
+                ridge=float(cfg['edits'].get('leace_ridge', 1e-6)),
+                max_points=int(va_cfg.get('max_points', 1500)),
+                k_plot=int(va_cfg.get('k_plot', 5)),
+                seed=seed,
+                overlay_top_n=int(va_cfg.get('overlay_top_n', 8)),
+                hist_top_n=int(va_cfg.get('hist_top_n', 8)),
+                ablation=bool(va_cfg.get('ablation', True)),
+                overlay_xlim=tuple(va_cfg.get('overlay_xlim')) if va_cfg.get('overlay_xlim') is not None else None,
+                overlay_ylim=tuple(va_cfg.get('overlay_ylim')) if va_cfg.get('overlay_ylim') is not None else None,
+                sets=sets,
+                umap_comparison_path=plot_paths.get('comparison') if plot_paths else None,
+                discriminability_path=disc_png_path
+            )
+        except Exception:
+            pass
+
+    sets_np = np.array(sets)
+    np.savez_compressed(
+        os.path.join(run_save_dir, "interpretability_data.npz"),
+        Z_all=pre.Z_all, Z_edit=E_all_edited, U=U,
+        labels=np.array(all_labels), sets=sets_np, manifest=np.array(pre.manifest, dtype=object), forget_spks=np.array([forget_label_str]),
+        feat_idx=np.array(feat_idx, dtype=np.int64)
+    )
+    torch.save(sae.state_dict(), os.path.join(run_save_dir, "sae_state_dict.pt"))
+    np.savez_compressed(os.path.join(run_save_dir, "whitener.npz"), mu=pre.mu, W=pre.W)
+    if cfg.get("cka_classical", {}).get("enabled", False):
+        try:
+            run_cka_classical_analysis(
+                run_save_dir, cfg,
+                A_all=A_all, feat_idx=feat_idx, labels=all_labels,
+                sets=sets_np, manifest=pre.manifest, Z_all=pre.Z_all,
+                device=device, seed=cfg['experiment']['seed'],
+            )
+        except Exception:
+            pass
+
     return {
         "FA_before": acc_fgt_before,
         "FA_after": acc_fgt_after,

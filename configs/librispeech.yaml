@@ -40,3 +40,15 @@ orchestration:
   mode: single
   seeds: [1337, 1338, 1339]
   classifier_epochs: 20
+
+visual_abstract:
+  overlay_xlim: [-12, 4]
+  overlay_ylim: [-6, 6]
+  enabled: true
+  max_points: 1500
+  k_plot: 5
+  overlay_top_n: 5     # how many SAE directions to overlay on projected panel
+  hist_top_n: 5        # how many SAE features to histogram (forget vs retain)
+
+cka_classical:
+  enabled: true   # set true to run CKA bw SAE and classical audio features
