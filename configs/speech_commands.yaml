@@ -8,7 +8,7 @@ dataset:
   name: speech_commands
   root_or_manifest: /data/veer/testing/new/datasets/speech_commands
   dev_frac: 0.7
-  forget_labels: ["yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"]
+  forget_labels: ["yes"]
 
 encoder:
   name: hubert
@@ -37,6 +37,6 @@ edits:
   noise_sigma: 0.02
 
 orchestration:
-  mode: continual
-  seeds: [1337, 1338, 1339]
+  mode: single
+  seeds: [1337]
   classifier_epochs: 20
