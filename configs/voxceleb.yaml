@@ -49,6 +49,3 @@ visual_abstract:
   k_plot: 5
   overlay_top_n: 5     # how many SAE directions to overlay on projected panel
   hist_top_n: 5        # how many SAE features to histogram (forget vs retain)
-
-cka_classical:
-  enabled: true   # set true to run CKA (SAE latents vs classical audio features) when real audio paths in manifest

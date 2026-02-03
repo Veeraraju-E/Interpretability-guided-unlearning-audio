@@ -109,8 +109,6 @@ def extract_all_utterances(manifest: List[Dict], cache_path: Optional[str] = Non
     for i, entry in enumerate(tqdm(manifest, desc="Extracting classical features")):
         ent = entry if isinstance(entry, dict) else dict(entry)
         path = ent.get("path", "")
-        if path.startswith("dummy_"):
-            continue
         vec = extract_utterance_features(path, ent.get("start"), ent.get("end"))
         out[i, :vec.size] = vec
     if cache_path:
