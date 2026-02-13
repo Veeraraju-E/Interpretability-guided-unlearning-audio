@@ -1,0 +1,42 @@
+experiment:
+  name: linear_probe_experiment
+  save_dir: ./runs/linear_probe
+  device: cuda
+  seed: 1337
+
+dataset:
+  name: lahaja
+  root_or_manifest: test  # HF split: train|validation|test
+  dev_frac: 0.7
+  forget_labels: ['6012000339299']
+
+encoder:
+  name: wav2vec2
+  wav2vec2_model: theainerd/Wav2Vec2-large-xlsr-hindi
+  hubert_model: utter-project/mHuBERT-147
+  conformer_model: facebook/wav2vec2-conformer-rel-pos-large
+  embeddings_path: null
+
+sae:
+  enabled: false
+  variant: topk
+  multiplier: 8.0
+  topk: 128
+  lambda_sparsity: 0.0
+  epochs: 250
+  batch_size: 64
+  hidden_dim: 0
+
+feature_mining:
+  build_U_top: 1536
+  statistical_method: cohens_d
+
+edits:
+  beta: 0.0
+  leace: true
+  leace_ridge: 1e-6
+  noise_sigma: 0.02
+
+linear_probe:
+  epochs: 10000
+  output_csv_dir: ./runs/linear_probe

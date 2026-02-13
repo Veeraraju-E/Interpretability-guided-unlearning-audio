@@ -18,6 +18,7 @@ encoder:
   embeddings_path: null
 
 sae:
+  enabled: true
   variant: topk
   multiplier: 10.0
   topk: 128

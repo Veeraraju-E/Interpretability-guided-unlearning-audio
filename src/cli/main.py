@@ -22,6 +22,7 @@ from src.datasets.mls_spanish_adapter import MLSSpanishAdapter
 from src.orchestration.single_run import run_single
 from src.orchestration.multi_run import run_multi
 from src.orchestration.continual import run_continual
+from src.orchestration.linear_probe_experiment import run_linear_probe_experiment
 
 # Initialize Typer app and console
 app = typer.Typer(
@@ -61,6 +62,26 @@ def validate_config_dict(cfg: dict) -> None:
             raise typer.Exit(1)
     
     # Validate dataset adapter
+    adapter_name = cfg['dataset']['name']
+    if adapter_name not in ADAPTERS:
+        console.print(f"[red]Error: Unknown dataset adapter '{adapter_name}'. Available: {list(ADAPTERS.keys())}[/red]")
+        raise typer.Exit(1)
+
+
+def validate_linear_probe_config(cfg: dict) -> None:
+    """Validate config for linear-probe experiment (no orchestration required)."""
+    required_sections = ['experiment', 'dataset', 'encoder', 'sae', 'feature_mining', 'edits', 'linear_probe']
+    for section in required_sections:
+        if section not in cfg:
+            console.print(f"[red]Error: Missing required config section '{section}'[/red]")
+            raise typer.Exit(1)
+    lp = cfg['linear_probe']
+    if 'output_csv_dir' not in lp:
+        console.print("[red]Error: linear_probe.output_csv_dir is required[/red]")
+        raise typer.Exit(1)
+    if 'epochs' not in lp:
+        console.print("[red]Error: linear_probe.epochs is required[/red]")
+        raise typer.Exit(1)
     adapter_name = cfg['dataset']['name']
     if adapter_name not in ADAPTERS:
         console.print(f"[red]Error: Unknown dataset adapter '{adapter_name}'. Available: {list(ADAPTERS.keys())}[/red]")
@@ -219,6 +240,53 @@ def grid(
     except Exception as e:
         console.print(f"[red]Error during grid search: {e}[/red]")
         raise typer.Exit(1)
+
+
+@app.command()
+def linear_probe(
+    config: Path = typer.Option(
+        ...,
+        "--config", "-c",
+        help="Path to YAML configuration file",
+        exists=True
+    ),
+    show_config: bool = typer.Option(
+        False,
+        "--show-config",
+        help="Show configuration summary before running"
+    )
+):
+    """
+    Run linear probing for class identity on encoder representations (E_all).
+    Appends one row to linear_probe_<seed>.csv in the configured output_csv_dir.
+    """
+    console.print(Panel.fit(" Linear Probing", style="bold blue"))
+
+    cfg = load_config(str(config))
+    validate_linear_probe_config(cfg)
+
+    if show_config:
+        exp = cfg['experiment']
+        lp = cfg['linear_probe']
+        console.print(f"[cyan]Experiment:[/cyan] {exp.get('name')} (seed={exp.get('seed')})")
+        console.print(f"[cyan]Dataset:[/cyan] {cfg['dataset']['name']}")
+        console.print(f"[cyan]Encoder:[/cyan] {cfg['encoder']['name']}")
+        console.print(f"[cyan]Linear probe:[/cyan] output_csv_dir={lp['output_csv_dir']}, epochs={lp['epochs']}")
+
+    adapter_name = cfg['dataset']['name']
+    adapter = ADAPTERS[adapter_name]
+    console.print(f"[green]Using dataset adapter: {adapter_name}[/green]")
+
+    try:
+        accuracy = run_linear_probe_experiment(adapter, cfg)
+        seed = cfg['experiment']['seed']
+        csv_path = str(Path(cfg['linear_probe']['output_csv_dir']) / f"linear_probe_{seed}.csv")
+        console.print(f"[green]Linear probe completed. Test accuracy: {accuracy:.4f}[/green]")
+        console.print(f"[green]Appended to: {csv_path}[/green]")
+    except Exception as e:
+        console.print(f"[red]Error during linear probing: {e}[/red]")
+        raise typer.Exit(1)
+
 
 @app.command()
 def list_configs():

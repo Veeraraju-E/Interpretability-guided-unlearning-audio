@@ -7,10 +7,11 @@ from src.core.sae import SAE, train_sae, sae_encode_batch
 from src.core.utils.stats import compute_feature_stats, select_features
 from src.core.utils.subspace import prune_and_normalize_decoder, build_U_from_decoder
 from src.core.evals.classification import train_classifier, evaluate_classifier
-from src.core.evals.probes import safe_linear_probe
+from src.core.evals.probes import safe_linear_probe, linear_probe_class_identity
 from src.core.evals.verification import per_class_eers, avg_eers
 from src.core.edits import apply_edits
 from src.core.visualization import create_embedding_visualizations, create_visual_abstract, plot_discriminability_landscape, create_embedding_summary_stats
+from src.orchestration.linear_probe_experiment import should_run_linear_probe, append_linear_probe_result
 
 
 def run_multi(adapter, cfg: Dict):
@@ -88,8 +89,18 @@ def run_multi(adapter, cfg: Dict):
         cache_data = {'pre': pre, 'classes': classes}
         with open(embeddings_cache_path, 'wb') as f: pickle.dump(cache_data, f)
         print(f"[INFO] Embeddings cached successfully!")
-    
-    # Step 2: Train SAE and compute activations once per seed (if not cached)
+
+    if should_run_linear_probe(cfg):
+        E_all_norm = pre.E_all / (np.linalg.norm(pre.E_all, axis=1, keepdims=True) + 1e-12)
+        lp_accuracy = linear_probe_class_identity(
+            E_all_norm, pre.labels, pre.mask_dev, pre.mask_test,
+            max_iter=cfg["linear_probe"]["epochs"], random_state=42,
+        )
+        append_linear_probe_result(cfg, lp_accuracy)
+
+    use_sae = cfg['sae'].get('enabled', True)
+
+    # Step 2: Train SAE and compute activations once per seed (if not cached), or skip when SAE disabled
     csv_path = os.path.join(base_save_dir, "multi_run_results.csv")
     fieldnames = ["seed", "forget_label", "FA_before", "FA_after", "RA_before", "RA_after", "forget_EER_before", "forget_EER_after", "retain_EER_before", "retain_EER_after", "linear_probe_auc_before", "linear_probe_auc_after", "error"]
     write_header = not os.path.exists(csv_path)
@@ -100,40 +111,32 @@ def run_multi(adapter, cfg: Dict):
             writer.writeheader()
             
         for seed in seeds:
-            sae_cache_path = os.path.join(sae_cache_dir, f"sae_seed_{seed}.pkl")
-            activations_cache_path = os.path.join(sae_cache_dir, f"activations_seed_{seed}.pkl")
-            
-            try:
-                # Load or train SAE
+            seed_all(seed)
+            A_all, dec_w = None, None
+            if use_sae:
+                sae_cache_path = os.path.join(sae_cache_dir, f"sae_seed_{seed}.pkl")
+                activations_cache_path = os.path.join(sae_cache_dir, f"activations_seed_{seed}.pkl")
                 if os.path.exists(sae_cache_path) and os.path.exists(activations_cache_path):
                     print(f"[INFO] Loading cached SAE and activations for seed {seed}...")
-                    with open(sae_cache_path, 'rb') as f:
-                        sae_state = pickle.load(f)
                     with open(activations_cache_path, 'rb') as f:
                         cache_data = pickle.load(f)
                         A_all = cache_data['A_all']
                         dec_w = cache_data['dec_w']
                 else:
                     print(f"[INFO] Training SAE for seed {seed} (this will be cached)...")
-                    seed_all(seed)
-                    
                     Z_train = pre.Z_all[pre.mask_dev]
                     perm = np.random.permutation(Z_train.shape[0])
                     cut = int(0.8 * len(perm)) if len(perm) > 1 else int(0.5 * len(perm))
                     Z_sae_train, Z_sae_val = (Z_train, Z_train) if cut <= 0 else (Z_train[perm[:cut]], Z_train[perm[cut:]])
-                    
                     sae = SAE(input_dim=pre.Z_all.shape[1], hidden_mult=cfg['sae']['multiplier'], k=cfg['sae']['topk'], variant=cfg['sae']['variant'], hidden_dim=cfg['sae']['hidden_dim'])
                     sae = train_sae(sae, Z_sae_train, Z_sae_val, epochs=cfg['sae']['epochs'], batch_size=cfg['sae']['batch_size'], lr=1e-3, device=device, lambda_sparsity=cfg['sae']['lambda_sparsity'])
                     A_all = sae_encode_batch(sae, pre.Z_all, device=device, batch=256)
                     dec_w = sae.dec.weight.detach().cpu().numpy()
-                    
-                    # Cache SAE and activations
-                    sae_state = sae.state_dict()
-                    with open(sae_cache_path, 'wb') as f: pickle.dump(sae_state, f)
+                    with open(sae_cache_path, 'wb') as f: pickle.dump(sae.state_dict(), f)
                     with open(activations_cache_path, 'wb') as f: pickle.dump({'A_all': A_all, 'dec_w': dec_w}, f)
                     print(f"[INFO] SAE and activations cached for seed {seed}!")
-                
-                # Step 3: Run unlearning for each class (reusing cached data)
+
+            try:
                 for forget in classes:
                     try:
                         print(f"[INFO] Processing seed {seed}, forget class: {forget}")
@@ -145,7 +148,6 @@ def run_multi(adapter, cfg: Dict):
                         print(f"[ERROR] Error processing seed {seed}, class {forget}: {e}")
                         writer.writerow({"seed": seed, "forget_label": forget, "error": str(e)})
                         fh.flush()
-                        
             except Exception as e:
                 print(f"[ERROR] Failed for seed {seed}: {e}")
                 for forget in classes:
@@ -183,24 +185,26 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     
     # Train Classifier
     clf = train_classifier(X_train, y_train, X_val, y_val, num_classes=len(unique_labels), device=device, epochs=cfg['orchestration']['classifier_epochs'], batch_size=512, lr=1e-3)
-    
-    # Feature mining
-    A_ret = A_all[M_ret_dev]
-    A_fgt = A_all[M_fgt_dev]
-    
-    # Feature mining (statistical method: cohens_d)
-    method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
-    feat_stats = compute_feature_stats(A_fgt, A_ret, method=method)
-    feat_idx = select_features(feat_stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
-    
-    if len(feat_idx) == 0:
-        console.print(f"[ERROR] No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.", style="red")
-        return {"error": "No discriminative features found"}
-    
-    # Build subspace and apply edits
-    prune_and_normalize_decoder(dec_w)
-    U = build_U_from_decoder(dec_w, feat_idx)
-    
+
+    skip_sae = not cfg['sae'].get('enabled', True) or A_all is None
+    if skip_sae:
+        # LEACE directly on whitened embeddings (full space)
+        U = np.eye(pre.Z_all.shape[1], dtype=pre.Z_all.dtype)
+        feat_idx = []
+        feat_stats = None
+    else:
+        # Feature mining
+        A_ret = A_all[M_ret_dev]
+        A_fgt = A_all[M_fgt_dev]
+        method = cfg['feature_mining'].get('statistical_method', 'cohens_d')
+        feat_stats = compute_feature_stats(A_fgt, A_ret, method=method)
+        feat_idx = select_features(feat_stats, method=method, top_k=cfg['feature_mining']['build_U_top'], fdr=0.05)
+        if len(feat_idx) == 0:
+            console.print(f"[ERROR] No discriminative features found for forget class '{forget_label_str}'. Cannot proceed with editing.", style="red")
+            return {"error": "No discriminative features found"}
+        prune_and_normalize_decoder(dec_w)
+        U = build_U_from_decoder(dec_w, feat_idx)
+
     # LEACE params - create labels for the full dataset
     Y_all = np.array([1 if str(all_labels[i]) == forget_label_str else 0 for i in range(len(all_labels))], dtype=int).reshape(-1, 1)
     E_edit, _ = apply_edits(
@@ -244,20 +248,22 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
     os.makedirs(viz_dir, exist_ok=True)
     sets = [f"{'forget' if str(lbl) == forget_label_str else 'retain'}:{'dev' if pre.mask_dev[i] else 'test'}" for i, lbl in enumerate(all_labels)]
 
-    try:
-        disc_png_path = os.path.join(viz_dir, "discriminability_landscape.png")
-        plot_discriminability_landscape(
-            stats=feat_stats,
-            selected_idx=feat_idx,
-            fdr_alpha=0.05,
-            auc_eps=1e-6,
-            out_path_pdf=os.path.join(viz_dir, "discriminability_landscape.pdf"),
-            out_path_png=disc_png_path,
-            title=f"Discriminability Landscape - Class {forget_label_str}",
-            highlight_top_n=20
-        )
-    except Exception:
-        disc_png_path = None
+    disc_png_path = None
+    if not skip_sae and feat_stats is not None:
+        try:
+            disc_png_path = os.path.join(viz_dir, "discriminability_landscape.png")
+            plot_discriminability_landscape(
+                stats=feat_stats,
+                selected_idx=feat_idx,
+                fdr_alpha=0.05,
+                auc_eps=1e-6,
+                out_path_pdf=os.path.join(viz_dir, "discriminability_landscape.pdf"),
+                out_path_png=disc_png_path,
+                title=f"Discriminability Landscape - Class {forget_label_str}",
+                highlight_top_n=20
+            )
+        except Exception:
+            disc_png_path = None
 
     try:
         plot_paths = create_embedding_visualizations(
@@ -279,7 +285,7 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
         plot_paths = {}
 
     va_cfg = cfg.get('visual_abstract', {})
-    if va_cfg.get('enabled', True):
+    if not skip_sae and va_cfg.get('enabled', True) and feat_stats is not None and dec_w is not None and A_all is not None:
         try:
             _ = create_visual_abstract(
                 Z_all=pre.Z_all,
@@ -319,7 +325,6 @@ def run_single_class_unlearning(pre, A_all, dec_w, forget_label, classes, cfg, d
         labels=np.array(all_labels), sets=sets_np, manifest=np.array(pre.manifest, dtype=object), forget_spks=np.array([forget_label_str]),
         feat_idx=np.array(feat_idx, dtype=np.int64)
     )
-    torch.save(sae.state_dict(), os.path.join(run_save_dir, "sae_state_dict.pt"))
     np.savez_compressed(os.path.join(run_save_dir, "whitener.npz"), mu=pre.mu, W=pre.W)
 
     return {

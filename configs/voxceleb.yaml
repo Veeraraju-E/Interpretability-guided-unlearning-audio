@@ -1,6 +1,6 @@
 experiment:
   name: voxceleb_exp
-  save_dir: ./runs/voxceleb
+  save_dir: ./runs/voxceleb_without_sae_w2v2
   device: cuda
   seed: 1337
 
@@ -11,13 +11,14 @@ dataset:
   forget_labels: ['id00017']
 
 encoder:
-  name: ecapa
+  name: wav2vec2
   wav2vec2_model: facebook/wav2vec2-base
   hubert_model: facebook/hubert-base-ls960
   conformer_model: facebook/wav2vec2-conformer-rel-pos-large
   embeddings_path: null
 
 sae:
+  enabled: false
   variant: topk
   multiplier: 8.0
   topk: 128
@@ -40,12 +41,3 @@ orchestration:
   mode: single
   seeds: [1337]
   classifier_epochs: 20
-
-visual_abstract:
-  overlay_xlim: [-12, 4]
-  overlay_ylim: [-6, 6]
-  enabled: true
-  max_points: 1500
-  k_plot: 5
-  overlay_top_n: 5     # how many SAE directions to overlay on projected panel
-  hist_top_n: 5        # how many SAE features to histogram (forget vs retain)
