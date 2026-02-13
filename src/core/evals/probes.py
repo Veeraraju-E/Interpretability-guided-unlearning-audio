@@ -30,3 +30,37 @@ def safe_linear_probe(Z_all: np.ndarray, labels: List[str], U: np.ndarray, split
         return float(acc), float(auc_val)
     except Exception:
         return float('nan'), float('nan')
+
+
+def linear_probe_class_identity(
+    E_all: np.ndarray,
+    labels: List[str],
+    mask_dev: np.ndarray,
+    mask_test: np.ndarray,
+    max_iter: int = 1000,
+    random_state: int = 42,
+) -> float:
+    """
+    Train a linear probe for multi-class class identity on E_all; return test accuracy.
+    Uses LogisticRegression with multi_class='ovr'.
+    """
+    try:
+        classes = sorted(list(set(labels)))
+        if len(classes) < 2:
+            return float('nan')
+        cls2id = {c: i for i, c in enumerate(classes)}
+        X_train = np.ascontiguousarray(E_all[mask_dev], dtype=np.float64)
+        X_test = np.ascontiguousarray(E_all[mask_test], dtype=np.float64)
+        y_train = np.array([cls2id[labels[i]] for i in range(len(labels)) if mask_dev[i]], dtype=np.int64)
+        y_test = np.array([cls2id[labels[i]] for i in range(len(labels)) if mask_test[i]], dtype=np.int64)
+        if len(X_train) == 0 or len(X_test) == 0:
+            return float('nan')
+        if len(np.unique(y_train)) < 2 or np.any(~np.isfinite(X_train)) or np.any(~np.isfinite(X_test)):
+            return float('nan')
+        clf = LogisticRegression(multi_class='ovr', max_iter=max_iter, random_state=random_state, solver='liblinear')
+        clf.fit(X_train, y_train)
+        preds = clf.predict(X_test)
+        acc = accuracy_score(y_test, preds)
+        return float(acc)
+    except Exception:
+        return float('nan')

@@ -1,16 +1,25 @@
-__pycache__
-*out*
-pretrained_models
-*plot*
-*runs*
-.venv
+__pycache__/
+.venv/
+pretrained_models/
+
+# Common experiment output dirs (repo-root)
+/runs/
+/out/
+/outputs/
+/plots/
+/visualization/
+/visuals/
+/plans/
+
+# Binary artifacts / caches
 *.png
-*.pkl
 *.jpg
+*.jpeg
 *.pdf
+*.pkl
 *.npy
-visualization
-visuals
+*.npz
+*.pt
+*.ckpt
 *.tex
-plans
 *.bib

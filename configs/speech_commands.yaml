@@ -1,6 +1,6 @@
 experiment:
   name: sc_exp
-  save_dir: ./runs/speech_commands
+  save_dir: ./runs/speech_commands_without_sae_wav2vec2
   device: cuda
   seed: 1337
 
@@ -11,13 +11,14 @@ dataset:
   forget_labels: ["yes"]
 
 encoder:
-  name: hubert
+  name: wav2vec2
   wav2vec2_model: facebook/wav2vec2-base
   hubert_model: facebook/hubert-base-ls960
   conformer_model: facebook/wav2vec2-conformer-rel-pos-large
   embeddings_path: null
 
 sae:
+  enabled: false
   variant: topk
   multiplier: 8.0
   topk: 128
