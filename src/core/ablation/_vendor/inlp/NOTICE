@@ -1,0 +1,3 @@
+INLP (Iterative Nullspace Projection). Logic from:
+https://github.com/shauli-ravfogel/nullspace_projection (ref: master)
+Ravfogel et al., "Null It Out: Guarding Protected Attributes by Iterative Nullspace Projection" (ACL 2020).

@@ -1,0 +1,12 @@
+Vendored implementations for ablation studies. Each subdirectory contains minimal
+code from the following repositories (pinned at stated refs). Original licenses
+apply; see LICENSE or NOTICE in each subdirectory or in the upstream repo.
+
+- inlp: https://github.com/shauli-ravfogel/nullspace_projection (ref: master)
+  Paper: Null It Out: Guarding Protected Attributes by Iterative Nullspace Projection (ACL 2020)
+- sal: https://github.com/jasonshaoshun/SAL (ref: main)
+  Paper: Gold Doesn't Always Glitter: Spectral Removal of Linear and Nonlinear Guarded Attribute Information (EACL 2023)
+- igbp: https://github.com/technion-cs-nlp/igbp_nonlinear-removal (ref: main)
+  Paper: Shielded Representations: Protecting Sensitive Attributes Through Iterative Gradient-Based Projection (Findings ACL 2023)
+- leopard: https://github.com/ToineSayan/non-LEOPARD (ref: main)
+  Paper: Nonlinear Concept Erasure: a Density Matching Approach (ECAI 2025)

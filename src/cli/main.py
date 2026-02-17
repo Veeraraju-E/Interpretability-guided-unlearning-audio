@@ -260,7 +260,7 @@ def linear_probe(
     Run linear probing for class identity on encoder representations (E_all).
     Appends one row to linear_probe_<seed>.csv in the configured output_csv_dir.
     """
-    console.print(Panel.fit(" Linear Probing", style="bold blue"))
+    console.print(Panel.fit(" Linear Probing ", style="bold blue"))
 
     cfg = load_config(str(config))
     validate_linear_probe_config(cfg)

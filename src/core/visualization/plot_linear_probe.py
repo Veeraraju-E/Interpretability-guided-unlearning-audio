@@ -36,6 +36,11 @@ def load_linear_probe_csvs(output_dir: str, seeds: list = None) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def _dataset_display_label(name: str) -> str:
+    """Convert dataset name to display label: split on underscore into two lines to avoid overlap."""
+    return name.replace("_", "\n")
+
+
 def aggregate_by_encoder_dataset(df: pd.DataFrame) -> pd.DataFrame:
     """Group by (encoder, dataset), compute mean accuracy and 95% CI (1.96 * std / sqrt(n))."""
     if df.empty or "accuracy" not in df.columns:
@@ -73,17 +78,18 @@ def create_linear_probe_summary_plot(
 
     encoders = agg["encoder"].unique().tolist()
     datasets = agg["dataset"].unique().tolist()
-    palette = get_palette("primary")
+    palette = get_palette("accent")
     encoder_colors = {enc: palette[i % len(palette)] for i, enc in enumerate(encoders)}
 
     apply_publication_style()
-    fig, ax = create_figure((7, 5), nrows=1, ncols=1)
+    # Wider and less tall figure
+    fig, ax = create_figure((12, 4), nrows=1, ncols=1)
 
-    # Grouped bars: x = datasets, groups = encoders
+    # Grouped bars: x = datasets, groups = encoders (thinner bars)
     n_datasets = len(datasets)
     n_encoders = len(encoders)
-    total_group_width = 0.75
-    bar_width = total_group_width / n_encoders if n_encoders else 0.4
+    total_group_width = 0.5
+    bar_width = total_group_width / n_encoders if n_encoders else 0.25
     x = np.arange(n_datasets, dtype=float)
 
     for i, encoder in enumerate(encoders):
@@ -111,17 +117,22 @@ def create_linear_probe_summary_plot(
             label=encoder,
         )
 
-    ax.set_ylabel("Accuracy", fontweight="bold")
-    ax.set_xlabel("Dataset", fontweight="bold")
+    label_fontsize = 18
+    tick_fontsize = 16
+    ax.set_ylabel("Accuracy", fontweight="bold", fontsize=label_fontsize)
     ax.set_xticks(x)
-    ax.set_xticklabels(datasets, rotation=45, ha="right")
+    x_labels = [_dataset_display_label(ds) for ds in datasets]
+    ax.set_xticklabels(x_labels, rotation=0, ha="center", fontsize=tick_fontsize)
+    ax.tick_params(axis="y", labelsize=tick_fontsize)
     ax.set_ylim(0, 1.05)
-    ax.legend(loc="best", frameon=True)
+    ax.legend(loc="upper right", frameon=True, fontsize=tick_fontsize)
     ax.grid(True, alpha=0.3, axis="y")
 
-    out_path = Path(output_dir) / output_filename
-    save_plot(fig, str(out_path))
-    return str(out_path)
+    out_path_png = Path(output_dir) / output_filename
+    out_path_pdf = Path(output_dir) / output_filename.replace(".png", ".pdf")
+    save_plot(fig, str(out_path_png))
+    save_plot(fig, str(out_path_pdf))
+    return {"png": str(out_path_png), "pdf": str(out_path_pdf)}
 
 
 def main():
@@ -130,8 +141,8 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="*", default=None, help="Seeds to include (default: all found)")
     parser.add_argument("--output", type=str, default="linear_probe_summary.png", help="Output filename")
     args = parser.parse_args()
-    path = create_linear_probe_summary_plot(args.output_dir, seeds=args.seeds, output_filename=args.output)
-    print(f"Saved: {path}")
+    create_linear_probe_summary_plot(args.output_dir, seeds=args.seeds, output_filename=args.output)
+    print("[VIZ]: Done")
 
 
 if __name__ == "__main__":
