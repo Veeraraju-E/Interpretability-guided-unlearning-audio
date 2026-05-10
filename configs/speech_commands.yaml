@@ -1,6 +1,6 @@
 experiment:
   name: sc_exp
-  save_dir: ./runs/speech_commands_without_sae_wav2vec2
+  save_dir: ./runs/speech_commands_with_sae_wav2vec2
   device: cuda
   seed: 1337
 

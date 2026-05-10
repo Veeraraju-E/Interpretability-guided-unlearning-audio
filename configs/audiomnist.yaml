@@ -20,15 +20,15 @@ encoder:
 sae:
   enabled: true
   variant: topk
-  multiplier: 10.0
-  topk: 128
+  multiplier: 4.0
+  topk: 512
   lambda_sparsity: 0.0
   epochs: 100
   batch_size: 64
   hidden_dim: 0
 
 feature_mining:
-  build_U_top: 480 # 25% of 1920
+  build_U_top: 800 # 25% of 1920
   statistical_method: cohens_d  # Only cohens_d supported
 
 edits:

@@ -1,6 +1,7 @@
 """
 L̄EOPARD wrapper: learn orthogonal projection P = U U^T to minimize MMD between class-conditional distributions.
 Faithful to Saillenfest & Lemberger, ECAI 2025 (density matching via MMD).
+Uses batching/subsampling so large datasets (e.g. N~10k) do not OOM.
 """
 from __future__ import annotations
 
@@ -8,9 +9,27 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# Max samples for sigma heuristic (pairwise diff is sample_size^2 * d)
+_SIGMA_SAMPLE_SIZE = 512
+# Max samples per class for MMD per step (kernel matrices are max_mmd_samples^2)
+_MAX_MMD_SAMPLES = 1024
+
+
+def _sigma_heuristic_batched(X_all: torch.Tensor, sample_size: int = _SIGMA_SAMPLE_SIZE) -> float:
+    """Estimate sigma from mean squared pairwise distance using a subset to avoid O(N^2) memory."""
+    n, d = X_all.shape
+    if n <= 1:
+        return 1.0
+    size = min(sample_size, n)
+    idx = torch.randperm(n, device=X_all.device)[:size]
+    X = X_all[idx]
+    diff = (X.unsqueeze(0) - X.unsqueeze(1)).reshape(-1, d)
+    sigma_sq = (diff ** 2).sum(1).mean().item() + 1e-12
+    return float(np.sqrt(sigma_sq))
+
 
 def _mmd2_gaussian(X: torch.Tensor, Y: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Unbiased MMD^2 with Gaussian kernel k(x,y)=exp(-||x-y||^2/(2*sigma^2))."""
+    """Unbiased MMD^2 with Gaussian kernel. Use on subsampled X,Y when full size would OOM."""
     n, m = X.size(0), Y.size(0)
     if n < 2 or m < 2:
         return torch.tensor(0.0, device=X.device)
@@ -78,17 +97,22 @@ class LEOPARDEraser:
             self._input_dim = d
             return self
         if self.sigma_heuristic:
-            diff = (X_all.unsqueeze(0) - X_all.unsqueeze(1)).reshape(-1, d)
-            sigma_sq = (diff ** 2).sum(1).mean().item() + 1e-12
-            sigma = float(np.sqrt(sigma_sq))
+            sigma = _sigma_heuristic_batched(X_all)
         else:
             sigma = 1.0
+        max_mmd = _MAX_MMD_SAMPLES
         for _ in range(self.n_epochs):
             opt.zero_grad()
             P = U @ U.T
             X_proj = X_all @ P.T
             X0 = X_proj[mask0]
             X1 = X_proj[mask1]
+            n0_cur, n1_cur = X0.size(0), X1.size(0)
+            if n0_cur > max_mmd or n1_cur > max_mmd:
+                i0 = torch.randperm(n0_cur, device=dev)[: min(n0_cur, max_mmd)]
+                i1 = torch.randperm(n1_cur, device=dev)[: min(n1_cur, max_mmd)]
+                X0 = X0[i0]
+                X1 = X1[i1]
             loss_mmd = _mmd2_gaussian(X0, X1, sigma)
             loss_orth = ((U.T @ U) - torch.eye(r, device=dev)).pow(2).mean()
             loss = loss_mmd + self.gamma_proj * loss_orth

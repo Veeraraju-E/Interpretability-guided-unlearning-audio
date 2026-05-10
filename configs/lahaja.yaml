@@ -12,7 +12,7 @@ dataset:
 encoder:
   name: wav2vec2
   wav2vec2_model: theainerd/Wav2Vec2-large-xlsr-hindi
-  hubert_model: facebook/hubert-base-ls960
+  hubert_model: utter-project/mHuBERT-147
   conformer_model: facebook/wav2vec2-conformer-rel-pos-large
   embeddings_path: null
 

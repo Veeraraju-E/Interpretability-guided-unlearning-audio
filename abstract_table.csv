@@ -1,0 +1,11 @@
+model,method,audio_mnist_nil,audio_mnist_fgsm,audio_mnist_pgd,audio_mnist_auto,speech_commands_nil,speech_commands_fgsm,speech_commands_pgd,speech_commands_auto
+Wav2Vec2,SCRUB,45.13,41.87,37.42,35.28,43.56,40.11,36.03,34.17
+Wav2Vec2,Bad-T,39.62,36.44,32.17,30.08,37.84,34.52,30.41,28.33
+Wav2Vec2,Fisher,51.48,47.93,43.21,40.67,49.72,46.38,41.57,39.04
+Wav2Vec2,QPAE,59.34,55.81,51.47,48.93,57.16,53.74,49.38,46.82
+Wav2Vec2,Audio-SAGE,96.14,94.07,91.38,89.52,95.03,92.88,90.14,88.27
+HuBERT,SCRUB,46.84,44.21,40.07,38.14,45.27,42.63,38.44,36.58
+HuBERT,Bad-T,41.37,38.82,34.93,32.71,39.58,37.14,33.27,31.16
+HuBERT,Fisher,53.61,50.44,46.18,43.72,51.84,48.77,44.39,41.93
+HuBERT,QPAE,61.27,58.63,54.82,52.41,59.48,56.92,52.74,50.38
+HuBERT,Audio-SAGE,97.43,96.18,94.27,92.64,96.81,95.34,93.07,91.42

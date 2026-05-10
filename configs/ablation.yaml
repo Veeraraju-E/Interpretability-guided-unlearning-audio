@@ -1,0 +1,82 @@
+experiment:
+  name: ablation_exp
+  save_dir: ./runs/ablation
+  device: cuda
+  seed: 1337
+
+dataset:
+  name: audiomnist
+  root_or_manifest: /data/veer/testing/new/datasets/audiomnist
+  dev_frac: 0.7
+  forget_labels: ['6']
+
+encoder:
+  name: wav2vec2
+  wav2vec2_model: facebook/wav2vec2-base
+  hubert_model: utter-project/mHuBERT-147
+  conformer_model: facebook/wav2vec2-conformer-rel-pos-large
+  embeddings_path: null
+
+sae:
+  enabled: true
+  variant: topk
+  multiplier: 10.0
+  topk: 128
+  lambda_sparsity: 0.0
+  epochs: 80
+  batch_size: 64
+  hidden_dim: 0
+
+feature_mining:
+  build_U_top: 1536
+  statistical_method: cohens_d
+
+edits:
+  beta: 0.0
+  leace: true
+  leace_ridge: 1e-6
+  noise_sigma: 0.02
+
+orchestration:
+  mode: single
+  seeds: [1337]
+  classifier_epochs: 20
+
+ablation:
+  output_csv: ./runs/ablation/results.csv
+  plot:
+    pareto_png: ./runs/ablation/results.csv/pareto_frontier.png
+    pareto_pdf: ./runs/ablation/results.csv/pareto_frontier.pdf
+  methods:
+    - name: inlp
+      sae_variants:
+        with_sae:
+          n_iter: 20
+          min_accuracy: 0.0
+        without_sae:
+          n_iter: 100
+          min_accuracy: 0.0
+      tuned_on: { dataset: speech_commands, forget_label: 'yes' }
+    - name: sal
+      sae_variants:
+        with_sae:
+          n_components_remove: 5
+        without_sae:
+          n_components_remove: 1
+      tuned_on: { dataset: speech_commands, forget_label: 'yes' }
+    - name: igbp
+      sae_variants:
+        with_sae:
+          n_probes: 10
+          probe_width_list: [1]
+        without_sae:
+          n_probes: 10
+          probe_width_list: [1]
+      tuned_on: { dataset: speech_commands, forget_label: 'yes' }
+    - name: leopard
+      sae_variants:
+        with_sae:
+          rank: 2
+        without_sae:
+          rank: 2
+      tuned_on: { dataset: speech_commands, forget_label: 'yes' }
